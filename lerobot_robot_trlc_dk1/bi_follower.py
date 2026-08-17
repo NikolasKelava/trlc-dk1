@@ -42,6 +42,10 @@ class BiDK1FollowerConfig(RobotConfig):
     joint_velocity_scaling: float = 0.2
     max_gripper_torque: float = 1.0 # Nm (/0.00875m spur gear radius = 114N gripper force)
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+    # "impedance" (default, as before) or "pos_vel". Note joint_velocity_scaling
+    # is only applied in pos_vel mode — impedance mode commands absolute joint
+    # targets straight through to the motor chain.
+    control_mode: str = "impedance"
 
 
 class BiDK1Follower(Robot):
@@ -62,12 +66,14 @@ class BiDK1Follower(Robot):
             disable_torque_on_disconnect=self.config.disable_torque_on_disconnect,
             joint_velocity_scaling=self.config.joint_velocity_scaling,
             max_gripper_torque=self.config.max_gripper_torque,
+            control_mode=self.config.control_mode,
         )
         right_arm_config = DK1FollowerConfig(
             port=self.config.right_arm_port,
             disable_torque_on_disconnect=self.config.disable_torque_on_disconnect,
             joint_velocity_scaling=self.config.joint_velocity_scaling,
             max_gripper_torque=self.config.max_gripper_torque,
+            control_mode=self.config.control_mode,
         )
         
         self.left_arm = DK1Follower(left_arm_config)
