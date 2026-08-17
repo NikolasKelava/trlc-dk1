@@ -76,8 +76,14 @@ class BiDK1Follower(Robot):
 
     @property
     def _motors_ft(self) -> dict[str, type]:
-        return {f"left_{motor}.pos": float for motor in self.left_arm.motors} | {
-            f"right_{motor}.pos": float for motor in self.right_arm.motors
+        # Derived from each arm's own declared action features rather than a
+        # motor list: DK1Follower only populates `_motors` in pos_vel mode, and
+        # leaves it None in impedance mode. `action_features` is the one
+        # descriptor that is correct for both modes, and its keys already carry
+        # the ".pos" suffix, matching the left_/right_ prefixing used by
+        # get_observation and send_action below.
+        return {f"left_{key}": float for key in self.left_arm.action_features} | {
+            f"right_{key}": float for key in self.right_arm.action_features
         }
 
     @property
