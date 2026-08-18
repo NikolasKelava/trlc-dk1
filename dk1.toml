@@ -149,3 +149,33 @@ max_joint_rate = false
 max_gripper_rate = 1.0
 max_lag = 0.15
 max_dt = 0.1
+
+# Policy rollout is the case the limiter was written for: a policy nobody has
+# ever seen drive these arms, commanding absolute joint targets at 30 Hz. The
+# cap here is deliberately timid — 0.3 rad/s is about 17 deg/s, slow enough to
+# watch a mistake happen and reach the e-stop. It is the first number to raise
+# once the policy has been seen to behave, not something to leave at `false`.
+#
+# The gripper is NOT slowed to match: a gripper that closes over three seconds
+# fails every grasp, and a slow gripper is not the hazard here.
+[limits.policy]
+max_joint_rate = 0.3
+max_gripper_rate = 1.0
+max_lag = 0.1
+max_dt = 0.1
+
+# --- Policy checkpoint -------------------------------------------------------
+#
+# The MolmoAct2 BimanualYAM checkpoint this cell is evaluated against. `~` is
+# expanded. Override per run with `dk1 policy ... --checkpoint`.
+#
+# This points at the bfloat16 copy converted in the previous iteration of this
+# project (11 GB, converted from lerobot/MolmoAct2-BimanualYAM-LeRobot, whose
+# own model.safetensors is 21.8 GB of float32). Reusing it saves the conversion
+# and the ~20 s per-start cast; `dk1 policy check` verifies it is intact.
+#
+# Two things in that directory's config.json are wrong for us and are overridden
+# at load: "device": "cpu" (would silently run inference on the CPU) and a
+# "pretrained_path" pointing at the HF cache snapshot it was converted from.
+[policy]
+checkpoint = "~/Documents/RobotLearning/trlc-dk1/outputs/molmoact2_bimanual_yam_bf16"

@@ -32,12 +32,14 @@ dk1lab/                 everything this fork adds; the only Python we own
   discovery/cameras.py  by-path enumeration + the labelling loop       (no lerobot import)
   discovery/formats.py  v4l2 capture-mode probing                      (no lerobot import)
   discovery/preview.py  grab a still and show it                       (cv2, no lerobot)
+  checkpoint.py         read a MolmoAct2 checkpoint's metadata     (no lerobot import)
   cameras.py            builds lerobot OpenCVCameraConfig from config
   robot.py              SafeBiDK1Follower — the rate-limited follower
   teleop.py             the one teleoperation implementation
+  policy.py             MolmoAct2 deployment: smoke / dryrun / rollout
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
-tests/                  212 tests, none need hardware
+tests/                  277 tests, none need hardware
 GUIDE.md                operator docs
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
@@ -144,10 +146,23 @@ Checkpoint: `lerobot/MolmoAct2-BimanualYAM-LeRobot` (LeRobot format);
   `layout.yam_joint_signs()` / `yam_joint_offsets()` — **on by default** for
   zero-shot, not an opt-in flag.
 - **Image order is already pinned in the checkpoint.** Its `policy_preprocessor.json`
-  carries `["...top","...left","...right"]`. The inherited claim that the
-  processor sorts alphabetically at deployment is **wrong**; the hazard is real
-  only when *training* rebuilds the processor from a new dataset's features. Pin
-  `--policy.image_keys` for training anyway.
+  carries `["...top","...left","...right"]` — read directly, in the converted
+  bf16 copy. The inherited claim that the processor sorts alphabetically at
+  deployment is **wrong**; the hazard is real only when *training* rebuilds the
+  processor from a new dataset's features. Pin `--policy.image_keys` for training
+  anyway.
+- **`--policy.joint_signs` is a silent no-op at rollout.** Found in Phase 3 by
+  reading LeRobot 0.6.1. `make_pre_post_processors` takes its `pretrained_path`
+  branch whenever a policy is loaded from a path — which is every rollout — and
+  rebuilds both pipelines from `policy_preprocessor.json` /
+  `policy_postprocessor.json`. `config.joint_signs` is read only on the
+  build-from-scratch branch. The BimanualYAM checkpoint ships both pipelines with
+  `joint_signs: null`, so the CLI flag parses, validates, is stored, and does
+  nothing. **The old repo's `eval.sh GRIPPER_FIX=1` would therefore have run with
+  the gripper backwards** — and the failure is symmetric and silent.
+  `dk1lab.policy.apply_gripper_inversion` patches the two loaded pipeline steps
+  instead, and raises rather than warns if it cannot find them. Same class of
+  upstream bug as the two cherry-picks: worth upstreaming, do not do it.
 - **Converted bf16 checkpoint** exists at
   `~/Documents/RobotLearning/trlc-dk1/outputs/molmoact2_bimanual_yam_bf16` (11 GB).
   Reuse it. Its `config.json` bakes in `"device": "cpu"` and an absolute
@@ -161,7 +176,8 @@ Checkpoint: `lerobot/MolmoAct2-BimanualYAM-LeRobot` (LeRobot format);
 ## Evidence status — keep this line sharp
 
 Nothing about MolmoAct2 on the real DK1 has been verified. No dataset recorded,
-no fine-tune completed, no policy has ever driven these arms.
+no fine-tune completed, no policy has ever driven these arms. Phase 3 built the
+tooling and read the checkpoint; it has not yet run a single inference here.
 
 The zero-shot case rests on the colleague's sim work
 (`sai-prasanna/molmoact2`, branch **`sim-eval-dk1`**, single commit `797b179`).
@@ -212,7 +228,7 @@ ports is open any more.
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
-| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | |
+| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **tooling built**, nothing run yet |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
 **Phase 1** — done. Built `dk1 find cameras` (preview a still per candidate with
@@ -252,12 +268,41 @@ resting in a leader trigger gets pushed. `safety.LEADER_HELP` says so.
 `dk1 teleop --dry-run` builds every config and prints it while connecting to
 nothing.
 
-**Phase 3** — escalating risk: (1) smoke test, GPU only, no robot; (2) reuse the
-bf16 checkpoint; (3) dry run — full deployment path with actions **printed, never
-sent**; (4) slow rate-limited rollout with a human on the e-stop. Gripper
-inversion on, image keys pinned, `inference_action_mode=continuous`, bf16, RTC
-(inference measured at ~172 ms ≈ 5 control periods at 30 Hz — unverified number
-inherited from the old repo).
+**Phase 3** — four escalating commands, all built, **none of them run yet**:
+
+| | | risk |
+| --- | --- | --- |
+| `dk1 policy check` | reads the checkpoint's JSON | none — no GPU, no robot |
+| `dk1 policy smoke` | loads it, runs inference on a synthetic frame | GPU only, nothing connected |
+| `dk1 policy dryrun` | full deployment path, actions **printed, never sent** | arms energised, no pose commanded |
+| `dk1 policy run` | the rollout | the policy drives the arms |
+
+`dk1lab/policy.py` is the single implementation; `dk1lab/checkpoint.py` is the
+JSON-only reader behind `check`. Settings are decided in code, not left to a
+command line: gripper inversion on, image keys pinned, `inference_action_mode
+= continuous`, bf16 on cuda, RTC by default (inference ~172 ms ≈ 5 control
+periods at 30 Hz — still the unverified number inherited from the old repo;
+`smoke` is what replaces it with a measurement), `return_to_initial_position`
+forced false.
+
+Two things in the bf16 checkpoint's `config.json` are wrong for us and are
+overridden at load: `"device": "cpu"` and a stale absolute `pretrained_path`.
+`dk1 policy check` passes on it — the weights are 10.1 GiB of bfloat16, the norm
+tag is `yam_dual_molmoact2`, the vectors are 14-D, and the saved preprocessor
+pins top/left/right. That is a file check, not a result.
+
+The speed cap lives in `[limits.policy]`: **0.3 rad/s**, about 17 deg/s. Timid on
+purpose; it is the first number to raise once the policy has been watched, and it
+must not be turned off for a rollout the way teleop's is.
+
+The checkpoint path lives in `[policy]` in `dk1.toml` rather than in Python, for
+the same reason the ports do. `~` is expanded.
+
+What remains for this phase is running it: `smoke` on the GPU, then `dryrun` on
+the arms (which is what finally confirms the gripper convention on hardware —
+watch the two gripper channels with the grippers open and then closed), then a
+short capped rollout with a hand on the e-stop. Report what happens plainly,
+including "it does nothing useful".
 
 **Phase 4** — record → LoRA from the same checkpoint → deploy → scored, labelled
 eval attempts.

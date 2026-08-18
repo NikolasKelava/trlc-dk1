@@ -222,13 +222,63 @@ Not built yet — Phase 4.
 
 ## 6. Evaluate MolmoAct2 zero-shot
 
-Not built yet — Phase 3. This is the first real goal: find out how the
-off-the-shelf `lerobot/MolmoAct2-BimanualYAM-LeRobot` checkpoint behaves on the
-DK1 before recording anything or fine-tuning anything.
+Phase 3, and the first real goal: find out how the off-the-shelf
+`lerobot/MolmoAct2-BimanualYAM-LeRobot` checkpoint behaves on this cell before
+recording anything or fine-tuning anything. Four commands, in escalating order of
+risk. Do them in that order — each one catches failures the next would otherwise
+find with the arms live.
 
-It will run in escalating order of risk — model loads and returns a chunk (GPU
-only, no robot) → dry run of the full deployment path with actions printed and
-never sent → a slow, hard-rate-limited rollout with a human on the e-stop.
+```fish
+dk1 policy check                       # reads JSON. No GPU, no robot, no motion.
+dk1 policy smoke                       # loads the model, runs inference. GPU only.
+dk1 policy dryrun --task "..."         # arms attached; actions PRINTED, never sent.
+dk1 policy run --task "..."            # the rollout. The policy drives the arms.
+```
+
+The checkpoint comes from `[policy]` in `dk1.toml`; `--checkpoint` overrides it
+per run.
+
+**`check`** compares the checkpoint against what this cell provides: 14-D state
+and action, the `yam_dual_molmoact2` normalisation statistics, and the
+`top` / `left` / `right` image order. It reads the *saved processor pipelines*,
+not just `config.json`, because those are what actually run.
+
+**`smoke`** loads the policy on the GPU and runs inference on a synthetic frame.
+Nothing is connected and no `/dev` node is opened, so it is safe with the cell
+powered down. Its useful output is the steady-state latency: anything above one
+control period (33 ms at 30 Hz) means the rollout needs `--rtc`, which is the
+default.
+
+**`dryrun`** does everything a rollout does except the last step. It prints, per
+tick, where every joint is and where the policy wants it. Two things to look for:
+
+* a large delta on the first tick means the policy disagrees with your start
+  pose, and a rollout would begin by driving there — reposition first;
+* the two gripper channels, watched with the grippers open and then closed, are
+  what confirm the gripper convention on real hardware.
+
+It **energises the arms** (connecting always does) but never calls
+`send_action`. `--build-only` prints everything and connects to nothing.
+
+**`run`** is the rollout. It is capped by `[limits.policy]` — 0.3 rad/s, about
+17 deg/s — and stopping disconnects without moving anything. Keep a hand on the
+e-stop. `--dry-run` prints the whole configuration without connecting.
+
+### The gripper is inverted, and LeRobot will not do it for you
+
+The DK1 normalises its gripper as 0 = open, 1 = closed. The checkpoint uses the
+opposite: 1 = open, 0 = closed. Left uncorrected, the policy opens the gripper
+every time it means to close it.
+
+MolmoAct2 has the knob for this — `joint_signs` / `joint_offsets` — but on the
+`lerobot-rollout` command line it does nothing. When a policy is loaded from a
+path, LeRobot rebuilds both processor pipelines from the checkpoint's saved
+`policy_preprocessor.json` and `policy_postprocessor.json`, and never consults
+the policy config; the BimanualYAM checkpoint ships both with `joint_signs:
+null`. `--policy.joint_signs=...` parses, validates, and is then ignored.
+
+`dk1 policy` patches the two pipeline steps directly after loading, always, and
+refuses to run if it cannot find them. There is no flag to turn it off.
 
 ## 7. Fine-tune and deploy
 
@@ -263,3 +313,10 @@ is promising but carries no measured success rates.
 The arm sides were confirmed directly, so nothing about the device config is
 open. Teleoperation through this fork has now driven the arms, which is what the
 uncapped default came out of — the first run, at 1.5 rad/s, felt sluggish.
+
+Added in Phase 3, and worth being precise about: the converted bfloat16
+checkpoint on this machine has been read and checked (`dk1 policy check` passes),
+and the gripper-inversion hole in LeRobot's rollout path was found by reading
+LeRobot 0.6.1's own source. Neither of those is a result on the robot. No
+inference has been run in this repo and the policy has still never driven these
+arms.

@@ -110,6 +110,19 @@ class LimitProfile:
 
 
 @dataclass(frozen=True)
+class PolicySettings:
+    """``[policy]`` — where the MolmoAct2 checkpoint lives on this machine.
+
+    Not a device, but the same argument applies: the checkpoint is a machine-
+    specific path, it is needed by more than one command, and the alternative is
+    a constant baked into Python. The section is optional — every policy command
+    also takes ``--checkpoint``.
+    """
+
+    checkpoint: str
+
+
+@dataclass(frozen=True)
 class DK1Config:
     """A validated ``dk1.toml``."""
 
@@ -118,6 +131,7 @@ class DK1Config:
     cameras: dict[str, CameraDevice]
     capture: dict[str, CaptureProfile]
     limits: dict[str, LimitProfile] = field(default_factory=dict)
+    policy: PolicySettings | None = None
     path: Path = field(default=DEFAULT_CONFIG_PATH, compare=False)
 
     def camera(self, name: str) -> CameraDevice:
@@ -143,6 +157,15 @@ class DK1Config:
         a fact about teleoperation or about a policy, not about the config format.
         """
         return self.limits.get(name, default)
+
+    def checkpoint(self) -> str:
+        """The configured policy checkpoint, or a message saying how to set one."""
+        if self.policy is None:
+            raise ConfigError(
+                f"{self.path}: no [policy] section, so there is no default checkpoint. "
+                f"Pass --checkpoint, or add:\n\n    [policy]\n    checkpoint = \"...\"\n"
+            )
+        return self.policy.checkpoint
 
     def arm_ports(self) -> dict[str, str]:
         """All four ports, keyed ``<role>_<side>``, for reporting."""
@@ -322,12 +345,30 @@ def parse(raw: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> DK1Config:
             raise ConfigError(f"{path}: [limits.{name}] has unknown keys {unexpected}")
         limits[name] = LimitProfile(max_joint_rate=max_joint_rate, **values)
 
+    # --- policy (optional) ---
+    policy: PolicySettings | None = None
+    policy_raw = raw.get("policy")
+    if policy_raw is not None:
+        if not isinstance(policy_raw, dict):
+            raise ConfigError(f"{path}: [policy] must be a table, got {type(policy_raw).__name__}")
+        checkpoint = policy_raw.get("checkpoint")
+        if not isinstance(checkpoint, str) or not checkpoint.strip():
+            raise ConfigError(
+                f"{path}: [policy].checkpoint must be a non-empty string "
+                f"(a local directory or a Hugging Face repo id), got {checkpoint!r}"
+            )
+        unexpected = [key for key in policy_raw if key != "checkpoint"]
+        if unexpected:
+            raise ConfigError(f"{path}: [policy] has unknown keys {unexpected}")
+        policy = PolicySettings(checkpoint=checkpoint)
+
     return DK1Config(
         follower=ports["follower"],
         leader=ports["leader"],
         cameras=cameras,
         capture=capture,
         limits=limits,
+        policy=policy,
         path=path,
     )
 
