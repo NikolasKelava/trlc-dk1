@@ -5,7 +5,7 @@ from __future__ import annotations
 import typer
 
 from ..config import ConfigError
-from . import config_cmds, find_cmds
+from . import config_cmds, find_cmds, teleop_cmds
 
 HELP = """Operate the bimanual TRLC-DK1: devices, teleoperation, policies.
 
@@ -23,6 +23,7 @@ app = typer.Typer(
 
 app.add_typer(config_cmds.app, name="config", help="Inspect and check dk1.toml.")
 app.add_typer(find_cmds.app, name="find", help="Identify the arm serial ports and the cameras.")
+app.command("teleop", help=teleop_cmds.HELP)(teleop_cmds.teleop)
 
 
 def main() -> None:

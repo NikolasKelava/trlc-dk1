@@ -34,9 +34,10 @@ dk1lab/                 everything this fork adds; the only Python we own
   discovery/preview.py  grab a still and show it                       (cv2, no lerobot)
   cameras.py            builds lerobot OpenCVCameraConfig from config
   robot.py              SafeBiDK1Follower — the rate-limited follower
+  teleop.py             the one teleoperation implementation
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
-tests/                  158 tests, none need hardware
+tests/                  194 tests, none need hardware
 GUIDE.md                operator docs
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
@@ -197,40 +198,49 @@ Added in Phase 1, on the hardware:
   each subsystem directory, which is all that is relied on — but do not compare
   the two namespaces.
 
-Still *not* verified: which arm of each pair is the left one. USB identity cannot
-see it and it was carried over from `ports.toml` rather than re-derived. Only
-`dk1 find arms` settles it, and it needs someone at the hardware to unplug cables.
+**The arm sides are confirmed** — Nikolas verified the four ports in `dk1.toml`
+are correct as they stand, so `dk1 find arms` was not needed. Nothing about the
+ports is open any more.
 
 ## Phases
 
 | | | |
 | --- | --- | --- |
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
-| **1** | Device discovery on the hardware | tooling **done** + camera/port facts verified; the `find arms` unplug run is outstanding |
-| **2** | Teleoperation | |
+| **1** | Device discovery on the hardware | **done** |
+| **2** | Teleoperation | **built, not yet run on the arms** — Nikolas gates the first `dk1 teleop` |
 | **3** | Zero-shot MolmoAct2 evaluation — the first real goal | |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
-**Phase 1** — done except one step that needs hands on the hardware.
-
-Built: `dk1 find cameras` (preview a still per candidate with rotation applied,
-prompt for `top`/`left`/`right`, write via `write_cameras`); `dk1 find arms
---inspect` (read-only USB identity); `dk1 config check --formats` (does each
-camera really advertise every `[capture.*]` profile — OpenCV will not tell you: it
-accepts an unavailable size and silently substitutes the nearest one it has, which
-would hand the policy a different aspect ratio than training used); and a
-cross-check that refuses to write an arms section contradicting the adapter
+**Phase 1** — done. Built `dk1 find cameras` (preview a still per candidate with
+rotation applied, prompt for `top`/`left`/`right`, write via `write_cameras`),
+`dk1 find arms --inspect` (read-only USB identity), `dk1 config check --formats`
+(does each camera really advertise every `[capture.*]` profile — OpenCV will not
+tell you: it accepts an unavailable size and silently substitutes the nearest one
+it has, which would hand the policy a different aspect ratio than training used),
+and a cross-check that refuses to write an arms section contradicting the adapter
 families. Findings are in the verified list above.
 
-**Outstanding: `dk1 find arms` has not been run.** It needs an operator to unplug
-one arm at a time, so ask — do not try to work around it. The contradiction it was
-meant to settle is already settled by USB identity; what remains is confirming
-left from right within each pair.
+**Phase 2** — built; **not yet run on the arms**. `dk1 teleop` is the single
+entry point, `dk1lab/teleop.py` the single implementation.
 
-**Phase 2** — one teleop implementation, one entry point, a flag for
-cameras/visualisation. The old repo had three near-duplicate copies. Cameras must
-be named `top`/`left`/`right`, not `wrist_left`/`wrist_right`. This is the
-checkpoint proving the ported plugin and motor stack are intact.
+The control loop is LeRobot's `teleop_loop`, imported rather than reimplemented,
+because recording and rollout run that same loop — a bespoke loop here could work
+while the one every later phase depends on does not.
+
+Two numbers in `dk1lab/teleop.py` are **unverified guesses** and are the first
+thing to revisit after a real run: `TELEOP_MAX_JOINT_RATE = 1.5` rad/s and
+`TELEOP_MAX_LAG = 0.35` rad. The limiter's own defaults (0.2 rad/s, 0.15 rad) are
+sized for a policy nobody trusts yet and a human outruns them instantly; too low
+and the follower visibly cannot keep up, which would say nothing about whether
+the stack works. Both are `--max-joint-rate` / `--max-lag` on the CLI.
+
+Also newly documented: **connecting a leader is motion too.** `DK1Leader.configure`
+torques the leader gripper servo and drives it to `gripper_open_pos`, so a finger
+resting in a leader trigger gets pushed. `safety.LEADER_HELP` says so.
+
+`dk1 teleop --dry-run` builds every config and prints it while connecting to
+nothing — that path is exercised, the real one is not.
 
 **Phase 3** — escalating risk: (1) smoke test, GPU only, no robot; (2) reuse the
 bf16 checkpoint; (3) dry run — full deployment path with actions **printed, never

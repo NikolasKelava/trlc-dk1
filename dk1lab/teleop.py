@@ -1,0 +1,207 @@
+"""Teleoperation: drive the followers from the leader arms.
+
+One implementation, reached through one entry point (``dk1 teleop``). The
+previous iteration of this project had three near-duplicate teleop scripts that
+drifted apart on camera names and safety defaults; the point of this module is
+that there is nowhere for a second copy to live.
+
+The control loop itself is LeRobot's ``teleop_loop``, imported rather than
+reimplemented. That is deliberate: recording and policy rollout run the same
+loop, so teleoperation exercising it is what makes this phase a real check that
+the ported plugin and motor stack are intact — a bespoke loop here could work
+while the one every later phase depends on does not.
+
+What this module owns is everything around that loop:
+
+* device identity comes from ``dk1.toml``, so teleop cannot drift from what the
+  policy will later be given;
+* cameras are named ``top`` / ``left`` / ``right`` via
+  :func:`dk1lab.cameras.camera_configs`, which is the naming the MolmoAct2
+  checkpoint requires — the old repo called them ``wrist_left`` / ``wrist_right``
+  and would have failed the rollout context's feature check;
+* the follower is always :class:`dk1lab.robot.SafeBiDK1Follower`, so the joint
+  speed limit applies in impedance mode as well;
+* stopping disconnects and nothing else. The arms are never swept home.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+
+from lerobot_robot_trlc_dk1.bi_leader import BiDK1Leader, BiDK1LeaderConfig
+
+from .cameras import camera_configs
+from .config import DK1Config
+from .limiter import DEFAULT_MAX_DT, DEFAULT_MAX_GRIPPER_RATE
+from .robot import SafeBiDK1Follower, SafeBiDK1FollowerConfig
+
+#: Joint speed cap for teleoperation, rad/s.
+#:
+#: The limiter's own default (0.2 rad/s, ~11 deg/s) is a deliberate crawl sized
+#: for a policy nobody trusts yet. A human moving a leader arm outruns that
+#: immediately, and a follower that visibly cannot keep up would tell you nothing
+#: about whether the stack works. 1.5 rad/s (~86 deg/s) is brisk enough to track a
+#: hand while still meaning a runaway command crosses the workspace in seconds
+#: rather than instantly.
+#:
+#: UNVERIFIED as a number: it has not been felt on the hardware. Tune it with
+#: ``--max-joint-rate`` on the first run.
+TELEOP_MAX_JOINT_RATE: float = 1.5
+
+#: Anti-windup cap for teleoperation, rad (~20 deg of lead).
+#:
+#: Raised from the limiter's 0.15 for the same reason. ``max_lag`` bounds how far
+#: the command may lead the *measured* position, and under impedance control a
+#: fast-moving arm legitimately trails its setpoint — a cap tighter than that
+#: normal tracking error would throttle motion the operator asked for, rather
+#: than catching a fault. Also unverified; tune with ``--max-lag``.
+TELEOP_MAX_LAG: float = 0.35
+
+#: Loop rate. The leader is read over a Dynamixel bus and the follower written
+#: over a CAN adapter, and LeRobot's loop additionally reads a full observation
+#: every tick, so the achievable rate is an empirical question — the loop prints
+#: what it actually gets.
+DEFAULT_FPS: int = 60
+
+
+@dataclass(frozen=True)
+class TeleopLimits:
+    """The speed limit teleoperation runs under.
+
+    Separate from the CLI so the defaults are stated once, in a place a test can
+    assert against.
+    """
+
+    max_joint_rate: float | None = TELEOP_MAX_JOINT_RATE
+    max_gripper_rate: float = DEFAULT_MAX_GRIPPER_RATE
+    max_lag: float = TELEOP_MAX_LAG
+    max_dt: float = DEFAULT_MAX_DT
+
+    def unlimited(self) -> TeleopLimits:
+        """The same limits with the joint cap removed. Deliberately explicit."""
+        return replace(self, max_joint_rate=None)
+
+
+def leader_config(config: DK1Config) -> BiDK1LeaderConfig:
+    """The leader pair, from ``dk1.toml``."""
+    return BiDK1LeaderConfig(
+        left_arm_port=config.leader.left,
+        right_arm_port=config.leader.right,
+        id="dk1_leader",
+    )
+
+
+def follower_config(
+    config: DK1Config,
+    *,
+    cameras: bool = True,
+    profile: str = "teleop",
+    control_mode: str = "impedance",
+    limits: TeleopLimits | None = None,
+) -> SafeBiDK1FollowerConfig:
+    """The rate-limited follower pair, from ``dk1.toml``.
+
+    Args:
+        cameras: attach the three cameras. Off makes the loop cheaper and is the
+            right choice when all you want to know is whether the arms track.
+        profile: which ``[capture.*]`` profile the cameras run at. ``teleop`` by
+            default — nothing downstream depends on it, so it is sized to be
+            looked at. Recording will want ``policy``.
+        control_mode: ``impedance`` (upstream's default) or ``pos_vel``.
+        limits: speed limit. ``None`` means :class:`TeleopLimits` defaults.
+    """
+    limits = limits or TeleopLimits()
+    return SafeBiDK1FollowerConfig(
+        left_arm_port=config.follower.left,
+        right_arm_port=config.follower.right,
+        cameras=camera_configs(config, profile) if cameras else {},
+        control_mode=control_mode,
+        max_joint_rate=limits.max_joint_rate,
+        max_gripper_rate=limits.max_gripper_rate,
+        max_lag=limits.max_lag,
+        max_dt=limits.max_dt,
+        id="dk1_follower",
+    )
+
+
+def build(
+    config: DK1Config,
+    *,
+    cameras: bool = True,
+    profile: str = "teleop",
+    control_mode: str = "impedance",
+    limits: TeleopLimits | None = None,
+) -> tuple[BiDK1Leader, SafeBiDK1Follower]:
+    """Construct both devices. Constructing connects to nothing."""
+    leader = BiDK1Leader(leader_config(config))
+    follower = SafeBiDK1Follower(
+        follower_config(
+            config,
+            cameras=cameras,
+            profile=profile,
+            control_mode=control_mode,
+            limits=limits,
+        )
+    )
+    return leader, follower
+
+
+def run(
+    leader: BiDK1Leader,
+    follower: SafeBiDK1Follower,
+    *,
+    fps: int = DEFAULT_FPS,
+    display: bool = False,
+    duration_s: float | None = None,
+) -> None:
+    """Connect, run LeRobot's teleop loop, and disconnect. **Moves the arms.**
+
+    Connecting is itself motion — see :mod:`dk1lab.cli.safety`. Ctrl-C leaves the
+    loop and disconnects; it does not move the arms anywhere, and there is
+    deliberately no return-to-home.
+
+    Args:
+        display: stream observations to Rerun. Needs cameras to be worth much.
+        duration_s: stop after this long. ``None`` runs until interrupted.
+    """
+    # Imported here, not at module scope: pulling in LeRobot's script module
+    # drags in every first-party robot and teleoperator class, which is a slow
+    # import to pay for on `dk1 --help`.
+    from lerobot.processor import make_default_processors
+    from lerobot.scripts.lerobot_teleoperate import teleop_loop
+    from lerobot.utils.visualization_utils import init_visualization, shutdown_visualization
+
+    teleop_action_processor, robot_action_processor, robot_observation_processor = (
+        make_default_processors()
+    )
+
+    if display:
+        init_visualization("rerun", session_name="dk1-teleop")
+
+    # Leader first: it is the passive half, and connecting it before the
+    # followers are live means a hand already resting on a leader arm cannot
+    # command anything yet.
+    leader.connect()
+    follower.connect()
+    try:
+        teleop_loop(
+            teleop=leader,
+            robot=follower,
+            fps=fps,
+            teleop_action_processor=teleop_action_processor,
+            robot_action_processor=robot_action_processor,
+            robot_observation_processor=robot_observation_processor,
+            display_data=display,
+            duration=duration_s,
+        )
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Disconnect in both cases. SafeBiDK1Follower.disconnect does not move
+        # the arms, and there is no return-to-home here by design: sweeping the
+        # arms home is the last thing you want when you stopped because
+        # something was wrong.
+        if display:
+            shutdown_visualization("rerun")
+        follower.disconnect()
+        leader.disconnect()

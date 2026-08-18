@@ -6,6 +6,10 @@ plainly every time:
 
 * Connecting a follower is itself motion: it energises all motors and self-zeroes
   both grippers by closing them until they stall.
+* Connecting a *leader* is motion too, which is easier to forget because the
+  leaders are otherwise passive handles: ``DK1Leader.configure`` torques the
+  leader gripper servo and drives it to ``gripper_open_pos``. A finger resting in
+  a leader trigger gets pushed.
 * Stopping never moves the arms. Return-to-home is opt-in, because sweeping the
   arms home is the last thing you want when you stopped because something is
   wrong.
@@ -32,12 +36,21 @@ ENERGISE_HELP = (
 )
 
 
-def confirm_motion(what: str, *, assume_yes: bool = False) -> None:
+#: Appended to the ``--help`` of any command that connects the leader arms.
+LEADER_HELP = (
+    "\n\n[!] ALSO MOVES THE LEADERS. Connecting a leader torques its gripper servo "
+    "and drives it open. Keep fingers out of the leader triggers."
+)
+
+
+def confirm_motion(what: str, *, assume_yes: bool = False, notes: list[str] | None = None) -> None:
     """Print the pre-connect warning and require an explicit go-ahead.
 
     Args:
         what: short description of what is about to happen.
         assume_yes: skip the prompt (``--yes``). The warning is still printed.
+        notes: extra lines shown inside the banner, for motion specific to one
+            command — the leader grippers opening during teleoperation, say.
     """
     typer.secho("", err=True)
     typer.secho("  " + "!" * 68, fg=typer.colors.YELLOW, err=True)
@@ -53,6 +66,8 @@ def confirm_motion(what: str, *, assume_yes: bool = False) -> None:
         fg=typer.colors.YELLOW,
         err=True,
     )
+    for note in notes or []:
+        typer.secho(f"  {note}", fg=typer.colors.YELLOW, err=True)
     typer.secho(
         "  Clear the workspace, keep hands clear of the grippers, e-stop in reach.",
         fg=typer.colors.YELLOW,

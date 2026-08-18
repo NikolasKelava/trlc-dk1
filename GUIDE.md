@@ -150,7 +150,56 @@ the first.
 
 ## 4. Teleoperate
 
-Not built yet — Phase 2.
+```bash
+uv run dk1 teleop --dry-run     # what would run; connects to nothing
+uv run dk1 teleop               # the real thing. MOVES THE ARMS.
+```
+
+`--dry-run` builds every config and prints the ports, camera names, resolutions
+and speed limit without opening a single device. Do that first on a cell you have
+not run before — it is free and it catches a wrong port or a missing camera before
+anything is energised.
+
+The real run warns on stderr and asks before it connects. **Two things move when
+it connects**, before you touch a leader arm at all:
+
+* the follower energises every motor and self-zeroes both grippers by driving
+  them closed until they stall;
+* each *leader* torques its gripper servo and drives it open — easy to forget,
+  because the leaders are otherwise passive handles. Keep fingers out of the
+  leader triggers.
+
+Ctrl-C stops. Stopping disconnects and does nothing else: the arms are never
+swept home. That is deliberate — sweeping the arms home is the last thing you
+want when you stopped because something was wrong.
+
+### Options worth knowing
+
+```bash
+uv run dk1 teleop --no-cameras          # arms only; cheaper loop
+uv run dk1 teleop --display             # stream to Rerun
+uv run dk1 teleop --fps 30              # slower loop
+uv run dk1 teleop --max-joint-rate 0.6  # tighter speed cap
+uv run dk1 teleop --duration 20         # stop by itself after 20 s
+```
+
+**The speed cap.** Teleop runs at 1.5 rad/s (~86 °/s) per joint, well above the
+0.2 rad/s the limiter defaults to for policies. A human moving a leader arm
+outruns 0.2 rad/s instantly, and a follower that visibly cannot keep up would
+tell you nothing about whether the stack works. Both that number and `--max-lag`
+(0.35 rad) are **starting points that have not been felt on the hardware** — if
+the followers feel sluggish or rubbery, those are the two knobs. `--no-limit`
+removes the cap entirely; have a reason.
+
+**Camera names are not an option.** They are always `top` / `left` / `right`,
+because that is what the MolmoAct2 checkpoint requires and therefore what
+recording will need. The old repo called them `wrist_left` / `wrist_right`, which
+cannot work.
+
+Teleop is also the checkpoint that the ported LeRobot plugin and the DM4310 /
+DM4340 motor stack are intact. It runs LeRobot's own `teleop_loop` — the same loop
+recording and policy rollout use — rather than a bespoke one, so it exercises the
+path every later phase depends on.
 
 ## 5. Record a dataset
 
@@ -196,6 +245,8 @@ recorded, no fine-tune completed, and no policy has ever driven these arms. The
 evidence that zero-shot is worth trying is a colleague's simulation work, which
 is promising but carries no measured success rates.
 
-Still open on the device side: which arm of each pair is the left one has been
-taken from the earlier project's `ports.toml` rather than re-derived here. USB
-identity cannot settle it; run `dk1 find arms` to confirm it by unplugging.
+The arm sides were confirmed directly, so nothing about the device config is
+open. What is not verified is teleoperation *through this fork*: `dk1 teleop` has
+been built and its construction path exercised end to end with `--dry-run`, but it
+has not yet driven the arms. Its two speed-limit numbers are starting points, not
+measurements.
