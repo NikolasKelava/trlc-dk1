@@ -9,6 +9,7 @@ import typer
 
 from ..cameras import cameras_cli_argument
 from ..config import DEFAULT_CONFIG_PATH, ConfigError, check_devices, load
+from .formats_report import report_formats
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -42,10 +43,19 @@ def check(
     devices: Annotated[
         bool, typer.Option("--devices/--no-devices", help="Also require every device node to exist.")
     ] = True,
+    formats: Annotated[
+        bool,
+        typer.Option(
+            "--formats",
+            help="Also ask each camera whether it really offers every capture profile.",
+        ),
+    ] = False,
 ) -> None:
     """Validate dk1.toml, and check every configured device is present.
 
-    Read-only: opens no serial port and no camera, so nothing is energised.
+    Read-only: opens no serial port, and nothing is energised. With --formats it
+    additionally interrogates each camera's advertised capture modes, which does
+    not open a stream either.
     """
     cfg = load(config)
     typer.secho(f"{cfg.path}: valid", fg=typer.colors.GREEN)
@@ -57,6 +67,21 @@ def check(
         typer.secho(f"\n{exc}\n", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     typer.secho("all 4 arm ports and 3 cameras present", fg=typer.colors.GREEN)
+
+    if not formats:
+        return
+    typer.secho("\ncapture profiles, as advertised by each camera", bold=True)
+    complete = True
+    for name, device in cfg.cameras.items():
+        typer.echo(f"  {name}")
+        complete &= report_formats(device.path, cfg.capture)
+    if not complete:
+        typer.secho(
+            "\nat least one camera does not offer a configured profile — see above.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
 
 @app.command("cameras-arg")

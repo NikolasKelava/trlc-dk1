@@ -28,20 +28,29 @@ dk1lab/                 everything this fork adds; the only Python we own
   config.py             dk1.toml load / validate / surgical write      (no lerobot import)
   limiter.py            slew-rate limiter                              (no lerobot import)
   discovery/arms.py     serial-port identification by unplugging       (no lerobot import)
-  discovery/cameras.py  by-path camera enumeration                     (no lerobot import)
+  discovery/ports.py    serial-port identity from USB vid/pid          (no lerobot import)
+  discovery/cameras.py  by-path enumeration + the labelling loop       (no lerobot import)
+  discovery/formats.py  v4l2 capture-mode probing                      (no lerobot import)
+  discovery/preview.py  grab a still and show it                       (cv2, no lerobot)
   cameras.py            builds lerobot OpenCVCameraConfig from config
   robot.py              SafeBiDK1Follower — the rate-limited follower
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
-tests/                  103 tests, none need hardware
+tests/                  158 tests, none need hardware
 GUIDE.md                operator docs
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
 ```
 
-The dependency split is deliberate: the four modules marked *no lerobot import*
-stay importable without torch, so config handling and its tests are fast and work
-on a machine with no robot stack.
+The dependency split is deliberate: the modules marked *no lerobot import* stay
+importable without torch, so config handling and its tests are fast and work on a
+machine with no robot stack. `discovery/preview.py` needs cv2 but not lerobot, and
+imports it inside the functions so the module itself stays cheap.
+
+Every discovery module separates the decision from the I/O — `parse_formats_ext`
+from `probe`, `assign_labels` from the capture-and-prompt callbacks, `detect_removed`
+from `find_arms`, `role_conflicts` from `list_ports`. That is why the whole suite
+runs with no robot attached.
 
 ## Accepted upstream deltas (keep minimal, they are the rebase surface)
 
@@ -166,23 +175,57 @@ that all three cameras report serial `20010101` so `/dev/v4l/by-id` is unusable;
 that MJPG is mandatory (YUYV at 720p60 exceeds the UVC bandwidth allocation); that
 all three cameras are mounted upside down.
 
+Added in Phase 1, on the hardware:
+
+- **All three cameras advertise 640x360 MJPG at 30/50/60 fps.** `[capture.policy]`
+  is real; no 4:3 fallback is needed and the 16:9 aspect the checkpoint was
+  trained on is achievable. `[capture.teleop]` 1280x720 MJPG@60 likewise.
+- **The `top` / `left` / `right` labels in `dk1.toml` are correct**, confirmed by
+  previewing each camera. Hub `10.1` is the overhead view; between `4.3` and `4.4`
+  a fixed object shifts left, so `4.4` is the further-right camera.
+- **The follower/leader split is settled by USB identity.** Followers are
+  `2e88:4603` (HDSC CDC, the Damiao USB-to-CAN adapter `follower.py` opens at
+  921600 baud); leaders are `1a86:55d3` (the serial adapter behind
+  `DynamixelMotorsBus`). Both followers report serial `00000000050C`, so
+  `/dev/serial/by-id` collapses for the pair just as the cameras' does; both
+  leaders have distinct serials. **This kills the old repo's contradiction**: the
+  untracked `robot-ports.txt` claimed `follower.left = /dev/ttyACM2`, but
+  `ttyACM2` is a leader adapter, so the tracked `ports.toml` was right.
+- **A by-path string is not unique across the machine.** The name omits the root
+  hub, and the cameras hang off `usb2` while the arms hang off `usb1`, so
+  `...-usb-0:4.3:1.0` names both the left camera and a leader arm. Unique within
+  each subsystem directory, which is all that is relied on — but do not compare
+  the two namespaces.
+
+Still *not* verified: which arm of each pair is the left one. USB identity cannot
+see it and it was carried over from `ports.toml` rather than re-derived. Only
+`dk1 find arms` settles it, and it needs someone at the hardware to unplug cables.
+
 ## Phases
 
 | | | |
 | --- | --- | --- |
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
-| **1** | Device discovery on the hardware | next |
+| **1** | Device discovery on the hardware | tooling **done** + camera/port facts verified; the `find arms` unplug run is outstanding |
 | **2** | Teleoperation | |
 | **3** | Zero-shot MolmoAct2 evaluation — the first real goal | |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
-**Phase 1** — run `dk1 find arms` on the hardware (settles a contradiction: the
-old repo's `ports.toml` said follower-left is `ttyACM1`, its untracked
-`robot-ports.txt` said `ttyACM2`). Build the camera preview-and-label loop:
-capture a still per candidate, show it, prompt for `top`/`left`/`right`, write via
-`write_cameras`. Probe whether the Innomakers actually offer **640×360 MJPG** —
-`[capture.policy]` assumes they do; fall back to 640×480 and note the aspect
-mismatch if not.
+**Phase 1** — done except one step that needs hands on the hardware.
+
+Built: `dk1 find cameras` (preview a still per candidate with rotation applied,
+prompt for `top`/`left`/`right`, write via `write_cameras`); `dk1 find arms
+--inspect` (read-only USB identity); `dk1 config check --formats` (does each
+camera really advertise every `[capture.*]` profile — OpenCV will not tell you: it
+accepts an unavailable size and silently substitutes the nearest one it has, which
+would hand the policy a different aspect ratio than training used); and a
+cross-check that refuses to write an arms section contradicting the adapter
+families. Findings are in the verified list above.
+
+**Outstanding: `dk1 find arms` has not been run.** It needs an operator to unplug
+one arm at a time, so ask — do not try to work around it. The contradiction it was
+meant to settle is already settled by USB identity; what remains is confirming
+left from right within each pair.
 
 **Phase 2** — one teleop implementation, one entry point, a flag for
 cameras/visualisation. The old repo had three near-duplicate copies. Cameras must

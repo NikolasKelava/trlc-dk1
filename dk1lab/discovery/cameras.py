@@ -9,14 +9,15 @@ Each camera also exposes two ``video`` nodes; only ``-index0`` carries frames
 (``-index1`` is a metadata node), so candidates are filtered to ``-index0``.
 
 Labelling — which by-path node is ``top``, which is ``left``, which is ``right``
-— cannot be derived and has to be seen, so the CLI captures a still from each
-candidate and asks. That part lives in the CLI; everything here is pure enough to
-test against a fake directory listing.
+— cannot be derived and has to be seen, so :func:`assign_labels` shows a still
+from each candidate and asks. Showing and asking are injected, so both halves of
+this module stay testable with no camera: enumeration against a fake directory
+listing, labelling against scripted answers.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -82,3 +83,55 @@ def list_candidates(base: Path = BY_PATH_DIR) -> list[CameraCandidate]:
         device = str(path.resolve()) if path.exists() else None
         resolved.append(CameraCandidate(by_path=candidate.by_path, device=device))
     return resolved
+
+
+class LabelError(Exception):
+    """Raised when the three camera labels could not be assigned unambiguously."""
+
+
+def assign_labels(
+    candidates: Sequence[CameraCandidate],
+    *,
+    names: Sequence[str],
+    show: Callable[[CameraCandidate], None],
+    ask: Callable[[CameraCandidate, Sequence[str]], str],
+    announce: Callable[[str], None] = print,
+) -> dict[str, CameraCandidate]:
+    """Walk the operator through naming each attached camera.
+
+    The pure half of the preview-and-label loop: ``show`` puts a still in front of
+    the operator and ``ask`` returns the name they chose, so the whole flow can be
+    driven by a test with a scripted set of answers and no camera.
+
+    A name already taken is offered again only if the operator frees it, which
+    they do by relabelling — so instead of unwinding, the loop keeps asking until
+    every name is claimed exactly once.
+
+    Raises:
+        LabelError: if there are not exactly as many candidates as names, or a
+            candidate is left unnamed.
+    """
+    if len(candidates) != len(names):
+        raise LabelError(
+            f"{len(candidates)} camera(s) attached but {len(names)} names to assign "
+            f"({', '.join(names)}). All three DK1 cameras must be plugged in and "
+            f"nothing else that presents a video node. Nothing has been written."
+        )
+
+    assigned: dict[str, CameraCandidate] = {}
+    for candidate in candidates:
+        remaining = [name for name in names if name not in assigned]
+        show(candidate)
+        choice = ask(candidate, remaining)
+        if choice not in remaining:
+            raise LabelError(
+                f"{choice!r} is not one of the remaining names ({', '.join(remaining)}). "
+                f"Nothing has been written."
+            )
+        assigned[choice] = candidate
+        announce(f"  {choice:6s} <- hub port {candidate.hub_port}")
+
+    unnamed = [name for name in names if name not in assigned]
+    if unnamed:
+        raise LabelError(f"no camera was labelled {unnamed}. Nothing has been written.")
+    return assigned

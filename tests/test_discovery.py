@@ -6,7 +6,13 @@ import pytest
 
 from dk1lab.config import ArmPorts
 from dk1lab.discovery.arms import ARM_SEQUENCE, DiscoveryError, detect_removed, find_arms
-from dk1lab.discovery.cameras import CameraCandidate, candidates_from_names
+from dk1lab.discovery.cameras import (
+    CameraCandidate,
+    LabelError,
+    assign_labels,
+    candidates_from_names,
+)
+from dk1lab.layout import CAMERA_NAMES
 
 # --------------------------------------------------------------------------- #
 # Arms
@@ -184,3 +190,118 @@ def test_empty_listing_yields_nothing():
 
 def test_hub_port_of_an_unparseable_name_is_marked_unknown():
     assert CameraCandidate(by_path="/dev/v4l/by-path/weird").hub_port == "?"
+
+
+# --------------------------------------------------------------------------- #
+# Labelling the cameras
+# --------------------------------------------------------------------------- #
+
+
+def _candidates(*ports):
+    return [
+        CameraCandidate(by_path=f"/dev/v4l/by-path/pci-0000:00:14.0-usb-0:{p}:1.0-video-index0")
+        for p in ports
+    ]
+
+
+def _scripted(answers):
+    """An ``ask`` that replies from a list, and records what it was offered."""
+    offered = []
+
+    def ask(candidate, remaining):
+        offered.append(list(remaining))
+        return answers.pop(0)
+
+    return ask, offered
+
+
+def test_assign_labels_maps_every_name_to_a_camera():
+    candidates = _candidates("10.1", "4.3", "4.4")
+    ask, _ = _scripted(["top", "left", "right"])
+    labelled = assign_labels(
+        candidates, names=CAMERA_NAMES, show=lambda _: None, ask=ask, announce=lambda _: None
+    )
+    assert set(labelled) == set(CAMERA_NAMES)
+    assert labelled["top"].hub_port == "10.1"
+    assert labelled["right"].hub_port == "4.4"
+
+
+def test_labels_need_not_be_offered_in_enumeration_order():
+    """The operator sees the pictures, not the hub ports; any order is legal."""
+    candidates = _candidates("10.1", "4.3", "4.4")
+    ask, _ = _scripted(["left", "right", "top"])
+    labelled = assign_labels(
+        candidates, names=CAMERA_NAMES, show=lambda _: None, ask=ask, announce=lambda _: None
+    )
+    assert labelled["top"].hub_port == "4.4"
+
+
+def test_a_name_already_taken_is_no_longer_offered():
+    candidates = _candidates("10.1", "4.3", "4.4")
+    ask, offered = _scripted(["top", "left", "right"])
+    assign_labels(
+        candidates, names=CAMERA_NAMES, show=lambda _: None, ask=ask, announce=lambda _: None
+    )
+    assert offered == [["top", "left", "right"], ["left", "right"], ["right"]]
+
+
+def test_every_camera_is_previewed_exactly_once():
+    candidates = _candidates("10.1", "4.3", "4.4")
+    shown = []
+    ask, _ = _scripted(["top", "left", "right"])
+    assign_labels(
+        candidates,
+        names=CAMERA_NAMES,
+        show=shown.append,
+        ask=ask,
+        announce=lambda _: None,
+    )
+    assert [c.hub_port for c in shown] == ["10.1", "4.3", "4.4"]
+
+
+def test_too_few_cameras_refuses_rather_than_labelling_a_subset():
+    ask, _ = _scripted(["top", "left"])
+    with pytest.raises(LabelError, match="2 camera"):
+        assign_labels(
+            _candidates("10.1", "4.3"),
+            names=CAMERA_NAMES,
+            show=lambda _: None,
+            ask=ask,
+            announce=lambda _: None,
+        )
+
+
+def test_an_extra_video_device_refuses_rather_than_guessing():
+    ask, _ = _scripted(["top", "left", "right", "top"])
+    with pytest.raises(LabelError, match="4 camera"):
+        assign_labels(
+            _candidates("10.1", "4.3", "4.4", "9.1"),
+            names=CAMERA_NAMES,
+            show=lambda _: None,
+            ask=ask,
+            announce=lambda _: None,
+        )
+
+
+def test_an_answer_outside_the_remaining_names_is_refused():
+    ask, _ = _scripted(["top", "wrist_left", "right"])
+    with pytest.raises(LabelError, match="wrist_left"):
+        assign_labels(
+            _candidates("10.1", "4.3", "4.4"),
+            names=CAMERA_NAMES,
+            show=lambda _: None,
+            ask=ask,
+            announce=lambda _: None,
+        )
+
+
+def test_a_repeated_name_is_refused_because_it_is_no_longer_remaining():
+    ask, _ = _scripted(["top", "top", "left"])
+    with pytest.raises(LabelError, match="'top'"):
+        assign_labels(
+            _candidates("10.1", "4.3", "4.4"),
+            names=CAMERA_NAMES,
+            show=lambda _: None,
+            ask=ask,
+            announce=lambda _: None,
+        )

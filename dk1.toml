@@ -17,9 +17,22 @@ version = 1
 # enumeration order and can change across reboots or replugs, so re-run
 # `dk1 find arms` if an arm stops responding.
 #
-# UNVERIFIED: carried over from the previous project's ports.toml. That repo
-# also had an untracked robot-ports.txt claiming follower.left = /dev/ttyACM2,
-# which contradicts the value below. `dk1 find arms` settles it.
+# The follower/leader split below is VERIFIED by USB identity (`dk1 find arms
+# --inspect` prints it, `udevadm info -n /dev/ttyACM*` shows it raw):
+#   * ttyACM1, ttyACM3  vid 2e88 pid 4603, "HDSC CDC Device"  -> the Damiao
+#     USB-to-CAN adapters, which is what follower.py opens as a raw 921600 baud
+#     serial port. Both report serial 00000000050C, so /dev/serial/by-id
+#     collapses to one entry for the pair, exactly as the cameras do.
+#   * ttyACM0, ttyACM2  vid 1a86 pid 55d3, "USB Single Serial" -> the Dynamixel
+#     adapters the leaders use via DynamixelMotorsBus. These have distinct
+#     serials (5A68010481, 5A68010285) and so are individually addressable.
+# That settles the old repo's contradiction: its untracked robot-ports.txt
+# claimed follower.left = /dev/ttyACM2, but ttyACM2 is a leader adapter. The
+# tracked ports.toml was right.
+#
+# UNVERIFIED: which side is left and which is right, within each pair. USB
+# identity cannot tell them apart — it is a physical fact. `dk1 find arms`
+# settles it by watching which node disappears when you unplug an arm.
 
 [arms.follower]
 left = "/dev/ttyACM1"
@@ -38,12 +51,21 @@ right = "/dev/ttyACM2"
 # The by-path node encodes the physical USB hub port, so it is stable as long as
 # the camera stays in the same socket. Re-derive with `ls -l /dev/v4l/by-path/`.
 #
+# Do not compare these strings against /dev/serial/by-path: the by-path name
+# omits the root hub, and the cameras hang off usb2 while the arms hang off usb1,
+# so `...-usb-0:4.3:1.0` names *both* the left camera and a leader arm. The
+# strings are unique within each subsystem's directory, which is all that matters
+# here, but they are not unique across the machine.
+#
 # The names top / left / right are not free choices: the MolmoAct2 BimanualYAM
 # checkpoint's image keys are observation.images.{top,left,right}, and the robot's
 # camera keys must match them exactly.
 #
 # All three are currently mounted upside down, hence rotation 180 throughout.
-# VERIFIED on hardware: hub-port assignment, MJPG requirement, rotation.
+# VERIFIED on hardware: hub-port assignment, MJPG requirement, rotation, and the
+# top/left/right labels themselves (previewed via `dk1 find cameras`: 10.1 is the
+# overhead view of the mat; between 4.3 and 4.4 a fixed object shifts left, so
+# 4.4 is the further-right camera).
 
 [cameras.top]
 path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:10.1:1.0-video-index0"
@@ -72,8 +94,9 @@ rotation = 180
 # here is the aspect ratio, not the pixel count: a 4:3 capture would stretch the
 # scene differently than training did.
 #
-# UNVERIFIED: that these cameras offer 640x360 MJPG at all. `dk1 find cameras`
-# probes it; fall back to 640x480 and note the aspect mismatch if they do not.
+# VERIFIED on hardware: all three cameras advertise 640x360 MJPG at 30, 50 and
+# 60 fps. Re-check any time with `dk1 config check --formats`, which reads the
+# advertised modes without opening a stream.
 [capture.policy]
 width = 640
 height = 360

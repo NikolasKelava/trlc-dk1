@@ -80,13 +80,38 @@ Validates the file and confirms all four arm ports and all three cameras are
 present right now. Opens nothing, energises nothing.
 
 ```bash
-uv run dk1 config show          # what is configured
-uv run dk1 find cameras         # what is attached, vs. what is configured
-uv run dk1 find arms            # re-identify the four serial ports
+uv run dk1 config show               # what is configured
+uv run dk1 config check --formats    # ...and do the cameras offer the capture profiles?
+uv run dk1 find arms --inspect       # what each serial port is, by USB identity
+uv run dk1 find cameras --list       # what is attached, vs. what is configured
 ```
 
-`find arms` asks you to unplug one arm at a time and watches which
-`/dev/ttyACM*` node disappears. It reads `/dev` and nothing else.
+None of those four touches a device: they read `/dev` and ask the kernel what it
+already knows. The two that do write are below.
+
+**`dk1 find arms`** asks you to unplug one arm at a time and watches which
+`/dev/ttyACM*` node disappears. Nothing is opened or energised.
+
+You only need it when an arm moves to a different socket, and it is worth knowing
+what it is really for. USB identity already separates followers from leaders: the
+followers sit behind a Damiao USB-to-CAN adapter (`2e88:4603`) and the leaders
+behind a Dynamixel serial adapter (`1a86:55d3`), which `--inspect` shows you for
+free. What identity *cannot* see is which arm of a pair is the left one — that is
+a fact about the room. So the unplugging settles the sides, and the result is
+cross-checked against the adapter families before anything is written; if you
+unplug the wrong cable, it refuses rather than writing a port that cannot be what
+it claims.
+
+**`dk1 find cameras`** grabs one still per attached camera, opens it in an image
+viewer, and asks which view it is — `top`, `left` or `right`. There is no way to
+derive this: the three cameras are the same model and all report the same serial,
+so someone has to look. The still is captured with the mounting rotation already
+applied, so you judge the picture the way the policy will see it. Along the way it
+checks each camera really advertises every `[capture.*]` profile. Nothing is
+energised and the arms do not move; it opens video devices only.
+
+The stills stay on disk (`--outdir` to choose where) so you can re-open one when a
+label turns out to have been wrong two cameras later.
 
 Each of these rewrites **only its own section** of `dk1.toml`. Running
 `find arms` cannot disturb the camera settings, and vice versa; comments and
@@ -95,7 +120,9 @@ every other section survive untouched.
 ### What is in `dk1.toml`
 
 **`[arms.follower]`, `[arms.leader]`** — one `/dev/ttyACM*` per arm. Two arms
-sharing a port is rejected as a discovery mistake.
+sharing a port is rejected as a discovery mistake. Note that `/dev/serial/by-id`
+is no help for the followers: both adapters report serial `00000000050C`, so it
+collapses to a single entry for the pair, exactly as the cameras do.
 
 **`[cameras.top|left|right]`** — the names are not free choices. The MolmoAct2
 checkpoint's image keys are `observation.images.{top,left,right}` and a mismatch
@@ -108,6 +135,12 @@ mounted upside down (180).
 **`[capture.policy|teleop]`** — resolution differs by use, device identity does
 not. `fourcc` is `MJPG` everywhere and should stay that way: YUYV at 720p60 needs
 ~884 Mb/s and the uvc driver fails to allocate it, so reads die immediately.
+
+`config check --formats` asks each camera which modes it actually advertises,
+because OpenCV will not. Given a size a camera does not offer, OpenCV accepts it
+and silently substitutes the nearest one it does — so a profile that looks fine in
+the config would quietly hand the policy a different aspect ratio than it was
+trained on. Both profiles are confirmed offered by all three cameras.
 
 A bad config fails on load with a message naming the offending key, and
 `config check` reports *all* missing devices in one pass rather than stopping at
@@ -150,11 +183,19 @@ impedance and gravity-compensation stack. Bimanual teleoperation, with and
 without cameras. The three camera facts above (shared serial, MJPG requirement,
 upside-down mounting).
 
+Added in Phase 1: all three cameras advertise 640×360 MJPG at 30 fps, so
+`[capture.policy]` is real and no 4:3 fallback is needed. The `top` / `left` /
+`right` labels in `dk1.toml` were confirmed by previewing each camera. The
+follower and leader ports were confirmed by USB adapter identity, which also
+settles a contradiction the earlier project left behind — an untracked
+`robot-ports.txt` there claimed `follower.left = /dev/ttyACM2`, but `ttyACM2` is a
+leader adapter, so the tracked `ports.toml` was the correct one.
+
 **Not verified.** Everything about MolmoAct2 on this robot. No dataset has been
 recorded, no fine-tune completed, and no policy has ever driven these arms. The
 evidence that zero-shot is worth trying is a colleague's simulation work, which
 is promising but carries no measured success rates.
 
-One open assumption worth knowing about: `[capture.policy]` is set to 640×360 to
-match the 16:9 aspect ratio the checkpoint was trained on. It is unconfirmed that
-these cameras offer that mode at all — Phase 1 checks it.
+Still open on the device side: which arm of each pair is the left one has been
+taken from the earlier project's `ports.toml` rather than re-derived here. USB
+identity cannot settle it; run `dk1 find arms` to confirm it by unplugging.
