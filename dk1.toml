@@ -1,0 +1,88 @@
+# dk1.toml — the single source of truth for this DK1 cell's devices.
+#
+# Nothing else in this repo hardcodes a serial port or a /dev path. Edit here,
+# or let `dk1 find arms` / `dk1 find cameras` fill the sections in for you;
+# each of those rewrites only its own section and leaves the rest untouched.
+#
+# Check what is currently configured, and that it is all plugged in:
+#     dk1 config show
+#     dk1 config check
+
+version = 1
+
+# --- Arms --------------------------------------------------------------------
+#
+# One /dev/ttyACM* per arm (Damiao DM4310/DM4340 over CAN-to-USB for the
+# followers, Dynamixel for the leaders). ttyACM numbering is assigned in
+# enumeration order and can change across reboots or replugs, so re-run
+# `dk1 find arms` if an arm stops responding.
+#
+# UNVERIFIED: carried over from the previous project's ports.toml. That repo
+# also had an untracked robot-ports.txt claiming follower.left = /dev/ttyACM2,
+# which contradicts the value below. `dk1 find arms` settles it.
+
+[arms.follower]
+left = "/dev/ttyACM1"
+right = "/dev/ttyACM3"
+
+[arms.leader]
+left = "/dev/ttyACM0"
+right = "/dev/ttyACM2"
+
+# --- Cameras -----------------------------------------------------------------
+#
+# Three Innomaker U30CAM-4K. They must be addressed by /dev/v4l/by-path:
+#   * /dev/videoN is assigned in enumeration order and is not stable.
+#   * /dev/v4l/by-id is unusable — all three share serial 20010101, so only one
+#     of them wins the by-id symlink (verified: by-id lists a single entry).
+# The by-path node encodes the physical USB hub port, so it is stable as long as
+# the camera stays in the same socket. Re-derive with `ls -l /dev/v4l/by-path/`.
+#
+# The names top / left / right are not free choices: the MolmoAct2 BimanualYAM
+# checkpoint's image keys are observation.images.{top,left,right}, and the robot's
+# camera keys must match them exactly.
+#
+# All three are currently mounted upside down, hence rotation 180 throughout.
+# VERIFIED on hardware: hub-port assignment, MJPG requirement, rotation.
+
+[cameras.top]
+path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:10.1:1.0-video-index0"
+rotation = 180
+
+[cameras.left]
+path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.3:1.0-video-index0"
+rotation = 180
+
+[cameras.right]
+path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.4:1.0-video-index0"
+rotation = 180
+
+# --- Capture profiles --------------------------------------------------------
+#
+# Device identity is shared; resolution is not. Teleop wants a big picture to
+# look at, the policy wants the aspect ratio it was trained on.
+#
+# MJPG is mandatory on these cameras. YUYV at 720p60 needs ~884 Mb/s and the
+# uvc driver fails to allocate the bandwidth — reads fail immediately.
+# VERIFIED on hardware.
+
+# What the policy sees. 640x360 is 16:9, matching the images the BimanualYAM
+# checkpoint was trained on (sai-prasanna/molmoact2 @ sim-eval-dk1 renders its
+# cameras at 640x360). MolmoAct2 resizes every view to 224x224, so what matters
+# here is the aspect ratio, not the pixel count: a 4:3 capture would stretch the
+# scene differently than training did.
+#
+# UNVERIFIED: that these cameras offer 640x360 MJPG at all. `dk1 find cameras`
+# probes it; fall back to 640x480 and note the aspect mismatch if they do not.
+[capture.policy]
+width = 640
+height = 360
+fps = 30
+fourcc = "MJPG"
+
+# What you look at during teleoperation. Nothing downstream depends on it.
+[capture.teleop]
+width = 1280
+height = 720
+fps = 60
+fourcc = "MJPG"

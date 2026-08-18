@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# --- dk1lab (fork additions) -------------------------------------------------
+# Run artifacts. Datasets, checkpoints and rollout output are large and
+# regenerable; none of it belongs in git.
+outputs/
+checkpoints/
+datasets/
+wandb/
+*.safetensors
+
+# Editor swap files. A stale kate swap file in the previous iteration of this
+# project sat next to the config long enough to be mistaken for it.
+*.kate-swp
+*.swp
+*.swo
+*~
+
+# Written atomically by dk1lab.config; never a real file for more than a moment.
+dk1.toml.tmp
