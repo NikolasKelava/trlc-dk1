@@ -100,12 +100,19 @@ discovery globs.
 ## Safety (non-negotiable)
 
 - **Connecting is not passive.** `connect()` energises every motor and self-zeroes
-  both grippers by driving them closed until they stall. Every command that
-  connects must say so in `--help` and warn again on stderr before acting.
-  Helpers: `dk1lab/cli/safety.py`.
+  both grippers by driving each at velocity until it stalls against its **open**
+  stop, then zeroing there (`follower.py`: `gripper_open_pos = 0.0` is *greater*
+  than `gripper_closed_pos = -4.7`, so the positive velocity in the calibration
+  opens). Every command that connects must say so in `--help` and warn again on
+  stderr before acting. Helpers: `dk1lab/cli/safety.py`.
+  The inherited wording said "driving them **closed** until they stall" and was
+  wrong — a safety notice pointing at the wrong hazard. Corrected in Phase 3
+  after Nikolas confirmed the grippers do not close on connect.
 - **Stopping never moves the arms.** `return_to_initial_position` defaults to
   `true` in LeRobot's rollout — always set it `false`. Return-to-home is opt-in
-  only.
+  only. Note what "never moves" does and does not mean: nothing is *commanded*,
+  but a clean disconnect in impedance mode reaches `DK1MotorChain.stop()`, which
+  **disables every motor** — so a raised arm sags. Support anything held up.
 - **The speed limit lives in the follower**, and in `dk1.toml`. `SafeBiDK1Follower`
   (`--robot.type=bi_dk1_follower_safe`) limits in *both* control modes; the
   numbers come from `[limits.<activity>]`, where `false` spells "no cap".
@@ -216,6 +223,29 @@ Added in Phase 1, on the hardware:
   `...-usb-0:4.3:1.0` names both the left camera and a leader arm. Unique within
   each subsystem directory, which is all that is relied on — but do not compare
   the two namespaces.
+
+Added in Phase 3, **on the hardware** (`dk1 policy dryrun`, 10 steps, nothing
+sent):
+
+- **`0 = open` is confirmed on the real grippers.** They were open before the run
+  and stayed open through it, reporting exactly `0.0000`. Connecting does not
+  close them — which also kills the inherited "self-zeroes by driving them closed"
+  safety line, now corrected everywhere.
+- **The policy agrees with the start pose.** Worst first-tick disagreement was
+  `left_joint_4` at 0.065 rad (3.7°); everything else under 0.02 rad. Nothing
+  would lurch.
+- **The chunk's own speed is ~0.2 rad/s** — 0.0065 rad per step at 30 Hz, read
+  off one 30-step chunk unrolling against a frozen robot. That sits just under
+  the 0.3 rad/s cap, so the limiter is a bound rather than a brake.
+- **The gripper command is consistent with the inversion.** The model output
+  ≈0.99 ("open" in YAM) and the arms were told ≈0.008 ("open" on the DK1).
+  Uninverted, the first tick would have commanded 0.99 = fully closed. Still not
+  proof — the model has not been seen to *change* the gripper — but the right sign.
+
+Also found here: `make_robot_from_config` builds a robot by *class-name lookup*
+in the package holding its config's module, which registration alone does not
+satisfy. `dk1lab/__init__.py` exposes `SafeBiDK1Follower` through a lazy
+`__getattr__` for exactly this. Teleoperation never hit it.
 
 Added in Phase 3, on this machine (GPU only — no robot was involved):
 

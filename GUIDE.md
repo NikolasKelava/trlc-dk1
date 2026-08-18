@@ -28,10 +28,15 @@ uv run pytest -q          # 103 tests, none need hardware
 ## 2. Safety — read before connecting
 
 **Connecting is not passive.** Connecting a follower arm energises every motor
-and self-zeroes both grippers by driving them closed until they stall. That
+and self-zeroes both grippers: each gripper is driven at velocity until it
+stalls against its **open** stop, and that position is taken as zero. That
 calibration runs every time, before any of your code. Clear the workspace, keep
 hands and cables away from the grippers, and expect the arms to stiffen and hold
 position the moment a command connects.
+
+A gripper standing open reads `0.0000`, which is where the DK1's `0 = open,
+1 = closed` convention comes from — and it is the opposite of the checkpoint's.
+See section 6.
 
 Every command that connects says so in its `--help` and warns again before it
 acts. Commands that only read `/dev` — everything in section 3 — connect to
@@ -176,7 +181,7 @@ The real run warns on stderr and asks before it connects. **Two things move when
 it connects**, before you touch a leader arm at all:
 
 * the follower energises every motor and self-zeroes both grippers by driving
-  them closed until they stall;
+  them open against their stop;
 * each *leader* torques its gripper servo and drives it open — easy to forget,
   because the leaders are otherwise passive handles. Keep fingers out of the
   leader triggers.
@@ -324,5 +329,10 @@ model call, 11.1 GiB peak, a 14-D action in the right key order, with the grippe
 inversion applied. The gripper-inversion hole in LeRobot's rollout path was found
 by reading LeRobot 0.6.1's source.
 
-None of that is a result on the robot. The policy has still never driven these
-arms, and what it does when it can is exactly what Phase 3 is for.
+On the hardware, `dk1 policy dryrun` has now run: the plumbing works end to end,
+the policy agrees with the start pose to within 0.065 rad, its intended speed is
+about 0.2 rad/s, and `0 = open` on the grippers is confirmed — they read 0.0000
+standing open, and connecting does not close them.
+
+The policy has still never *driven* these arms, and what it does when it can is
+exactly what Phase 3 is for.

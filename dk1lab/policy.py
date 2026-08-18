@@ -532,7 +532,7 @@ def dryrun(
     """Run the whole deployment path with the arms attached, and send nothing.
 
     **Energises the arms.** Connecting a DK1 follower is not passive: every motor
-    is energised and both grippers self-zero by driving closed until they stall.
+    is energised and both grippers self-zero by driving open against their stop.
     Nothing is ever passed to ``send_action`` — the actions are returned and
     printed — but the arms are live and holding position throughout.
 

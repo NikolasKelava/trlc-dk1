@@ -5,7 +5,9 @@ again on stderr immediately before it does it. Two things are worth stating
 plainly every time:
 
 * Connecting a follower is itself motion: it energises all motors and self-zeroes
-  both grippers by closing them until they stall.
+  both grippers by driving them OPEN against their stop and taking that as zero.
+  Verified on the hardware in Phase 3: they do not close on connect, and a
+  gripper standing open reports 0.0 — which is what 0 = open means here.
 * Connecting a *leader* is motion too, which is easier to forget because the
   leaders are otherwise passive handles: ``DK1Leader.configure`` torques the
   leader gripper servo and drives it to ``gripper_open_pos``. A finger resting in
@@ -24,15 +26,15 @@ import typer
 #: Appended to the ``--help`` of any command that can move the arms.
 MOTION_HELP = (
     "\n\n[!] CAUSES MOTION. Connecting energises every motor and self-zeroes both "
-    "grippers by closing them until they stall. Clear the workspace and keep the "
-    "e-stop in reach."
+    "grippers by driving them open against their stop. Clear the workspace and keep "
+    "the e-stop in reach."
 )
 
 #: For commands that connect but never command a pose.
 ENERGISE_HELP = (
     "\n\n[!] ENERGISES THE ARMS. Connecting energises every motor and self-zeroes "
-    "both grippers by closing them until they stall. No pose is ever commanded, but "
-    "the arms are live and holding position throughout."
+    "both grippers by driving them open against their stop. No pose is ever "
+    "commanded, but the arms are live and holding position throughout."
 )
 
 
@@ -62,7 +64,7 @@ def confirm_motion(what: str, *, assume_yes: bool = False, notes: list[str] | No
         err=True,
     )
     typer.secho(
-        "  BOTH grippers by driving them closed until they stall.",
+        "  BOTH grippers by driving them OPEN against their stop.",
         fg=typer.colors.YELLOW,
         err=True,
     )

@@ -8,7 +8,7 @@ Registered as ``bi_dk1_follower_safe``. Use it everywhere in place of
    not).
 2. A loud warning at ``connect()``, because connecting a DK1 follower is not a
    passive act: it energises every motor and self-zeroes both grippers by driving
-   them until they stall.
+   them open against their stop.
 
 Implemented as a subclass rather than a patch so this fork stays rebaseable on
 robot-learning-co/trlc-dk1 — no upstream file is modified.
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 CONNECT_WARNING = """\
 Connecting the DK1 follower is NOT passive:
   * every arm motor is energised and begins holding position
-  * BOTH grippers self-zero by driving closed until they stall
+  * BOTH grippers self-zero by driving OPEN against their stop
 Clear the workspace and keep clear of the grippers."""
 
 
