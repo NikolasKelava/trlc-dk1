@@ -63,6 +63,39 @@ def test_it_does_not_shadow_the_upstream_robot_type():
     assert RobotConfig.get_choice_class("bi_dk1_follower") is BiDK1FollowerConfig
 
 
+def test_lerobot_can_build_the_follower_from_its_config():
+    """Registration is not enough: rollout builds the robot by *class* lookup.
+
+    ``make_robot_from_config`` derives the class name from the config class name
+    and imports it from the package holding the config's module — ``dk1lab`` and
+    ``dk1lab.safebidk1follower``. Teleoperation never exercises this, because it
+    constructs the follower directly; the first policy dry run on the hardware
+    died here.
+    """
+    from lerobot.robots.utils import make_robot_from_config
+
+    built = make_robot_from_config(
+        SafeBiDK1FollowerConfig(left_arm_port="/dev/null", right_arm_port="/dev/zero")
+    )
+    assert isinstance(built, SafeBiDK1Follower)
+    assert built.name == "bi_dk1_follower_safe"
+
+
+def test_the_follower_is_reachable_on_the_package_itself():
+    """The attribute LeRobot looks up by name, on the module it looks it up on."""
+    import dk1lab
+
+    assert dk1lab.SafeBiDK1Follower is SafeBiDK1Follower
+
+
+def test_the_package_still_refuses_unknown_attributes():
+    """The lazy __getattr__ must not turn typos into silent Nones."""
+    import dk1lab
+
+    with pytest.raises(AttributeError):
+        dk1lab.NoSuchThing
+
+
 def test_config_defaults_to_impedance_with_a_limit(robot):
     """Impedance is the mode the bimanual follower actually runs, and the mode
     in which upstream's joint_velocity_scaling does nothing."""
