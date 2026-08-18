@@ -1,6 +1,7 @@
 > **This is a fork.** It adds bimanual operation and MolmoAct2 tooling on top of
 > [robot-learning-co/trlc-dk1](https://github.com/robot-learning-co/trlc-dk1).
-> Start at [`docs/README.md`](docs/README.md); the upstream README follows.
+> Operators start at [`GUIDE.md`](GUIDE.md), agents at [`CLAUDE.md`](CLAUDE.md).
+> The upstream README follows.
 
 <p align="center">
     <img src="media/xray.jpg">
