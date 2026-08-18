@@ -8,18 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from dk1lab.config import load
+from dk1lab.config import LimitProfile, load
 from dk1lab.layout import CAMERA_NAMES
-from dk1lab.limiter import DEFAULT_MAX_JOINT_RATE, DEFAULT_MAX_LAG
-from dk1lab.teleop import (
-    TELEOP_MAX_JOINT_RATE,
-    TELEOP_MAX_LAG,
-    TeleopLimits,
-    build,
-    follower_config,
-    leader_config,
-    run,
-)
+from dk1lab.teleop import TELEOP_LIMITS, build, follower_config, leader_config, run
 
 
 @pytest.fixture
@@ -65,22 +56,21 @@ def test_the_follower_is_the_rate_limited_one(config):
     assert follower_config(config).type == "bi_dk1_follower_safe"
 
 
-def test_teleop_raises_the_limit_above_the_policy_crawl():
-    """The limiter's own default is sized for a policy nobody trusts yet.
-
-    A human moving a leader arm outruns 0.2 rad/s instantly, and a follower that
-    visibly cannot keep up would say nothing about whether the stack works.
-    """
-    assert TELEOP_MAX_JOINT_RATE > DEFAULT_MAX_JOINT_RATE
-    assert TELEOP_MAX_LAG > DEFAULT_MAX_LAG
+def test_teleop_is_uncapped_by_default():
+    """Which is what the DK1 does natively — upstream has no slew limit in
+    impedance mode at all. In teleop the commands come from a human hand, so a
+    runaway is already bounded by the person holding the leader arm."""
+    assert TELEOP_LIMITS.max_joint_rate is None
 
 
-def test_the_limit_is_on_by_default(config):
-    assert follower_config(config).max_joint_rate == TELEOP_MAX_JOINT_RATE
+def test_the_default_applies_when_the_config_says_nothing(config):
+    """The fixture dk1.toml has no [limits] section."""
+    assert config.limits == {}
+    assert follower_config(config).max_joint_rate is None
 
 
 def test_custom_limits_reach_the_follower(config):
-    limits = TeleopLimits(max_joint_rate=0.4, max_gripper_rate=0.5, max_lag=0.2, max_dt=0.05)
+    limits = LimitProfile(max_joint_rate=0.4, max_gripper_rate=0.5, max_lag=0.2, max_dt=0.05)
     follower = follower_config(config, limits=limits)
     assert follower.max_joint_rate == 0.4
     assert follower.max_gripper_rate == 0.5
@@ -88,15 +78,28 @@ def test_custom_limits_reach_the_follower(config):
     assert follower.max_dt == 0.05
 
 
-def test_removing_the_limit_takes_saying_so(config):
-    """Disabling is possible but never implicit — nothing defaults to None."""
-    assert follower_config(config, limits=TeleopLimits().unlimited()).max_joint_rate is None
+def test_a_cap_configured_in_dk1_toml_is_used(config_file):
+    """dk1.toml is the source of truth for the limit, not a Python constant."""
+    config_file.write_text(
+        config_file.read_text()
+        + "\n[limits.teleop]\nmax_joint_rate = 0.8\nmax_lag = 0.25\n"
+    )
+    follower = follower_config(load(config_file))
+    assert follower.max_joint_rate == 0.8
+    assert follower.max_lag == 0.25
+
+
+def test_a_config_that_spells_false_means_no_cap(config_file):
+    config_file.write_text(
+        config_file.read_text() + "\n[limits.teleop]\nmax_joint_rate = false\n"
+    )
+    assert follower_config(load(config_file)).max_joint_rate is None
 
 
 def test_unlimited_leaves_the_other_caps_alone():
-    limits = TeleopLimits().unlimited()
-    assert limits.max_lag == TELEOP_MAX_LAG
-    assert limits.max_gripper_rate == TeleopLimits().max_gripper_rate
+    limits = LimitProfile(1.0, 2.0, 0.3, 0.1).unlimited()
+    assert limits.max_joint_rate is None
+    assert (limits.max_gripper_rate, limits.max_lag, limits.max_dt) == (2.0, 0.3, 0.1)
 
 
 # --------------------------------------------------------------------------- #

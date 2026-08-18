@@ -51,12 +51,23 @@ def test_dry_run_shows_the_camera_names_in_the_trained_order(runner, config_file
     assert names == ["top", "left", "right"]
 
 
-def test_dry_run_shows_the_speed_limit(runner, config_file, no_run):
-    assert "1.5 rad/s" in dry(runner, config_file).output
+def test_dry_run_reports_that_teleop_runs_uncapped(runner, config_file, no_run):
+    assert "track the leaders at full speed" in dry(runner, config_file).output
 
 
-def test_disabling_the_limit_is_reported_loudly(runner, config_file, no_run):
-    assert "DISABLED" in dry(runner, config_file, "--no-limit").output
+def test_a_cap_can_be_imposed_for_one_run(runner, config_file, no_run):
+    assert "0.8 rad/s" in dry(runner, config_file, "--max-joint-rate", "0.8").output
+
+
+def test_no_limit_and_an_explicit_rate_contradict_each_other(runner, config_file, no_run):
+    result = dry(runner, config_file, "--no-limit", "--max-joint-rate", "0.8")
+    assert result.exit_code != 0
+    assert no_run == []
+
+
+def test_a_cap_in_dk1_toml_is_picked_up(runner, config_file, no_run):
+    config_file.write_text(config_file.read_text() + "\n[limits.teleop]\nmax_joint_rate = 0.6\n")
+    assert "0.6 rad/s" in dry(runner, config_file).output
 
 
 def test_no_cameras_says_so(runner, config_file, no_run):

@@ -10,6 +10,7 @@ from dk1lab.config import (
     ArmPorts,
     CameraDevice,
     ConfigError,
+    LimitProfile,
     check_devices,
     load,
     parse,
@@ -258,3 +259,105 @@ def test_write_arms_rejects_partial_input(config_file):
 def test_write_cameras_rejects_partial_input(config_file):
     with pytest.raises(ConfigError, match="missing cameras"):
         write_cameras({"top": CameraDevice(path="/dev/x")}, config_file)
+
+
+# --------------------------------------------------------------------------- #
+# [limits.*] — optional, and a typo must never silently disable a cap
+# --------------------------------------------------------------------------- #
+
+
+def _with_limits(config_file, body: str):
+    config_file.write_text(config_file.read_text() + f"\n[limits.teleop]\n{body}\n")
+    return config_file
+
+
+def test_the_limits_section_is_optional(config_file):
+    assert load(config_file).limits == {}
+
+
+def test_an_absent_profile_falls_back_to_what_the_caller_supplies(config_file):
+    fallback = LimitProfile(0.2, 1.0, 0.15, 0.1)
+    assert load(config_file).limit("teleop", fallback) is fallback
+
+
+def test_a_configured_profile_wins_over_the_fallback(config_file):
+    config = load(_with_limits(config_file, "max_joint_rate = 0.5"))
+    assert config.limit("teleop", LimitProfile(9.9, 1.0, 0.15, 0.1)).max_joint_rate == 0.5
+
+
+def test_false_is_how_the_file_spells_no_limit(config_file):
+    config = load(_with_limits(config_file, "max_joint_rate = false"))
+    assert config.limits["teleop"].max_joint_rate is None
+
+
+def test_a_missing_rate_key_means_no_limit(config_file):
+    assert load(_with_limits(config_file, "max_lag = 0.2")).limits["teleop"].max_joint_rate is None
+
+
+def test_the_other_keys_have_defaults(config_file):
+    limit = load(_with_limits(config_file, "max_joint_rate = 0.5")).limits["teleop"]
+    assert (limit.max_gripper_rate, limit.max_lag, limit.max_dt) == (1.0, 0.15, 0.1)
+
+
+def test_true_is_not_a_rate(config_file):
+    """`true` would coerce to 1.0 under a naive isinstance check — a real hazard."""
+    with pytest.raises(ConfigError, match="max_joint_rate"):
+        load(_with_limits(config_file, "max_joint_rate = true"))
+
+
+def test_a_zero_rate_is_refused_rather_than_freezing_the_arms(config_file):
+    with pytest.raises(ConfigError, match="max_joint_rate"):
+        load(_with_limits(config_file, "max_joint_rate = 0"))
+
+
+def test_a_negative_rate_is_refused(config_file):
+    with pytest.raises(ConfigError, match="max_joint_rate"):
+        load(_with_limits(config_file, "max_joint_rate = -1.0"))
+
+
+def test_a_non_numeric_rate_is_refused(config_file):
+    with pytest.raises(ConfigError, match="max_joint_rate"):
+        load(_with_limits(config_file, 'max_joint_rate = "fast"'))
+
+
+def test_a_misspelt_key_is_refused_not_ignored(config_file):
+    """Silently ignoring `max_joint_rat` would leave the cap at its default while
+    the file reads as though it had been set."""
+    with pytest.raises(ConfigError, match="unknown keys"):
+        load(_with_limits(config_file, "max_joint_rat = 0.5"))
+
+
+def test_a_bad_supporting_value_is_refused(config_file):
+    with pytest.raises(ConfigError, match="max_lag"):
+        load(_with_limits(config_file, "max_joint_rate = 0.5\nmax_lag = 0"))
+
+
+def test_several_profiles_can_coexist(config_file):
+    config_file.write_text(
+        config_file.read_text()
+        + "\n[limits.teleop]\nmax_joint_rate = false\n"
+        + "\n[limits.policy]\nmax_joint_rate = 0.2\n"
+    )
+    limits = load(config_file).limits
+    assert limits["teleop"].max_joint_rate is None
+    assert limits["policy"].max_joint_rate == 0.2
+
+
+def test_limits_must_be_a_table(config_file):
+    # Inserted before the first table, or it would land inside [capture.teleop].
+    config_file.write_text(
+        config_file.read_text().replace("version = 1", "version = 1\nlimits = 3", 1)
+    )
+    with pytest.raises(ConfigError, match=r"\[limits\]"):
+        load(config_file)
+
+
+def test_writing_arms_leaves_the_limits_section_alone(config_file):
+    """The surgical-write invariant, extended to the new section."""
+    _with_limits(config_file, "max_joint_rate = 0.5")
+    write_arms(
+        {"follower": ArmPorts("/dev/ttyACM5", "/dev/ttyACM6"),
+         "leader": ArmPorts("/dev/ttyACM7", "/dev/ttyACM8")},
+        config_file,
+    )
+    assert load(config_file).limits["teleop"].max_joint_rate == 0.5

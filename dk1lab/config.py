@@ -82,6 +82,34 @@ class CaptureProfile:
 
 
 @dataclass(frozen=True)
+class LimitProfile:
+    """A speed limit for one activity, from ``[limits.*]``.
+
+    ``max_joint_rate`` of ``None`` means no limiting at all — the limiter passes
+    commands straight through and the follower also skips the extra motor read it
+    would otherwise need on every tick. In the file that is written ``false``,
+    because TOML has no null.
+    """
+
+    max_joint_rate: float | None
+    max_gripper_rate: float
+    max_lag: float
+    max_dt: float
+
+    def unlimited(self) -> LimitProfile:
+        """The same profile with the joint cap removed. Deliberately explicit."""
+        return LimitProfile(None, self.max_gripper_rate, self.max_lag, self.max_dt)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "max_joint_rate": False if self.max_joint_rate is None else self.max_joint_rate,
+            "max_gripper_rate": self.max_gripper_rate,
+            "max_lag": self.max_lag,
+            "max_dt": self.max_dt,
+        }
+
+
+@dataclass(frozen=True)
 class DK1Config:
     """A validated ``dk1.toml``."""
 
@@ -89,6 +117,7 @@ class DK1Config:
     leader: ArmPorts
     cameras: dict[str, CameraDevice]
     capture: dict[str, CaptureProfile]
+    limits: dict[str, LimitProfile] = field(default_factory=dict)
     path: Path = field(default=DEFAULT_CONFIG_PATH, compare=False)
 
     def camera(self, name: str) -> CameraDevice:
@@ -105,6 +134,15 @@ class DK1Config:
                 f"{self.path}: no capture profile named {name!r} "
                 f"(have: {', '.join(sorted(self.capture))})"
             ) from None
+
+    def limit(self, name: str, default: LimitProfile) -> LimitProfile:
+        """The ``[limits.<name>]`` profile, or ``default`` if the file omits it.
+
+        The caller supplies the fallback rather than this module inventing one:
+        what counts as a sane speed depends on what is driving the arms, which is
+        a fact about teleoperation or about a policy, not about the config format.
+        """
+        return self.limits.get(name, default)
 
     def arm_ports(self) -> dict[str, str]:
         """All four ports, keyed ``<role>_<side>``, for reporting."""
@@ -246,11 +284,50 @@ def parse(raw: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> DK1Config:
             width=table["width"], height=table["height"], fps=table["fps"], fourcc=fourcc
         )
 
+    # --- limits (optional) ---
+    limits: dict[str, LimitProfile] = {}
+    limits_raw = raw.get("limits", {})
+    if not isinstance(limits_raw, dict):
+        raise ConfigError(f"{path}: [limits] must be a table, got {type(limits_raw).__name__}")
+    for name, table in limits_raw.items():
+        if not isinstance(table, dict):
+            raise ConfigError(f"{path}: [limits.{name}] must be a table")
+        rate = table.get("max_joint_rate", False)
+        # `false` is how the file spells "no limit"; TOML has no null. Anything
+        # else must be a positive number, so a typo cannot silently disable the
+        # cap — the one failure mode that matters here.
+        if rate is False:
+            max_joint_rate = None
+        elif isinstance(rate, (int, float)) and not isinstance(rate, bool) and rate > 0:
+            max_joint_rate = float(rate)
+        else:
+            raise ConfigError(
+                f"{path}: [limits.{name}].max_joint_rate must be a positive number, or "
+                f"`false` for no limit at all — got {rate!r}"
+            )
+        values: dict[str, float] = {}
+        for key, fallback in (("max_gripper_rate", 1.0), ("max_lag", 0.15), ("max_dt", 0.1)):
+            value = table.get(key, fallback)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+                raise ConfigError(
+                    f"{path}: [limits.{name}].{key} must be a positive number, got {value!r}"
+                )
+            values[key] = float(value)
+        unexpected = [
+            key
+            for key in table
+            if key not in ("max_joint_rate", "max_gripper_rate", "max_lag", "max_dt")
+        ]
+        if unexpected:
+            raise ConfigError(f"{path}: [limits.{name}] has unknown keys {unexpected}")
+        limits[name] = LimitProfile(max_joint_rate=max_joint_rate, **values)
+
     return DK1Config(
         follower=ports["follower"],
         leader=ports["leader"],
         cameras=cameras,
         capture=capture,
+        limits=limits,
         path=path,
     )
 

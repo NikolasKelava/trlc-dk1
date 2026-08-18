@@ -37,7 +37,7 @@ dk1lab/                 everything this fork adds; the only Python we own
   teleop.py             the one teleoperation implementation
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
-tests/                  194 tests, none need hardware
+tests/                  212 tests, none need hardware
 GUIDE.md                operator docs
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
@@ -104,8 +104,11 @@ discovery globs.
 - **Stopping never moves the arms.** `return_to_initial_position` defaults to
   `true` in LeRobot's rollout — always set it `false`. Return-to-home is opt-in
   only.
-- **The speed limit lives in the follower.** `SafeBiDK1Follower`
-  (`--robot.type=bi_dk1_follower_safe`) limits in *both* control modes.
+- **The speed limit lives in the follower**, and in `dk1.toml`. `SafeBiDK1Follower`
+  (`--robot.type=bi_dk1_follower_safe`) limits in *both* control modes; the
+  numbers come from `[limits.<activity>]`, where `false` spells "no cap".
+  **Teleoperation runs uncapped by default** — see Phase 2 for why. Policy
+  rollout does not, and must not.
   Upstream's `joint_velocity_scaling` only reaches `control_Pos_Vel`, so it is a
   **silent no-op in impedance mode** — which is the mode the bimanual follower
   runs by default. Do not present it as a safety knob.
@@ -208,7 +211,7 @@ ports is open any more.
 | --- | --- | --- |
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
-| **2** | Teleoperation | **built, not yet run on the arms** — Nikolas gates the first `dk1 teleop` |
+| **2** | Teleoperation | **done** — run on the arms, limits tuned |
 | **3** | Zero-shot MolmoAct2 evaluation — the first real goal | |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
@@ -221,26 +224,33 @@ it has, which would hand the policy a different aspect ratio than training used)
 and a cross-check that refuses to write an arms section contradicting the adapter
 families. Findings are in the verified list above.
 
-**Phase 2** — built; **not yet run on the arms**. `dk1 teleop` is the single
-entry point, `dk1lab/teleop.py` the single implementation.
+**Phase 2** — built; run on the arms once, and tuned as a result.
 
-The control loop is LeRobot's `teleop_loop`, imported rather than reimplemented,
-because recording and rollout run that same loop — a bespoke loop here could work
-while the one every later phase depends on does not.
+`dk1 teleop` is the single entry point, `dk1lab/teleop.py` the single
+implementation. The control loop is LeRobot's `teleop_loop`, imported rather than
+reimplemented, because recording and rollout run that same loop — a bespoke loop
+here could work while the one every later phase depends on does not.
 
-Two numbers in `dk1lab/teleop.py` are **unverified guesses** and are the first
-thing to revisit after a real run: `TELEOP_MAX_JOINT_RATE = 1.5` rad/s and
-`TELEOP_MAX_LAG = 0.35` rad. The limiter's own defaults (0.2 rad/s, 0.15 rad) are
-sized for a policy nobody trusts yet and a human outruns them instantly; too low
-and the follower visibly cannot keep up, which would say nothing about whether
-the stack works. Both are `--max-joint-rate` / `--max-lag` on the CLI.
+**Teleoperation runs with no speed cap** (`[limits.teleop] max_joint_rate = false`).
+The first run at 1.5 rad/s felt sluggish and Nikolas asked for the DK1's native
+behaviour, which is what this is: upstream's plain `bi_dk1_follower` has no slew
+limit in impedance mode at all, since `joint_velocity_scaling` only reaches
+`control_Pos_Vel`. It is also the right default for the activity — the limiter
+exists to bound a policy nobody trusts yet, and in teleop the commands come from a
+human hand, so a runaway is already bounded by the person holding the leader arm.
+A cap tight enough to matter is tight enough to feel. Disabling it also removes a
+serial round-trip per tick, since `SafeBiDK1Follower` only reads
+`measured_positions()` when the limiter is enabled.
 
-Also newly documented: **connecting a leader is motion too.** `DK1Leader.configure`
+**This does not extend to Phase 3.** A policy is exactly the case the limiter was
+written for. Give rollout its own `[limits.policy]` profile with a real cap.
+
+Also documented here: **connecting a leader is motion too.** `DK1Leader.configure`
 torques the leader gripper servo and drives it to `gripper_open_pos`, so a finger
 resting in a leader trigger gets pushed. `safety.LEADER_HELP` says so.
 
 `dk1 teleop --dry-run` builds every config and prints it while connecting to
-nothing — that path is exercised, the real one is not.
+nothing.
 
 **Phase 3** — escalating risk: (1) smoke test, GPU only, no robot; (2) reuse the
 bf16 checkpoint; (3) dry run — full deployment path with actions **printed, never

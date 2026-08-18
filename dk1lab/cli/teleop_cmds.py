@@ -7,14 +7,14 @@ show you the cameras, and how tight the speed limit is.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
 from ..config import DEFAULT_CONFIG_PATH, load
-from ..limiter import DEFAULT_MAX_DT, DEFAULT_MAX_GRIPPER_RATE
-from ..teleop import DEFAULT_FPS, TELEOP_MAX_JOINT_RATE, TELEOP_MAX_LAG, TeleopLimits, build, run
+from ..teleop import DEFAULT_FPS, TELEOP_LIMITS, build, run
 from .safety import LEADER_HELP, MOTION_HELP, confirm_motion
 
 ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Path to dk1.toml.")]
@@ -51,17 +51,15 @@ def _report(follower, leader, *, fps: int, display: bool, duration_s: float | No
 
     typer.secho("\nspeed limit", bold=True)
     if config.max_joint_rate is None:
-        typer.secho(
-            "  DISABLED — the followers will track the leaders at full speed",
-            fg=typer.colors.RED,
-        )
+        typer.echo("  none — the followers track the leaders at full speed")
+        typer.echo("  (gripper rate and max lag are inert while the cap is off)")
     else:
         typer.echo(
             f"  joints    {config.max_joint_rate} rad/s "
             f"({config.max_joint_rate * 57.3:.0f} deg/s)"
         )
-    typer.echo(f"  gripper   {config.max_gripper_rate} /s")
-    typer.echo(f"  max lag   {config.max_lag} rad")
+        typer.echo(f"  gripper   {config.max_gripper_rate} /s")
+        typer.echo(f"  max lag   {config.max_lag} rad")
 
     typer.secho("\ncameras", bold=True)
     if not config.cameras:
@@ -93,14 +91,15 @@ def teleop(
         str, typer.Option("--control-mode", help="Follower control mode: impedance or pos_vel.")
     ] = "impedance",
     max_joint_rate: Annotated[
-        float, typer.Option("--max-joint-rate", help="Joint speed cap, rad/s.")
-    ] = TELEOP_MAX_JOINT_RATE,
+        float | None,
+        typer.Option("--max-joint-rate", help="Joint speed cap, rad/s. Overrides dk1.toml."),
+    ] = None,
     max_lag: Annotated[
-        float, typer.Option("--max-lag", help="How far a command may lead the measurement, rad.")
-    ] = TELEOP_MAX_LAG,
+        float | None,
+        typer.Option("--max-lag", help="How far a command may lead the measurement, rad."),
+    ] = None,
     no_limit: Annotated[
-        bool,
-        typer.Option("--no-limit", help="Remove the joint speed cap entirely. Say why out loud."),
+        bool, typer.Option("--no-limit", help="Remove the joint speed cap for this run.")
     ] = False,
     duration_s: Annotated[
         float | None, typer.Option("--duration", help="Stop after this many seconds.")
@@ -122,14 +121,21 @@ def teleop(
     if display and not cameras:
         raise typer.BadParameter("--display needs cameras; drop --no-cameras.")
 
-    limits = TeleopLimits(
-        max_joint_rate=None if no_limit else max_joint_rate,
-        max_gripper_rate=DEFAULT_MAX_GRIPPER_RATE,
-        max_lag=max_lag,
-        max_dt=DEFAULT_MAX_DT,
-    )
+    if no_limit and max_joint_rate is not None:
+        raise typer.BadParameter("--no-limit and --max-joint-rate contradict each other.")
+
+    settings = load(config, require_devices=not dry_run)
+    # dk1.toml is the source of truth; the flags are a per-run override on top.
+    limits = settings.limit("teleop", TELEOP_LIMITS)
+    if no_limit:
+        limits = limits.unlimited()
+    elif max_joint_rate is not None:
+        limits = replace(limits, max_joint_rate=max_joint_rate)
+    if max_lag is not None:
+        limits = replace(limits, max_lag=max_lag)
+
     leader, follower = build(
-        load(config, require_devices=not dry_run),
+        settings,
         cameras=cameras,
         profile=profile,
         control_mode=control_mode,

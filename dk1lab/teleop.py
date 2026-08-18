@@ -26,60 +26,42 @@ What this module owns is everything around that loop:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-
 from lerobot_robot_trlc_dk1.bi_leader import BiDK1Leader, BiDK1LeaderConfig
 
 from .cameras import camera_configs
-from .config import DK1Config
-from .limiter import DEFAULT_MAX_DT, DEFAULT_MAX_GRIPPER_RATE
+from .config import DK1Config, LimitProfile
+from .limiter import DEFAULT_MAX_DT, DEFAULT_MAX_GRIPPER_RATE, DEFAULT_MAX_LAG
 from .robot import SafeBiDK1Follower, SafeBiDK1FollowerConfig
 
-#: Joint speed cap for teleoperation, rad/s.
+#: The speed limit teleoperation runs under when ``dk1.toml`` says nothing.
 #:
-#: The limiter's own default (0.2 rad/s, ~11 deg/s) is a deliberate crawl sized
-#: for a policy nobody trusts yet. A human moving a leader arm outruns that
-#: immediately, and a follower that visibly cannot keep up would tell you nothing
-#: about whether the stack works. 1.5 rad/s (~86 deg/s) is brisk enough to track a
-#: hand while still meaning a runaway command crosses the workspace in seconds
-#: rather than instantly.
+#: **No cap.** This matches what the DK1 actually does: upstream's plain
+#: ``bi_dk1_follower`` has no slew limit in impedance mode at all, since
+#: ``joint_velocity_scaling`` only reaches ``control_Pos_Vel``. It is also the
+#: right default for *this* activity — the limiter exists to bound a policy
+#: nobody trusts yet, and in teleoperation the commands come from a human hand,
+#: so a runaway is already bounded by the person holding the leader arm. A cap
+#: tight enough to matter is tight enough to feel, and a follower that visibly
+#: lags the leader tells you nothing about whether the stack works.
 #:
-#: UNVERIFIED as a number: it has not been felt on the hardware. Tune it with
-#: ``--max-joint-rate`` on the first run.
-TELEOP_MAX_JOINT_RATE: float = 1.5
-
-#: Anti-windup cap for teleoperation, rad (~20 deg of lead).
+#: Disabling it also removes a serial round-trip per tick: ``SafeBiDK1Follower``
+#: only reads ``measured_positions()`` when the limiter is enabled.
 #:
-#: Raised from the limiter's 0.15 for the same reason. ``max_lag`` bounds how far
-#: the command may lead the *measured* position, and under impedance control a
-#: fast-moving arm legitimately trails its setpoint — a cap tighter than that
-#: normal tracking error would throttle motion the operator asked for, rather
-#: than catching a fault. Also unverified; tune with ``--max-lag``.
-TELEOP_MAX_LAG: float = 0.35
+#: Policy rollout is unaffected — Phase 3 sets its own, much tighter, limit.
+#: Override per run with ``--max-joint-rate``, or for good with ``[limits.teleop]``
+#: in ``dk1.toml``.
+TELEOP_LIMITS = LimitProfile(
+    max_joint_rate=None,
+    max_gripper_rate=DEFAULT_MAX_GRIPPER_RATE,
+    max_lag=DEFAULT_MAX_LAG,
+    max_dt=DEFAULT_MAX_DT,
+)
 
 #: Loop rate. The leader is read over a Dynamixel bus and the follower written
 #: over a CAN adapter, and LeRobot's loop additionally reads a full observation
 #: every tick, so the achievable rate is an empirical question — the loop prints
 #: what it actually gets.
 DEFAULT_FPS: int = 60
-
-
-@dataclass(frozen=True)
-class TeleopLimits:
-    """The speed limit teleoperation runs under.
-
-    Separate from the CLI so the defaults are stated once, in a place a test can
-    assert against.
-    """
-
-    max_joint_rate: float | None = TELEOP_MAX_JOINT_RATE
-    max_gripper_rate: float = DEFAULT_MAX_GRIPPER_RATE
-    max_lag: float = TELEOP_MAX_LAG
-    max_dt: float = DEFAULT_MAX_DT
-
-    def unlimited(self) -> TeleopLimits:
-        """The same limits with the joint cap removed. Deliberately explicit."""
-        return replace(self, max_joint_rate=None)
 
 
 def leader_config(config: DK1Config) -> BiDK1LeaderConfig:
@@ -97,7 +79,7 @@ def follower_config(
     cameras: bool = True,
     profile: str = "teleop",
     control_mode: str = "impedance",
-    limits: TeleopLimits | None = None,
+    limits: LimitProfile | None = None,
 ) -> SafeBiDK1FollowerConfig:
     """The rate-limited follower pair, from ``dk1.toml``.
 
@@ -108,9 +90,10 @@ def follower_config(
             default — nothing downstream depends on it, so it is sized to be
             looked at. Recording will want ``policy``.
         control_mode: ``impedance`` (upstream's default) or ``pos_vel``.
-        limits: speed limit. ``None`` means :class:`TeleopLimits` defaults.
+        limits: speed limit. ``None`` takes ``[limits.teleop]`` from ``dk1.toml``,
+            falling back to :data:`TELEOP_LIMITS`.
     """
-    limits = limits or TeleopLimits()
+    limits = limits if limits is not None else config.limit("teleop", TELEOP_LIMITS)
     return SafeBiDK1FollowerConfig(
         left_arm_port=config.follower.left,
         right_arm_port=config.follower.right,
@@ -130,7 +113,7 @@ def build(
     cameras: bool = True,
     profile: str = "teleop",
     control_mode: str = "impedance",
-    limits: TeleopLimits | None = None,
+    limits: LimitProfile | None = None,
 ) -> tuple[BiDK1Leader, SafeBiDK1Follower]:
     """Construct both devices. Constructing connects to nothing."""
     leader = BiDK1Leader(leader_config(config))

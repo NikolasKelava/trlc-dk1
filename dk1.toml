@@ -109,3 +109,43 @@ width = 1280
 height = 720
 fps = 60
 fourcc = "MJPG"
+
+# --- Speed limits ------------------------------------------------------------
+#
+# How fast the followers are allowed to move, per activity. One table per
+# activity; `dk1 teleop` reads [limits.teleop].
+#
+# This is the limit that actually works. Upstream's `joint_velocity_scaling`
+# only reaches control_Pos_Vel, so it is a silent no-op in impedance mode —
+# which is the mode the bimanual follower runs by default. Do not treat it as a
+# safety knob. The real limiter lives in SafeBiDK1Follower
+# (`--robot.type=bi_dk1_follower_safe`) and applies in both modes.
+#
+# Keys, all optional:
+#   max_joint_rate    arm joint speed cap, rad/s. `false` = no limiting at all.
+#                     TOML has no null, so `false` is how "off" is spelled.
+#   max_gripper_rate  gripper speed cap, normalised units/s.
+#   max_lag           how far a command may lead the MEASURED position, rad.
+#                     Anti-windup: without it a blocked arm lets the setpoint
+#                     run away and then lunges when the obstruction clears.
+#   max_dt            longest elapsed time one command may claim, s, so a
+#                     stalled loop cannot come back entitled to a big step.
+#
+# When max_joint_rate is false the other three are inert, but they are kept so
+# that raising the cap later is a one-line edit.
+#
+# Delete this whole section and the built-in defaults apply.
+
+# Teleoperation runs UNCAPPED, which is what the DK1 does natively. The limiter
+# exists to bound a policy nobody trusts yet; in teleop the commands come from a
+# human hand, so a runaway is already bounded by the person holding the leader
+# arm. A cap tight enough to matter is tight enough to feel. It also costs a
+# serial round-trip per tick — the follower only reads the measured positions
+# when the limiter is enabled.
+#
+# Policy rollout is NOT covered by this table and stays tightly limited.
+[limits.teleop]
+max_joint_rate = false
+max_gripper_rate = 1.0
+max_lag = 0.15
+max_dt = 0.1

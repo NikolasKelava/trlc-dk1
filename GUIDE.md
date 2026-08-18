@@ -132,6 +132,18 @@ hub port. The alternatives do not work: `/dev/videoN` moves between reboots, and
 so only one wins the symlink. `rotation` is per camera; all three are currently
 mounted upside down (180).
 
+**`[limits.<activity>]`** — how fast the followers may move, per activity.
+`dk1 teleop` reads `[limits.teleop]`. `max_joint_rate = false` means no limiting
+at all (TOML has no null, so `false` is how "off" is spelled); anything else must
+be a positive number, so a typo cannot quietly disable the cap. `max_lag` is
+anti-windup — how far a command may lead the *measured* position, so a blocked arm
+cannot wind up and lunge when it comes free. Delete the section and built-in
+defaults apply.
+
+This is the limit that works. Upstream's `joint_velocity_scaling` only reaches
+`control_Pos_Vel`, so it is a silent no-op in impedance mode, which is the mode
+the bimanual follower runs by default. Do not treat it as a safety knob.
+
 **`[capture.policy|teleop]`** — resolution differs by use, device identity does
 not. `fourcc` is `MJPG` everywhere and should stay that way: YUYV at 720p60 needs
 ~884 Mb/s and the uvc driver fails to allocate it, so reads die immediately.
@@ -179,17 +191,20 @@ want when you stopped because something was wrong.
 uv run dk1 teleop --no-cameras          # arms only; cheaper loop
 uv run dk1 teleop --display             # stream to Rerun
 uv run dk1 teleop --fps 30              # slower loop
-uv run dk1 teleop --max-joint-rate 0.6  # tighter speed cap
+uv run dk1 teleop --max-joint-rate 0.6  # impose a cap for this run
 uv run dk1 teleop --duration 20         # stop by itself after 20 s
 ```
 
-**The speed cap.** Teleop runs at 1.5 rad/s (~86 °/s) per joint, well above the
-0.2 rad/s the limiter defaults to for policies. A human moving a leader arm
-outruns 0.2 rad/s instantly, and a follower that visibly cannot keep up would
-tell you nothing about whether the stack works. Both that number and `--max-lag`
-(0.35 rad) are **starting points that have not been felt on the hardware** — if
-the followers feel sluggish or rubbery, those are the two knobs. `--no-limit`
-removes the cap entirely; have a reason.
+**The speed cap is off.** Teleoperation runs with no slew limit, which is what
+the DK1 does natively — upstream has no rate limit in impedance mode at all. The
+limiter exists to bound a policy nobody trusts yet; in teleop the commands come
+from your hand, so a runaway is already bounded by you, and a cap tight enough to
+matter is tight enough to feel. It also costs a serial round-trip per tick, so
+turning it off makes the loop faster as well as smoother.
+
+Impose one for a single run with `--max-joint-rate 0.8`, or permanently by editing
+`[limits.teleop]` in `dk1.toml`. Policy rollout is a different activity and keeps
+its own, much tighter, limit.
 
 **Camera names are not an option.** They are always `top` / `left` / `right`,
 because that is what the MolmoAct2 checkpoint requires and therefore what
@@ -246,7 +261,5 @@ evidence that zero-shot is worth trying is a colleague's simulation work, which
 is promising but carries no measured success rates.
 
 The arm sides were confirmed directly, so nothing about the device config is
-open. What is not verified is teleoperation *through this fork*: `dk1 teleop` has
-been built and its construction path exercised end to end with `--dry-run`, but it
-has not yet driven the arms. Its two speed-limit numbers are starting points, not
-measurements.
+open. Teleoperation through this fork has now driven the arms, which is what the
+uncapped default came out of — the first run, at 1.5 rad/s, felt sluggish.

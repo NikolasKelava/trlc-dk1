@@ -32,6 +32,15 @@ def show(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
     for name, device in cfg.cameras.items():
         typer.echo(f"  {name:6s} rotation {device.rotation:3d}  {device.path}")
 
+    if cfg.limits:
+        typer.secho("\nspeed limits", bold=True)
+        for name, limit in cfg.limits.items():
+            rate = "none" if limit.max_joint_rate is None else f"{limit.max_joint_rate} rad/s"
+            typer.echo(
+                f"  {name:8s} joints {rate}  gripper {limit.max_gripper_rate}/s  "
+                f"lag {limit.max_lag} rad  max dt {limit.max_dt}s"
+            )
+
     typer.secho("\ncapture profiles", bold=True)
     for name, profile in cfg.capture.items():
         typer.echo(f"  {name:8s} {profile.width}x{profile.height} @ {profile.fps} fps  {profile.fourcc}")
