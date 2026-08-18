@@ -162,12 +162,23 @@ def smoke(
         typer.echo(f"  {key:22s} {value:+.4f}")
 
     typer.secho("\nlatency", bold=True)
-    typer.echo("  " + "  ".join(f"{ms:.0f}" for ms in result.latencies_ms) + "  ms")
-    typer.echo(f"  steady state {result.steady_ms:.0f} ms")
-    periods = result.steady_ms / (1000 / DEFAULT_FPS)
-    typer.echo(f"  = {periods:.1f} control periods at {DEFAULT_FPS} Hz")
+    period_ms = 1000 / DEFAULT_FPS
+    periods = result.inference_ms / period_ms
+    typer.echo(f"  first call     {result.warmup_ms:.0f} ms   (warmup + CUDA graph capture)")
+    typer.echo(
+        f"  model call     {result.inference_ms:.0f} ms   "
+        f"= {periods:.1f} control periods at {DEFAULT_FPS} Hz"
+    )
+    typer.echo(
+        f"  cached call    {result.cached_ms:.0f} ms   "
+        f"(29 calls in 30 — the chunk is already computed)"
+    )
     if periods > 1:
-        typer.echo("  more than one period: rollout wants --rtc, or it will stall the loop")
+        typer.echo(
+            "\n  A model call costs more than one control period, so with --sync the loop\n"
+            "  stalls every 30th tick. --rtc runs inference in a background thread and is\n"
+            "  the default for rollout."
+        )
     typer.echo(f"\npeak GPU memory {result.peak_gpu_gib:.1f} GiB")
     typer.secho(f"\n{result.inversion.describe()}", fg=typer.colors.GREEN)
     typer.secho("smoke test passed. Nothing was connected.", fg=typer.colors.GREEN)

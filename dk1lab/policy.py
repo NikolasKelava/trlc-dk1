@@ -346,19 +346,39 @@ def build_context(cfg: Any, shutdown_event: Event | None = None) -> tuple[Any, I
 
 @dataclass(frozen=True)
 class SmokeResult:
-    """What the GPU-only check found."""
+    """What the GPU-only check found.
+
+    The two latencies are measured separately on purpose. ``select_action``
+    serves from a cached 30-step chunk, so all but one call in thirty is a queue
+    pop costing a millisecond or two — timing a run of consecutive calls reports
+    that, and it is not the number that decides anything.
+    """
 
     action_keys: tuple[str, ...]
     action: tuple[float, ...]
-    latencies_ms: tuple[float, ...]
+    #: Cost of a call that has to run the model. This is the one that matters.
+    chunk_ms: tuple[float, ...]
+    #: Cost of a call served from the cached chunk.
+    pop_ms: tuple[float, ...]
+    #: The very first call, which also pays warmup and CUDA-graph capture.
+    warmup_ms: float
     peak_gpu_gib: float
     inversion: Inversion
 
+    @staticmethod
+    def _median(values: tuple[float, ...]) -> float:
+        ordered = sorted(values)
+        return ordered[len(ordered) // 2] if ordered else 0.0
+
     @property
-    def steady_ms(self) -> float:
-        """Median latency after warmup, which is the number that matters."""
-        tail = sorted(self.latencies_ms[1:]) or list(self.latencies_ms)
-        return tail[len(tail) // 2]
+    def inference_ms(self) -> float:
+        """Median cost of an actual forward pass."""
+        return self._median(self.chunk_ms)
+
+    @property
+    def cached_ms(self) -> float:
+        """Median cost of a call served from the chunk already computed."""
+        return self._median(self.pop_ms)
 
 
 def smoke(
@@ -384,8 +404,9 @@ def smoke(
     nothing more.
 
     Args:
-        steps: inference calls. The first pays warmup and CUDA-graph capture and
-            is excluded from the reported latency.
+        steps: how many timed samples of each kind to take. Each chunk sample
+            resets the policy first, so it has to run the model rather than
+            answer from the chunk it already has.
         width, height: synthetic image size, defaulting to the ``[capture.policy]``
             resolution so the resize path matches deployment.
     """
@@ -439,12 +460,27 @@ def smoke(
     )
     frame = build_dataset_frame(features, values, OBS_STR)
 
-    latencies: list[float] = []
-    action = None
+    # The first call pays model warmup and CUDA-graph capture and says nothing
+    # about deployment; it is reported separately because it is what you wait
+    # through at startup.
+    start = time.perf_counter()
+    action = engine.get_action(frame)
+    warmup_ms = (time.perf_counter() - start) * 1000.0
+
+    chunk_ms: list[float] = []
+    pop_ms: list[float] = []
     for _ in range(max(1, steps)):
+        # Resetting empties the policy's action queue, so this call must run the
+        # model. Without the reset, select_action answers from the 30-step chunk
+        # it already holds and the measurement is of a dict lookup.
+        engine.reset()
         start = time.perf_counter()
         action = engine.get_action(frame)
-        latencies.append((time.perf_counter() - start) * 1000.0)
+        chunk_ms.append((time.perf_counter() - start) * 1000.0)
+
+        start = time.perf_counter()
+        engine.get_action(frame)
+        pop_ms.append((time.perf_counter() - start) * 1000.0)
 
     if action is None or len(action) != DOF:
         raise RuntimeError(
@@ -455,7 +491,9 @@ def smoke(
     return SmokeResult(
         action_keys=tuple(ACTION_KEYS),
         action=tuple(float(v) for v in action),
-        latencies_ms=tuple(latencies),
+        chunk_ms=tuple(chunk_ms),
+        pop_ms=tuple(pop_ms),
+        warmup_ms=warmup_ms,
         peak_gpu_gib=peak,
         inversion=inversion,
     )

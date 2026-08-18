@@ -245,9 +245,13 @@ not just `config.json`, because those are what actually run.
 
 **`smoke`** loads the policy on the GPU and runs inference on a synthetic frame.
 Nothing is connected and no `/dev` node is opened, so it is safe with the cell
-powered down. Its useful output is the steady-state latency: anything above one
-control period (33 ms at 30 Hz) means the rollout needs `--rtc`, which is the
-default.
+powered down. Measured here: **171 ms per model call**, 11.1 GiB peak, ~950 ms
+for the first call. That is 5.1 control periods at 30 Hz, so the rollout needs
+`--rtc` — which is the default.
+
+It reports two latencies because there are two. A policy call usually answers
+from the 30-step chunk it already computed (~12 ms); only one call in thirty runs
+the model. Timing consecutive calls measures the cheap one.
 
 **`dryrun`** does everything a rollout does except the last step. It prints, per
 tick, where every joint is and where the policy wants it. Two things to look for:
@@ -314,9 +318,11 @@ The arm sides were confirmed directly, so nothing about the device config is
 open. Teleoperation through this fork has now driven the arms, which is what the
 uncapped default came out of — the first run, at 1.5 rad/s, felt sluggish.
 
-Added in Phase 3, and worth being precise about: the converted bfloat16
-checkpoint on this machine has been read and checked (`dk1 policy check` passes),
-and the gripper-inversion hole in LeRobot's rollout path was found by reading
-LeRobot 0.6.1's own source. Neither of those is a result on the robot. No
-inference has been run in this repo and the policy has still never driven these
-arms.
+Added in Phase 3: the converted bfloat16 checkpoint has been checked
+(`dk1 policy check` passes) and inference has been run on this GPU — 171 ms per
+model call, 11.1 GiB peak, a 14-D action in the right key order, with the gripper
+inversion applied. The gripper-inversion hole in LeRobot's rollout path was found
+by reading LeRobot 0.6.1's source.
+
+None of that is a result on the robot. The policy has still never driven these
+arms, and what it does when it can is exactly what Phase 3 is for.

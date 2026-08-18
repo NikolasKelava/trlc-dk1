@@ -217,6 +217,21 @@ Added in Phase 1, on the hardware:
   each subsystem directory, which is all that is relied on — but do not compare
   the two namespaces.
 
+Added in Phase 3, on this machine (GPU only — no robot was involved):
+
+- **The converted bf16 checkpoint is intact and matches this cell.** 10.1 GiB of
+  bfloat16, `norm_tag=yam_dual_molmoact2`, 14-D state and action, and the saved
+  preprocessor pins `top`/`left`/`right`. `dk1 policy check` passes.
+- **Inference is 171 ms**, measured here, which finally lands the inherited
+  ~172 ms figure: ≈ 5.1 control periods at 30 Hz, so `--sync` would stall the
+  loop every 30th tick and RTC is not optional. First call 953 ms (warmup +
+  CUDA-graph capture), peak GPU memory 11.1 GiB on the 32 GB card.
+- **Timing `select_action` naively measures nothing.** It serves from the cached
+  30-step chunk, so 29 calls in 30 cost ~12 ms; only a reset forces a real
+  forward pass. `dk1 policy smoke` measures the two separately — the first
+  version of it reported 12 ms and was wrong.
+- The gripper inversion applies cleanly to both loaded pipeline steps.
+
 **The arm sides are confirmed** — Nikolas verified the four ports in `dk1.toml`
 are correct as they stand, so `dk1 find arms` was not needed. Nothing about the
 ports is open any more.
@@ -280,10 +295,11 @@ nothing.
 `dk1lab/policy.py` is the single implementation; `dk1lab/checkpoint.py` is the
 JSON-only reader behind `check`. Settings are decided in code, not left to a
 command line: gripper inversion on, image keys pinned, `inference_action_mode
-= continuous`, bf16 on cuda, RTC by default (inference ~172 ms ≈ 5 control
-periods at 30 Hz — still the unverified number inherited from the old repo;
-`smoke` is what replaces it with a measurement), `return_to_initial_position`
-forced false.
+= continuous`, bf16 on cuda, RTC by default, `return_to_initial_position` forced
+false.
+
+`check` and `smoke` have been run on this machine (see below); `dryrun` and `run`
+have not.
 
 Two things in the bf16 checkpoint's `config.json` are wrong for us and are
 overridden at load: `"device": "cpu"` and a stale absolute `pretrained_path`.
@@ -298,8 +314,7 @@ must not be turned off for a rollout the way teleop's is.
 The checkpoint path lives in `[policy]` in `dk1.toml` rather than in Python, for
 the same reason the ports do. `~` is expanded.
 
-What remains for this phase is running it: `smoke` on the GPU, then `dryrun` on
-the arms (which is what finally confirms the gripper convention on hardware —
+What remains for this phase is the hardware half: `dryrun` on the arms (which is what finally confirms the gripper convention on hardware —
 watch the two gripper channels with the grippers open and then closed), then a
 short capped rollout with a hand on the e-stop. Report what happens plainly,
 including "it does nothing useful".

@@ -88,7 +88,9 @@ def test_smoke_never_touches_the_robot(runner, config_file, checkpoint_dir, monk
         return SmokeResult(
             action_keys=tuple(ACTION_KEYS),
             action=tuple(0.1 for _ in ACTION_KEYS),
-            latencies_ms=(900.0, 170.0, 172.0),
+            chunk_ms=(170.0, 172.0),
+            pop_ms=(2.0, 2.0),
+            warmup_ms=900.0,
             peak_gpu_gib=12.5,
             inversion=Inversion(("a", "b"), (1.0,), (0.0,)),
         )
@@ -111,7 +113,9 @@ def test_smoke_says_when_inference_is_too_slow_for_the_control_loop(
         lambda spec, **kw: SmokeResult(
             action_keys=tuple(ACTION_KEYS),
             action=tuple(0.0 for _ in ACTION_KEYS),
-            latencies_ms=(900.0, 172.0, 172.0),
+            chunk_ms=(172.0, 172.0),
+            pop_ms=(2.0, 2.0),
+            warmup_ms=900.0,
             peak_gpu_gib=12.5,
             inversion=Inversion(("a", "b"), (1.0,), (0.0,)),
         ),
