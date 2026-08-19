@@ -248,3 +248,75 @@ def test_no_dataset_is_recorded_by_a_plain_rollout(rollout):
     """Phase 4 records; Phase 3 only watches."""
     assert rollout().dataset is None
     assert rollout().strategy.type == "base"
+
+
+# --------------------------------------------------------------------------- #
+# RTC headroom — the delay must fit inside the execution horizon
+# --------------------------------------------------------------------------- #
+
+
+def test_the_default_horizon_leaves_room_for_the_measured_latency():
+    """The old default of 10 was exactly the degenerate case.
+
+    RTC ramps its prefix weights from the inference delay down to zero at the
+    execution horizon. Measured RTC latency on this machine is ~270-330 ms,
+    which is 9-10 ticks at 30 Hz, so a horizon of 10 left a ramp of zero width.
+    """
+    from dk1lab.policy import (
+        DEFAULT_EXECUTION_HORIZON,
+        DEFAULT_FPS,
+        MEASURED_RTC_LATENCY_S,
+        rtc_headroom,
+    )
+
+    delay, ok = rtc_headroom(
+        MEASURED_RTC_LATENCY_S, fps=DEFAULT_FPS, execution_horizon=DEFAULT_EXECUTION_HORIZON
+    )
+    assert ok, f"delay {delay} does not fit in horizon {DEFAULT_EXECUTION_HORIZON}"
+    assert DEFAULT_EXECUTION_HORIZON - delay >= 5, "the blend needs more than a couple of steps"
+
+
+def test_the_horizon_stays_below_the_chunk_size():
+    """A horizon of 30 pins the whole chunk to the previous one, and stops reacting."""
+    from dk1lab.policy import DEFAULT_EXECUTION_HORIZON
+
+    assert DEFAULT_EXECUTION_HORIZON < 30
+
+
+def test_a_slow_inference_is_reported_as_degenerate():
+    from dk1lab.policy import rtc_headroom
+
+    delay, ok = rtc_headroom(0.5, fps=30, execution_horizon=10)
+    assert delay == 15
+    assert not ok
+
+
+def test_the_delay_matches_rtcs_own_ceiling_arithmetic():
+    """``rtc_headroom`` must round the way ``_rtc_loop`` does, or the warning lies."""
+    import math
+
+    from dk1lab.policy import rtc_headroom
+
+    for latency in (0.001, 0.171, 0.272, 0.324, 0.333, 0.511, 1.0):
+        delay, _ = rtc_headroom(latency, fps=30, execution_horizon=20)
+        assert delay == math.ceil(latency / (1 / 30))
+
+
+def test_the_degenerate_case_really_does_flatten_rtcs_weights():
+    """Not a claim about our code — a check on the behaviour we are avoiding.
+
+    With ``delay >= execution_horizon`` the linear schedule has no interior
+    points left, so the weights become a step function: consecutive chunks are
+    pinned hard for the horizon and then jump. With the delay inside the horizon
+    there is a real ramp.
+    """
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+
+    processor = RTCProcessor(RTCConfig())
+
+    degenerate = processor.get_prefix_weights(10, 10, 30).tolist()
+    assert set(degenerate) == {0.0, 1.0}, "no intermediate weights: the blend is gone"
+
+    healthy = processor.get_prefix_weights(10, 20, 30).tolist()
+    assert len([w for w in healthy if 0.0 < w < 1.0]) >= 5

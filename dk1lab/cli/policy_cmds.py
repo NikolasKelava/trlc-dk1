@@ -46,6 +46,35 @@ def _checkpoint(config, override: str | None) -> str:
     return override if override else config.checkpoint()
 
 
+def _echo_rtc(cfg) -> None:
+    """The RTC delay-vs-horizon relationship, which is what decides smoothness."""
+    from ..policy import MEASURED_RTC_LATENCY_S, MIN_RTC_BLEND_STEPS, rtc_headroom
+
+    horizon = getattr(getattr(cfg, "inference", None), "rtc", None)
+    if horizon is None:
+        typer.secho(
+            "  inference SYNC — the model runs inline every 30th tick and stalls the loop",
+            fg=typer.colors.YELLOW,
+        )
+        return
+    horizon = horizon.execution_horizon
+    delay, ok = rtc_headroom(MEASURED_RTC_LATENCY_S, fps=cfg.fps, execution_horizon=horizon)
+    typer.echo(
+        f"  inference RTC, execution horizon {horizon}; "
+        f"~{MEASURED_RTC_LATENCY_S * 1000:.0f} ms = {delay} ticks of delay"
+    )
+    if ok:
+        typer.echo(f"  prefix blend over {horizon - delay} steps (re-measured at startup)")
+    else:
+        typer.secho(
+            f"  NO BLEND: a {delay}-tick delay against a horizon of {horizon} leaves "
+            f"{horizon - delay} steps of ramp. RTC's prefix weights collapse towards a step "
+            f"function, consecutive chunks meet with a discontinuity, and the arms judder. "
+            f"Raise --execution-horizon to at least {delay + MIN_RTC_BLEND_STEPS}.",
+            fg=typer.colors.RED,
+        )
+
+
 def _echo_inversion() -> None:
     channels = ", ".join(ACTION_KEYS[i] for i in GRIPPER_INDICES)
     typer.secho("\ngripper inversion", bold=True)
@@ -173,11 +202,34 @@ def smoke(
         f"  cached call    {result.cached_ms:.0f} ms   "
         f"(29 calls in 30 — the chunk is already computed)"
     )
+    from ..policy import DEFAULT_EXECUTION_HORIZON, MIN_RTC_BLEND_STEPS, rtc_headroom
+
+    delay, ok = rtc_headroom(
+        result.rtc_inference_ms / 1000,
+        fps=DEFAULT_FPS,
+        execution_horizon=DEFAULT_EXECUTION_HORIZON,
+    )
+    typer.echo(
+        f"  RTC call       {result.rtc_inference_ms:.0f} ms   "
+        f"= {delay} ticks of inference delay  <- what a rollout actually pays"
+    )
     if periods > 1:
         typer.echo(
             "\n  A model call costs more than one control period, so with --sync the loop\n"
             "  stalls every 30th tick. --rtc runs inference in a background thread and is\n"
             "  the default for rollout."
+        )
+    if ok:
+        typer.echo(
+            f"  With --execution-horizon {DEFAULT_EXECUTION_HORIZON}, RTC blends consecutive "
+            f"chunks over {DEFAULT_EXECUTION_HORIZON - delay} steps."
+        )
+    else:
+        typer.secho(
+            f"  A {delay}-tick delay leaves no blend inside the default horizon of "
+            f"{DEFAULT_EXECUTION_HORIZON}. Raise --execution-horizon to at least "
+            f"{delay + MIN_RTC_BLEND_STEPS}, or the arms will judder.",
+            fg=typer.colors.RED,
         )
     typer.echo(f"\npeak GPU memory {result.peak_gpu_gib:.1f} GiB")
     typer.secho(f"\n{result.inversion.describe()}", fg=typer.colors.GREEN)
@@ -240,6 +292,7 @@ def _report(cfg, spec: str, *, steps: int | None = None) -> None:
 
     typer.secho("\nloop", bold=True)
     typer.echo(f"  target {cfg.fps} Hz, interpolation x{cfg.interpolation_multiplier}")
+    _echo_rtc(cfg)
     if steps is not None:
         typer.echo(f"  {steps} inference steps, then stop")
     elif cfg.duration:

@@ -39,7 +39,7 @@ dk1lab/                 everything this fork adds; the only Python we own
   policy.py             MolmoAct2 deployment: smoke / dryrun / rollout
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
-tests/                  277 tests, none need hardware
+tests/                  292 tests, none need hardware
 GUIDE.md                operator docs
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
@@ -273,7 +273,7 @@ ports is open any more.
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
-| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **tooling built**, nothing run yet |
+| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms once**; judder diagnosed and fixed, needs a re-run |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
 **Phase 1** — done. Built `dk1 find cameras` (preview a still per candidate with
@@ -313,7 +313,7 @@ resting in a leader trigger gets pushed. `safety.LEADER_HELP` says so.
 `dk1 teleop --dry-run` builds every config and prints it while connecting to
 nothing.
 
-**Phase 3** — four escalating commands, all built, **none of them run yet**:
+**Phase 3** — four escalating commands, all built, **all four now run**:
 
 | | | risk |
 | --- | --- | --- |
@@ -328,8 +328,8 @@ command line: gripper inversion on, image keys pinned, `inference_action_mode
 = continuous`, bf16 on cuda, RTC by default, `return_to_initial_position` forced
 false.
 
-`check` and `smoke` have been run on this machine (see below); `dryrun` and `run`
-have not.
+All four have been run. `run` produced juddering, stalling motion; the cause was
+found and fixed (see *The first rollout*, below) and it has not been re-run since.
 
 Two things in the bf16 checkpoint's `config.json` are wrong for us and are
 overridden at load: `"device": "cpu"` and a stale absolute `pretrained_path`.
@@ -344,10 +344,86 @@ must not be turned off for a rollout the way teleop's is.
 The checkpoint path lives in `[policy]` in `dk1.toml` rather than in Python, for
 the same reason the ports do. `~` is expanded.
 
-What remains for this phase is the hardware half: `dryrun` on the arms (which is what finally confirms the gripper convention on hardware —
-watch the two gripper channels with the grippers open and then closed), then a
-short capped rollout with a hand on the e-stop. Report what happens plainly,
-including "it does nothing useful".
+### The first rollout, and what was wrong with it
+
+The first `dk1 policy run` ("pick up the marker") moved, reached toward the
+marker, and actuated the grippers — but juddered, hesitated, and stalled for
+seconds at a time. The log carried both `Record loop is running slower` and
+`Indexes diff is not equal to real delay`. Raising `--execution-horizon` to 30
+made it smoother and *more* confused.
+
+**The cause was RTC's prefix blending collapsing, and it was our number that
+collapsed it.** RTC merges each new chunk with the unexecuted tail of the
+previous one, weighting the first `delay` steps at 1.0 — the steps that went by
+while the GPU was thinking — then ramping linearly to 0 at `execution_horizon`.
+The ramp is the whole mechanism. `DEFAULT_EXECUTION_HORIZON` was **10**, chosen
+from the smoke test's 172 ms, which is ~5 ticks at 30 Hz.
+
+But 172 ms is the **`select_action` path**. A rollout runs `predict_action_chunk`
+through RTC, which is a different, slower path — measured here at **324 ms**,
+almost exactly **10 ticks**. So `delay >= execution_horizon`, the ramp had zero
+width, and `get_prefix_weights` degenerated to a step function: ten steps pinned
+rigidly to the old chunk, then twenty unconstrained, meeting at a discontinuity
+about six times a second. That is the judder, and it is reproducible in one line
+against LeRobot's own code (`tests/test_policy.py`).
+
+`--execution-horizon 30` then pins *every* step at weight 1.0, so the new chunk
+is dragged onto the old one for its whole length and the policy stops reacting to
+what it sees. Smoother and more confused is exactly the predicted symptom.
+
+Three things made it worse:
+
+- **The latency tracker is poisoned by the warmup call.** `LatencyTracker.max()`
+  is a running maximum that never decays, and the exclusion for warmup samples is
+  gated on `use_torch_compile`, which is `False` here. So the first inference —
+  measured at 511 ms with a cold model — set the delay for the entire run at 16
+  ticks instead of 10. `dk1lab.policy.prewarm` now runs one inference before the
+  RTC thread starts.
+- **RTC ran with autograd on for nothing.** Its guidance step runs the action
+  expert under `torch.enable_grad()`, so with the parameters still flagged
+  trainable every flow step built and kept a full autograd graph. That graph is
+  never used: `denoise_step` computes `v_t` *before* calling
+  `x_t.requires_grad_(True)`, so the only differentiable path is
+  `x1_t = x_t - time * v_t`, an identity in `x_t`, and the recovered correction
+  equals the `grad_outputs` handed in. `freeze_for_inference` drops it: 324 ms →
+  **272 ms**, action chunks **bit-identical** under a fixed seed.
+- **Two serial round-trips per tick.** `SafeBiDK1Follower.send_action` called
+  `measured_positions()` for the limiter's anti-windup clamp, a second full read
+  of all 12 motors in a tick that had already read them. It now reuses the
+  reading from `get_observation()` when it is younger than 15 ms, and falls back
+  to a real read otherwise, so a caller that does not observe every tick is
+  unaffected.
+
+Measured on this machine, GPU only, no robot involved:
+
+| | |
+| --- | --- |
+| backbone (VLM) forward alone | 55 ms |
+| `predict_action_chunk`, non-RTC, 8 flow steps | 168 ms |
+| `predict_action_chunk`, **RTC**, 8 flow steps | 324 ms |
+| the same, after `freeze_for_inference` | **271 ms** = 9 ticks at 30 Hz |
+| 30 Hz control loop, while RTC infers in a background thread | 29.9 Hz, p95 33.5 ms |
+
+That last row matters: **the control loop is not GIL-starved by inference**, so
+the async-inference server in LeRobot's `async` docs addresses a real problem
+that this cell does not have. RTC is the in-process answer to the same problem
+and it was already the default; it was simply mis-tuned.
+
+`DEFAULT_EXECUTION_HORIZON` is now **20** — a 9-tick delay leaves an 11-step
+blend, and 20 also matches the steady-state leftover length (`chunk - delay`), so
+the previous chunk is used whole and never zero-padded. `dk1 policy smoke` now
+measures the RTC path as well as the sync one and prints the delay it implies,
+and both `smoke` and the `run` banner refuse to stay quiet when the blend is
+thinner than `MIN_RTC_BLEND_STEPS`. Measuring only the path you are not going to
+run is what caused this.
+
+**Not yet explained, and the first thing to look at on the re-run:** the
+multi-second stalls, and whether the gripper opens at the right moment. Nothing
+above rules out queue starvation when a chunk lands late, and the gripper
+direction is still inferred rather than observed changing. Both need the arms.
+
+What remains for this phase: re-run the rollout with the fixes, hand on the
+e-stop, and report what happens plainly — including "it does nothing useful".
 
 **Phase 4** — record → LoRA from the same checkpoint → deploy → scored, labelled
 eval attempts.

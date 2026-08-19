@@ -215,3 +215,85 @@ def test_disconnect_does_not_command_a_pose(robot, monkeypatch):
     monkeypatch.setattr(type(robot).__mro__[1], "disconnect", lambda self: None)
     robot.disconnect()
     assert sent == []
+
+
+# --------------------------------------------------------------------------- #
+# One serial read per tick, not two
+# --------------------------------------------------------------------------- #
+
+
+def _stub_observation(robot, monkeypatch, positions, counter):
+    """Make ``BiDK1Follower.get_observation`` return ``positions`` and count calls."""
+    from lerobot_robot_trlc_dk1.bi_follower import BiDK1Follower
+
+    monkeypatch.setattr(BiDK1Follower, "get_observation", lambda self: dict(positions))
+    monkeypatch.setattr(BiDK1Follower, "send_action", lambda self, action: action)
+    monkeypatch.setattr(
+        robot, "measured_positions", lambda: counter.append(1) or dict(positions)
+    )
+
+
+def test_send_action_reuses_the_observation_from_the_same_tick(robot, monkeypatch):
+    """The limiter must not pay a second serial round-trip per control tick."""
+    positions = dict.fromkeys(ACTION_KEYS, 0.0)
+    reads: list[int] = []
+    _stub_observation(robot, monkeypatch, positions, reads)
+
+    robot.get_observation()
+    robot.send_action(dict.fromkeys(ACTION_KEYS, 0.1))
+
+    assert reads == [], "send_action read the motors again after get_observation did"
+
+
+def test_send_action_still_reads_when_nobody_observed_first(robot, monkeypatch):
+    """A caller that does not observe every tick must not get a stale clamp."""
+    positions = dict.fromkeys(ACTION_KEYS, 0.0)
+    reads: list[int] = []
+    _stub_observation(robot, monkeypatch, positions, reads)
+
+    robot.send_action(dict.fromkeys(ACTION_KEYS, 0.1))
+
+    assert reads == [1]
+
+
+def test_a_stale_observation_is_not_reused(robot, monkeypatch):
+    """Older than one tick and the cache is refused, however it got old."""
+    import dk1lab.robot as robot_module
+
+    positions = dict.fromkeys(ACTION_KEYS, 0.0)
+    reads: list[int] = []
+    _stub_observation(robot, monkeypatch, positions, reads)
+
+    now = [1000.0]
+    monkeypatch.setattr(robot_module.time, "monotonic", lambda: now[0])
+    robot.get_observation()
+    now[0] += robot_module.CACHED_MEASUREMENT_MAX_AGE_S * 2
+    robot.send_action(dict.fromkeys(ACTION_KEYS, 0.1))
+
+    assert reads == [1]
+
+
+def test_the_cached_reading_carries_every_channel(robot, monkeypatch):
+    """Cameras are dropped, all fourteen motor channels are kept."""
+    positions = dict.fromkeys(ACTION_KEYS, 0.25)
+    observation = dict(positions) | {"top": object(), "left": object()}
+    reads: list[int] = []
+    _stub_observation(robot, monkeypatch, observation, reads)
+
+    robot.get_observation()
+
+    assert robot._measured == positions
+
+
+def test_disconnect_forgets_the_cached_reading(robot, monkeypatch):
+    from lerobot_robot_trlc_dk1.bi_follower import BiDK1Follower
+
+    positions = dict.fromkeys(ACTION_KEYS, 0.0)
+    reads: list[int] = []
+    _stub_observation(robot, monkeypatch, positions, reads)
+    monkeypatch.setattr(BiDK1Follower, "disconnect", lambda self: None)
+
+    robot.get_observation()
+    robot.disconnect()
+
+    assert robot._measured is None

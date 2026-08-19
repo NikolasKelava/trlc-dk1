@@ -79,10 +79,41 @@ POLICY_LIMITS = LimitProfile(
 #: property of the checkpoint, not a preference.
 DEFAULT_FPS: int = 30
 
-#: How many actions of each chunk RTC executes before it needs the next one.
-#: Inference was measured at ~172 ms in the previous iteration of this project,
-#: which is ~5 control periods at 30 Hz — 10 leaves margin. Unverified here.
-DEFAULT_EXECUTION_HORIZON: int = 10
+#: How many actions of each chunk RTC blends against the previous one.
+#:
+#: **This must be strictly greater than the inference delay in ticks**, and the
+#: old value of 10 was not. RTC builds its prefix weights as
+#: ``get_prefix_weights(delay, execution_horizon, chunk)``: ones for the first
+#: ``delay`` steps (already committed while the GPU was thinking), then a linear
+#: ramp down to zero at ``execution_horizon``. When ``delay >= execution_horizon``
+#: the ramp has zero width and the schedule collapses to a hard binary mask —
+#: the first steps pinned rigidly to the previous chunk, the rest unconstrained,
+#: with a discontinuity at the seam. That is the judder.
+#:
+#: Measured on this machine (RTX 5090, bf16, the RTC code path, 3x 640x360):
+#: 324 ms per chunk, 272 ms with :func:`freeze_for_inference`. At 30 Hz that is
+#: a delay of 9-10 ticks, so the old default of 10 was exactly degenerate.
+#:
+#: 20 leaves a 10-step ramp and matches the steady-state leftover length
+#: (``chunk - delay`` = 30 - 10 = 20), so the previous chunk is used whole and
+#: never zero-padded. Raising it to 30 is worse, not better: every step gets
+#: weight 1.0, the new chunk is pinned to the old one for its whole length, and
+#: the policy stops reacting to what it sees.
+#:
+#: The ~172 ms this used to cite was the *non-RTC* path. RTC costs about twice
+#: that, because its denoise step runs under ``torch.enable_grad``.
+DEFAULT_EXECUTION_HORIZON: int = 20
+
+#: How many steps of linear blend RTC needs between the inference delay and the
+#: execution horizon for the seam between two chunks to be smooth. A one- or
+#: two-step ramp is a step function with a rounded corner, so "delay < horizon"
+#: is not a sufficient test on its own.
+MIN_RTC_BLEND_STEPS: int = 5
+
+#: Inference latency measured on this machine for the RTC path, seconds. Used
+#: only to sanity-check the execution horizon before a run; the real number is
+#: measured at startup by :func:`prewarm`.
+MEASURED_RTC_LATENCY_S: float = 0.27
 
 #: Registered name of the rate-limited follower, for the log line and the report.
 ROBOT_TYPE = "bi_dk1_follower_safe"
@@ -318,13 +349,24 @@ def apply_gripper_inversion(preprocessor: Any, postprocessor: Any) -> Inversion:
 # --------------------------------------------------------------------------- #
 
 
-def build_context(cfg: Any, shutdown_event: Event | None = None) -> tuple[Any, Inversion]:
+def build_context(
+    cfg: Any, shutdown_event: Event | None = None, *, prewarm_engine: bool = True
+) -> tuple[Any, Inversion]:
     """Load the policy, connect the robot, and switch the gripper inversion on.
 
     **Connects the arms.** ``build_rollout_context`` loads the policy first and
     the hardware last, so a bad checkpoint path fails before anything is
     energised — but by the time this returns, the followers are live and holding
     position.
+
+    Also does the two things that have to happen between loading the policy and
+    starting the control loop: :func:`freeze_for_inference` and :func:`prewarm`.
+    Both exist because of how RTC behaves, and both are no-ops for correctness —
+    they change only speed, and what RTC believes about speed.
+
+    Args:
+        prewarm_engine: run one inference before returning, and report the
+            resulting RTC headroom. Off only for tests.
 
     Returns:
         The rollout context and the applied inversion.
@@ -336,7 +378,137 @@ def build_context(cfg: Any, shutdown_event: Event | None = None) -> tuple[Any, I
     # inference engine holds references to these pipeline objects, so patching
     # the steps in place reaches it.
     inversion = apply_gripper_inversion(ctx.policy.preprocessor, ctx.policy.postprocessor)
+    freeze_for_inference(ctx.policy.policy)
+    if prewarm_engine:
+        latency = prewarm(ctx)
+        report_rtc_headroom(latency, fps=cfg.fps, execution_horizon=_execution_horizon(cfg))
     return ctx, inversion
+
+
+# --------------------------------------------------------------------------- #
+# Making RTC behave: the two startup steps that were missing
+# --------------------------------------------------------------------------- #
+
+
+def freeze_for_inference(policy: Any) -> int:
+    """``requires_grad_(False)`` on every parameter. Returns how many changed.
+
+    Nothing here trains, so this ought to be a no-op — and for the sync engine it
+    is. It is not a no-op for RTC, because RTC's guidance step runs the action
+    expert under ``torch.enable_grad()`` (``policies/rtc/modeling_rtc.py``,
+    ``denoise_step``). With the parameters still flagged trainable, each of the
+    eight flow steps builds a full autograd graph over the action expert and
+    keeps the activations alive.
+
+    That graph is never used. ``denoise_step`` computes ``v_t`` *before* it calls
+    ``x_t.requires_grad_(True)``, so the only path ``torch.autograd.grad`` can
+    follow is ``x1_t = x_t - time * v_t`` — an identity in ``x_t``. The
+    correction it recovers is exactly the ``grad_outputs`` it passed in. The
+    graph over the weights is pure overhead.
+
+    Measured here: 324 ms -> 272 ms per chunk, with the produced action chunk
+    **bit-identical** under a fixed generator seed (max abs difference 0.0).
+    """
+    changed = sum(1 for p in policy.parameters() if p.requires_grad)
+    policy.requires_grad_(False)
+    logger.info("froze %d parameter tensors for inference", changed)
+    return changed
+
+
+def prewarm(ctx: Any) -> float:
+    """Run one full inference before the control loop starts. Returns its seconds.
+
+    **Why this is not just impatience.** RTC decides how much of each new chunk
+    to pin to the previous one from ``latency_tracker.max()``, and
+    :class:`~lerobot.policies.rtc.LatencyTracker` keeps a running maximum that
+    never decays. The exclusion for warmup samples is guarded by
+    ``use_torch_compile``, which is ``False`` here — so the first call, which
+    pays model warmup and CUDA-graph capture, is fed straight into the tracker
+    and sets the delay for the rest of the run. Measured here that first call is
+    511 ms against a steady state of 324: a delay of 16 ticks instead of 10,
+    permanently, from one sample taken before the model was warm.
+
+    Doing it here, on the real observation, walks exactly the path the RTC thread
+    walks — robot observation, observation processor, dataset frame, policy
+    preprocessor, ``predict_action_chunk`` — so the caches it fills are the ones
+    that matter.
+
+    Reads the robot. Sends nothing, and does not touch the action queue:
+    ``predict_action_chunk`` has no queue side effect, unlike ``select_action``.
+    """
+    import torch
+    from lerobot.policies.utils import prepare_observation_for_inference
+    from lerobot.utils.constants import OBS_STR
+    from lerobot.utils.feature_utils import build_dataset_frame
+
+    observation = ctx.hardware.robot_wrapper.get_observation()
+    processed = ctx.processors.robot_observation_processor(observation)
+    frame = build_dataset_frame(ctx.data.hw_features, processed, prefix=OBS_STR)
+
+    task = ctx.runtime.cfg.task
+    device = torch.device(ctx.runtime.cfg.device or "cpu")
+    batch = prepare_observation_for_inference(
+        frame, device, task, ctx.hardware.robot_wrapper.robot_type
+    )
+    batch["task"] = [task]
+
+    start = time.perf_counter()
+    ctx.policy.policy.predict_action_chunk(
+        ctx.policy.preprocessor(batch), inference_delay=0, prev_chunk_left_over=None
+    )
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    logger.info("prewarm inference: %.0f ms (kept out of the RTC latency tracker)", elapsed * 1000)
+    return elapsed
+
+
+def _execution_horizon(cfg: Any) -> int | None:
+    """The configured RTC execution horizon, or ``None`` when not running RTC."""
+    rtc = getattr(getattr(cfg, "inference", None), "rtc", None)
+    return getattr(rtc, "execution_horizon", None)
+
+
+def rtc_headroom(
+    latency_s: float,
+    *,
+    fps: float,
+    execution_horizon: int,
+    min_blend: int = MIN_RTC_BLEND_STEPS,
+) -> tuple[int, bool]:
+    """The inference delay in ticks, and whether RTC's prefix ramp survives it.
+
+    RTC weights the first ``delay`` steps of a new chunk at 1.0 — those describe
+    time that passed while the GPU was thinking — then ramps linearly to 0 at
+    ``execution_horizon``. The ramp is what makes consecutive chunks agree at the
+    seam. When ``delay >= execution_horizon`` the ramp is empty and the schedule
+    degenerates into a step function, which is the shape that judders; a ramp of
+    one or two steps is that same step function with a rounded corner, so the
+    test is against ``min_blend`` rather than against zero.
+    """
+    delay = int(-(-latency_s * fps // 1))  # ceil, matching the RTC thread
+    return delay, (execution_horizon - delay) >= min_blend
+
+
+def report_rtc_headroom(latency_s: float, *, fps: float, execution_horizon: int | None) -> None:
+    """Log the delay-vs-horizon relationship, loudly when there is no room."""
+    if execution_horizon is None:
+        return
+    delay, ok = rtc_headroom(latency_s, fps=fps, execution_horizon=execution_horizon)
+    blend = execution_horizon - delay
+    if ok:
+        logger.info(
+            "RTC: %.0f ms inference = %d ticks delay, ramping to 0 at %d — %d steps of blend",
+            latency_s * 1000, delay, execution_horizon, blend,
+        )
+        return
+    logger.warning(
+        "RTC prefix blending has no room: %.0f ms inference is %d ticks at %g Hz against an "
+        "--execution-horizon of %d, leaving a %d-step blend. The weights collapse towards a "
+        "step function, consecutive chunks meet with a discontinuity, and the arms judder. "
+        "Raise --execution-horizon to at least %d (and keep it below the chunk size, 30).",
+        latency_s * 1000, delay, fps, execution_horizon, blend, delay + MIN_RTC_BLEND_STEPS,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -362,6 +534,11 @@ class SmokeResult:
     pop_ms: tuple[float, ...]
     #: The very first call, which also pays warmup and CUDA-graph capture.
     warmup_ms: float
+    #: Cost of a chunk through the **RTC** code path — the one a rollout runs.
+    #: Measured separately because it is roughly twice ``chunk_ms``: RTC's
+    #: guidance step runs under ``torch.enable_grad`` and cannot use the CUDA
+    #: graph. Reporting only ``chunk_ms`` is what hid the judder.
+    rtc_ms: tuple[float, ...]
     peak_gpu_gib: float
     inversion: Inversion
 
@@ -379,6 +556,11 @@ class SmokeResult:
     def cached_ms(self) -> float:
         """Median cost of a call served from the chunk already computed."""
         return self._median(self.pop_ms)
+
+    @property
+    def rtc_inference_ms(self) -> float:
+        """Median cost of one chunk through the RTC path. The deployment number."""
+        return self._median(self.rtc_ms)
 
 
 def smoke(
@@ -424,6 +606,7 @@ def smoke(
     )
     policy = policy.to(device)
     policy.eval()
+    freeze_for_inference(policy)
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=config,
@@ -487,6 +670,8 @@ def smoke(
             f"expected a {DOF}-D action, got {None if action is None else len(action)}"
         )
 
+    rtc_ms = _time_rtc_path(policy, preprocessor, frame, task=task, device=device, steps=steps)
+
     peak = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
     return SmokeResult(
         action_keys=tuple(ACTION_KEYS),
@@ -494,9 +679,64 @@ def smoke(
         chunk_ms=tuple(chunk_ms),
         pop_ms=tuple(pop_ms),
         warmup_ms=warmup_ms,
+        rtc_ms=rtc_ms,
         peak_gpu_gib=peak,
         inversion=inversion,
     )
+
+
+def _time_rtc_path(
+    policy: Any,
+    preprocessor: Any,
+    frame: dict,
+    *,
+    task: str,
+    device: str,
+    steps: int,
+) -> tuple[float, ...]:
+    """Time ``predict_action_chunk`` the way the RTC thread calls it.
+
+    This is the number that sets the inference delay, and therefore whether RTC's
+    prefix blending has any room — see :func:`rtc_headroom`. It is not the same
+    as the ``select_action`` cost: the RTC path runs its denoise steps under
+    ``torch.enable_grad`` for a guidance term, which rules out the CUDA graph and
+    costs roughly twice as much. Measuring only ``select_action`` is exactly how
+    a 172 ms figure came to justify an execution horizon of 10 for a 324 ms call.
+
+    Leaves the policy's RTC state as it found it.
+    """
+    import torch
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.policies.utils import prepare_observation_for_inference
+
+    previous = policy.config.rtc_config
+    policy.config.rtc_config = RTCConfig()
+    policy.init_rtc_processor()
+    try:
+        def chunk(prev: Any, delay: int) -> Any:
+            batch = prepare_observation_for_inference(
+                dict(frame), torch.device(device), task, ROBOT_TYPE
+            )
+            batch["task"] = [task]
+            return policy.predict_action_chunk(
+                preprocessor(batch), inference_delay=delay, prev_chunk_left_over=prev
+            )
+
+        # A leftover prefix has to exist for the guidance term to be exercised;
+        # without one RTC short-circuits and the measurement is of the cheap path.
+        leftover = chunk(None, 0).squeeze(0)[:DEFAULT_EXECUTION_HORIZON].clone()
+        timings: list[float] = []
+        for _ in range(max(1, steps)):
+            start = time.perf_counter()
+            out = chunk(leftover, DEFAULT_EXECUTION_HORIZON // 2)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            timings.append((time.perf_counter() - start) * 1000.0)
+            leftover = out.squeeze(0)[:DEFAULT_EXECUTION_HORIZON].clone()
+        return tuple(timings)
+    finally:
+        policy.config.rtc_config = previous
+        policy.init_rtc_processor()
 
 
 # --------------------------------------------------------------------------- #

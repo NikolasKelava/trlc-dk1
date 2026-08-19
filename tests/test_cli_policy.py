@@ -91,6 +91,7 @@ def test_smoke_never_touches_the_robot(runner, config_file, checkpoint_dir, monk
             chunk_ms=(170.0, 172.0),
             pop_ms=(2.0, 2.0),
             warmup_ms=900.0,
+            rtc_ms=(330.0, 330.0),
             peak_gpu_gib=12.5,
             inversion=Inversion(("a", "b"), (1.0,), (0.0,)),
         )
@@ -116,6 +117,7 @@ def test_smoke_says_when_inference_is_too_slow_for_the_control_loop(
             chunk_ms=(172.0, 172.0),
             pop_ms=(2.0, 2.0),
             warmup_ms=900.0,
+            rtc_ms=(330.0, 330.0),
             peak_gpu_gib=12.5,
             inversion=Inversion(("a", "b"), (1.0,), (0.0,)),
         ),
@@ -240,3 +242,52 @@ def test_running_needs_a_task(runner, config_file, checkpoint_dir, no_motion):
     """MolmoAct2 is conditioned on the instruction; there is no default worth having."""
     result = invoke(runner, config_file, "run", "--checkpoint", str(checkpoint_dir), "--dry-run")
     assert result.exit_code != 0
+
+
+def test_smoke_reports_the_rtc_latency_and_the_blend_it_leaves(runner, config_file, checkpoint_dir):
+    """The sync number is not the deployment number, and reporting only it misled us."""
+    from dk1lab import policy
+    from dk1lab.policy import Inversion, SmokeResult
+
+    monkeypatch_result = SmokeResult(
+        action_keys=tuple(ACTION_KEYS),
+        action=tuple(0.0 for _ in ACTION_KEYS),
+        chunk_ms=(172.0, 172.0),
+        pop_ms=(2.0, 2.0),
+        warmup_ms=900.0,
+        rtc_ms=(270.0, 270.0),
+        peak_gpu_gib=12.5,
+        inversion=Inversion(("a", "b"), (1.0,), (0.0,)),
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(policy, "smoke", lambda spec, **kw: monkeypatch_result)
+        output = invoke(runner, config_file, "smoke", "--checkpoint", str(checkpoint_dir)).output
+
+    assert "RTC call" in output
+    assert "270 ms" in output
+    assert "9 ticks of inference delay" in output
+    assert "blends consecutive chunks over 11 steps" in output
+
+
+def test_smoke_flags_an_rtc_latency_the_default_horizon_cannot_absorb(
+    runner, config_file, checkpoint_dir
+):
+    from dk1lab import policy
+    from dk1lab.policy import Inversion, SmokeResult
+
+    slow = SmokeResult(
+        action_keys=tuple(ACTION_KEYS),
+        action=tuple(0.0 for _ in ACTION_KEYS),
+        chunk_ms=(172.0, 172.0),
+        pop_ms=(2.0, 2.0),
+        warmup_ms=900.0,
+        rtc_ms=(600.0, 600.0),  # 18 ticks: no room inside a horizon of 20
+        peak_gpu_gib=12.5,
+        inversion=Inversion(("a", "b"), (1.0,), (0.0,)),
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(policy, "smoke", lambda spec, **kw: slow)
+        output = invoke(runner, config_file, "smoke", "--checkpoint", str(checkpoint_dir)).output
+
+    assert "no blend" in output.lower()
+    assert "judder" in output

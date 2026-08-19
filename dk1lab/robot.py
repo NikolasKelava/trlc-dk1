@@ -24,6 +24,7 @@ find it. Go through the ``dk1`` CLI.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +41,17 @@ from .limiter import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: How old a cached position reading may be before ``send_action`` reads the
+#: motors again, in seconds.
+#:
+#: Every control loop in LeRobot calls ``get_observation()`` and then
+#: ``send_action()`` within the same tick, so the limiter can use the reading the
+#: loop just took instead of paying a second full serial round-trip over the CAN
+#: adapters — 12 motor reads per tick rather than 24. At 30 Hz a tick is 33 ms;
+#: 15 ms keeps the reuse strictly within one tick, and anything older falls back
+#: to reading the motors, so a caller that does not observe first is unaffected.
+CACHED_MEASUREMENT_MAX_AGE_S: float = 0.015
 
 CONNECT_WARNING = """\
 Connecting the DK1 follower is NOT passive:
@@ -82,6 +94,8 @@ class SafeBiDK1Follower(BiDK1Follower):
             max_lag=config.max_lag,
             max_dt=config.max_dt,
         )
+        self._measured: dict[str, float] | None = None
+        self._measured_at: float = 0.0
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -91,6 +105,7 @@ class SafeBiDK1Follower(BiDK1Follower):
         for line in CONNECT_WARNING.splitlines():
             logger.warning(line)
         self.limiter.reset()
+        self._measured = None
         super().connect()
         # Seed the ramp at the pose the arms are actually in, so the first
         # commanded action cannot be a step away from wherever they came to rest.
@@ -99,6 +114,27 @@ class SafeBiDK1Follower(BiDK1Follower):
     # ------------------------------------------------------------------ #
     # Motor state without paying for the cameras
     # ------------------------------------------------------------------ #
+
+    def get_observation(self) -> dict[str, Any]:
+        """The full observation, remembering the joint positions it contains.
+
+        The reading is cached so ``send_action`` does not have to take a second
+        one in the same tick — see :data:`CACHED_MEASUREMENT_MAX_AGE_S`. Cameras
+        are read here and only here.
+        """
+        observation = super().get_observation()
+        self._measured = {k: v for k, v in observation.items() if k.endswith(".pos")}
+        self._measured_at = time.monotonic()
+        return observation
+
+    def _fresh_measurement(self) -> dict[str, float]:
+        """Positions from this tick's observation, or a fresh read if there is none."""
+        if (
+            self._measured is not None
+            and time.monotonic() - self._measured_at <= CACHED_MEASUREMENT_MAX_AGE_S
+        ):
+            return self._measured
+        return self.measured_positions()
 
     def measured_positions(self) -> dict[str, float]:
         """Current joint + gripper positions, prefixed ``left_`` / ``right_``.
@@ -131,10 +167,11 @@ class SafeBiDK1Follower(BiDK1Follower):
         """
         if not self.limiter.enabled:
             return super().send_action(action)
-        limited = self.limiter.limit(action, self.measured_positions())
+        limited = self.limiter.limit(action, self._fresh_measurement())
         return super().send_action(limited)
 
     def disconnect(self) -> None:
         """Disconnect. Does not move the arms."""
         self.limiter.reset()
+        self._measured = None
         super().disconnect()
