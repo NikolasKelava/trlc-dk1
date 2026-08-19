@@ -290,6 +290,55 @@ It **energises the arms** (connecting always does) but never calls
 17 deg/s — and stopping disconnects without moving anything. Keep a hand on the
 e-stop. `--dry-run` prints the whole configuration without connecting.
 
+### Watching a rollout from the inside
+
+Two flags exist because two things about a rollout are not visible from the
+outside, and both were open questions after the first run.
+
+```fish
+dk1 policy run --task "..."                          # --trace is on by default
+dk1 policy dryrun --task "..." --display-policy-input   # safe: nothing is sent
+dk1 policy run --task "..." --display --display-policy-input
+```
+
+**`--trace`** (on by default) prints one line per action chunk — not per tick,
+so it stays readable — and an end-of-run summary. Per chunk it gives the whole
+cost breakdown, which is the thing LeRobot never logs:
+
+```
+chunk  12   900 ms = 27 ticks (model 271 · pre 8 · post 3 · other 618)
+            consumed 10  queue -> 3  STARVED 17 ticks
+  policy  +0.012 -0.310 ... grip L +0.991 R +0.988
+  robot   +0.012 -0.310 ... grip L +0.991 R +0.988
+```
+
+`policy` is the model's **own** output, before the postprocessor unnormalises it
+and before any gripper inversion; `robot` is the same row after both. They are
+printed separately because a question about the policy cannot be answered with a
+vector LeRobot rewrote.
+
+The summary turns the numbers into a reading and says so in plain words: whether
+the queue ran dry, whether inference is too slow for RTC to have anything left
+after trimming, whether the missing milliseconds are in the model or in the
+background thread not running at all, and whether the policy ever moved a
+gripper. `--no-trace` turns the per-chunk printing off; the summary stays.
+
+**`--display-policy-input`** opens Rerun and logs, under `policy_input/`, the
+images **as the model receives them** — after the policy preprocessor, not the
+robot-side view. This is not the same picture as `--display`, and the difference
+is the point: teleop already showed the robot-side view is right way up, and
+that is not what was in question. It also logs the policy's own action channels
+and the RTC queue depth as scalars, so a gripper that moves shows up as a line.
+
+Do it on `dryrun` first. That energises the arms and sends nothing, so you can
+check the orientation with no risk at all.
+
+### The gripper inversion is a flag, and it is off
+
+`--invert-gripper` flips both gripper channels, `x -> 1 - x`, in both
+directions. It is **off by default**. See the section below for why the
+inversion is very probably right and why it is nevertheless not the default.
+
 ### Ending a run at a home pose
 
 ```fish
@@ -322,11 +371,11 @@ from teardown on every exit path including a crash, sweeps for a fixed 3 s
 whether or not the arms arrive, and targets the connect-time pose. Behind the
 0.3 rad/s cap, anything further than ~0.9 rad cannot finish in its 3 s.
 
-### The gripper is inverted, and LeRobot will not do it for you
+### The gripper inversion, and why LeRobot will not do it for you
 
 The DK1 normalises its gripper as 0 = open, 1 = closed. The checkpoint uses the
-opposite: 1 = open, 0 = closed. Left uncorrected, the policy opens the gripper
-every time it means to close it.
+opposite: 1 = open, 0 = closed. If that is right, then left uncorrected the
+policy opens the gripper every time it means to close it.
 
 MolmoAct2 has the knob for this — `joint_signs` / `joint_offsets` — but on the
 `lerobot-rollout` command line it does nothing. When a policy is loaded from a
@@ -335,8 +384,19 @@ path, LeRobot rebuilds both processor pipelines from the checkpoint's saved
 the policy config; the BimanualYAM checkpoint ships both with `joint_signs:
 null`. `--policy.joint_signs=...` parses, validates, and is then ignored.
 
-`dk1 policy` patches the two pipeline steps directly after loading, always, and
-refuses to run if it cannot find them. There is no flag to turn it off.
+So `dk1 policy` patches the two pipeline steps directly after loading, and
+refuses to run if it cannot find them.
+
+It does that **only when `--invert-gripper` is given**, and the flag is off by
+default. That is a deliberate step back from where this started. The argument
+for inverting is good — two independent sources for the YAM convention, plus the
+checkpoint's own gripper statistics sitting at mean 0.64 — but it is an
+argument, not an observation: no run on this cell has yet been watched to open
+or close a gripper on purpose. Until one has, the sign is a hypothesis, and a
+hypothesis belongs behind a flag you can turn both ways in consecutive runs.
+
+`--trace` records the policy's own gripper channel either way, so the run that
+settles it will have the evidence in its own log.
 
 ## 7. Fine-tune and deploy
 
@@ -383,10 +443,16 @@ the policy agrees with the start pose to within 0.065 rad, its intended speed is
 about 0.2 rad/s, and `0 = open` on the grippers is confirmed — they read 0.0000
 standing open, and connecting does not close them.
 
-`dk1 policy run` has driven the arms once. It moved, reached and actuated the
-grippers, but juddered and stalled; the cause was RTC's prefix blend collapsing
-to zero width, which is fixed but not yet re-run. Nothing has been evaluated or
-scored, so what the policy can actually do here is still unknown.
+`dk1 policy run` has driven the arms twice. The first run juddered and stalled;
+the judder was RTC's prefix blend collapsing to zero width and is fixed. The
+second run judders much less but still stalls, and reacts less to the object
+moving. Its logs name the cause: RTC measures each chunk at ~27 ticks (900 ms)
+of wall time, three times the 271 ms measured on the bench, and then discards
+that many actions from a 30-step chunk — leaving three. `--trace` was built to
+find out where those 900 ms go. That is what the next run is for.
+
+Nothing has been evaluated or scored, so what the policy can actually do here is
+still unknown.
 
 The home pose has been captured on the hardware — that path energises the arms
 and reads them, nothing more. The home *sweep*, which drives both arms, has run

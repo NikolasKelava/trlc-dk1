@@ -157,11 +157,16 @@ def test_the_image_keys_are_pinned_in_the_trained_order(checkpoint):
     assert policy_config(checkpoint).image_keys == list(IMAGE_KEYS)
 
 
-def test_the_config_also_carries_the_inversion_even_though_it_is_not_what_applies_it(checkpoint):
+def test_the_config_carries_the_inversion_only_when_it_was_asked_for(checkpoint):
     """Set for anything that rebuilds processors from the config — training, say."""
-    config = policy_config(checkpoint)
+    config = policy_config(checkpoint, invert_gripper=True)
     assert [config.joint_signs[i] for i in GRIPPER_INDICES] == [-1.0, -1.0]
     assert [config.joint_offsets[i] for i in GRIPPER_INDICES] == [1.0, 1.0]
+
+
+def test_the_config_leaves_the_gripper_alone_by_default(checkpoint):
+    """The inversion is opt-in, so a config nobody asked to invert says nothing."""
+    assert policy_config(checkpoint).joint_signs is None
 
 
 # --------------------------------------------------------------------------- #

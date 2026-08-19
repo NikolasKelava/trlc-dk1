@@ -35,6 +35,34 @@ CheckpointOpt = Annotated[
 ]
 TaskOpt = Annotated[str, typer.Option("--task", help="The language instruction to condition on.")]
 DeviceOpt = Annotated[str, typer.Option("--device", help="Torch device.")]
+InvertOpt = Annotated[
+    bool,
+    typer.Option(
+        "--invert-gripper/--no-invert-gripper",
+        help=(
+            "Flip the two gripper channels (x -> 1-x) in both directions. OFF by "
+            "default: the DK1 is 0=open and the checkpoint is 1=open, so it is "
+            "very likely right, but no run has been watched to confirm it."
+        ),
+    ),
+]
+TraceOpt = Annotated[
+    bool,
+    typer.Option(
+        "--trace/--no-trace",
+        help="Print the policy's own action per chunk, plus where the time went.",
+    ),
+]
+WatchInputOpt = Annotated[
+    bool,
+    typer.Option(
+        "--display-policy-input",
+        help=(
+            "Open Rerun and log the images and actions as the MODEL sees them, "
+            "after the policy preprocessor — not the robot-side view --display shows."
+        ),
+    ),
+]
 
 #: Instruction used by `smoke`, where the images are noise and the task text only
 #: has to exist for the prompt to build.
@@ -75,11 +103,19 @@ def _echo_rtc(cfg) -> None:
         )
 
 
-def _echo_inversion() -> None:
+def _echo_inversion(invert: bool | None = None) -> None:
+    """What the gripper channels will do. ``None`` = describing the option itself."""
     channels = ", ".join(ACTION_KEYS[i] for i in GRIPPER_INDICES)
     typer.secho("\ngripper inversion", bold=True)
-    typer.echo(f"  ON for {channels}  (x -> 1 - x, both directions)")
-    typer.echo("  the DK1 is 0=open/1=closed, the checkpoint is 1=open/0=closed")
+    if invert is None:
+        typer.echo(f"  available for {channels}  (x -> 1 - x, both directions)")
+    elif invert:
+        typer.secho(f"  ON for {channels}  (x -> 1 - x, both directions)", fg=typer.colors.YELLOW)
+    else:
+        typer.echo(f"  OFF — {channels} pass through unchanged (the default)")
+    typer.echo("  the DK1 is 0=open/1=closed, the checkpoint is 1=open/0=closed,")
+    typer.echo("  so inverting is the well-argued choice — but it has never been")
+    typer.echo("  watched to work here. Run it both ways and watch the grippers.")
     typer.echo("  applied to the loaded pipeline steps — --policy.joint_signs does nothing")
 
 
@@ -125,7 +161,7 @@ def check(
         typer.echo(f"  {key}")
     typer.echo(f"  this cell provides: {', '.join(IMAGE_KEYS)}")
 
-    _echo_inversion()
+    _echo_inversion(None)
 
     for note in ckpt.notes(info):
         typer.secho(f"\nnote: {note}", fg=typer.colors.YELLOW)
@@ -152,6 +188,7 @@ def smoke(
     task: TaskOpt = PLACEHOLDER_TASK,
     steps: Annotated[int, typer.Option("--steps", help="Inference calls to make.")] = 5,
     device: DeviceOpt = "cuda",
+    invert_gripper: InvertOpt = False,
 ) -> None:
     """Load the policy and run inference on a synthetic frame. GPU only, no robot.
 
@@ -184,6 +221,7 @@ def smoke(
         device=device,
         width=capture.width,
         height=capture.height,
+        invert_gripper=invert_gripper,
     )
 
     typer.secho("\naction", bold=True)
@@ -232,7 +270,10 @@ def smoke(
             fg=typer.colors.RED,
         )
     typer.echo(f"\npeak GPU memory {result.peak_gpu_gib:.1f} GiB")
-    typer.secho(f"\n{result.inversion.describe()}", fg=typer.colors.GREEN)
+    typer.secho(
+        f"\n{result.inversion.describe() if result.inversion else 'gripper inversion off'}",
+        fg=typer.colors.GREEN,
+    )
     typer.secho("smoke test passed. Nothing was connected.", fg=typer.colors.GREEN)
 
 
@@ -252,7 +293,7 @@ def _limits(settings, max_joint_rate: float | None, no_limit: bool):
     return limits
 
 
-def _report(cfg, spec: str, *, steps: int | None = None, home=None) -> None:
+def _report(cfg, spec: str, *, steps: int | None = None, home=None, invert: bool = False) -> None:
     """Print everything that was built, before anything is connected."""
     robot = cfg.robot
 
@@ -288,7 +329,7 @@ def _report(cfg, spec: str, *, steps: int | None = None, home=None) -> None:
             f"  rotation {int(camera.rotation)}  {camera.index_or_path}"
         )
 
-    _echo_inversion()
+    _echo_inversion(invert)
 
     typer.secho("\nloop", bold=True)
     typer.echo(f"  target {cfg.fps} Hz, interpolation x{cfg.interpolation_multiplier}")
@@ -323,6 +364,41 @@ def _echo_home(home) -> None:
     typer.echo("  Ctrl-C during the sweep stops it where the arms are.")
 
 
+def _make_trace(*, fps: float, enabled: bool, display_policy_input: bool):
+    """A :class:`~dk1lab.trace.RolloutTrace`, or ``None`` if nothing was asked for.
+
+    The chunk line is printed from the RTC background thread, roughly once or
+    twice a second — not per tick — so it stays readable while the loop runs.
+    """
+    if not (enabled or display_policy_input):
+        return None
+    from ..trace import RolloutTrace
+
+    def show(record) -> None:
+        colour = typer.colors.RED if record.starved else None
+        typer.secho(record.line(), fg=colour)
+        for line in record.action_lines():
+            typer.echo(line)
+
+    return RolloutTrace(
+        fps=fps,
+        on_chunk=show if enabled else None,
+        display=display_policy_input,
+    )
+
+
+def _echo_trace_summary(trace) -> None:
+    """The end-of-run reading of the trace. Printed after the arms have stopped."""
+    if trace is None:
+        return
+    summary = trace.summary()
+    typer.secho("\ninference and queue", bold=True)
+    for line in summary.lines():
+        typer.echo(f"  {line}")
+    for verdict in summary.verdicts():
+        typer.secho(f"\n  {verdict}", fg=typer.colors.RED)
+
+
 # --------------------------------------------------------------------------- #
 # 3. dryrun — arms attached, nothing sent
 # --------------------------------------------------------------------------- #
@@ -352,6 +428,8 @@ def dryrun(
         str, typer.Option("--control-mode", help="Follower control mode: impedance or pos_vel.")
     ] = "impedance",
     device: DeviceOpt = "cuda",
+    invert_gripper: InvertOpt = False,
+    display_policy_input: WatchInputOpt = False,
     build_only: Annotated[
         bool, typer.Option("--build-only", help="Build and print everything; connect nothing.")
     ] = False,
@@ -372,8 +450,16 @@ def dryrun(
         control_mode=control_mode,
         device=device,
         return_home=False,
+        invert_gripper=invert_gripper,
     )
-    _report(cfg, spec, steps=steps)
+    _report(cfg, spec, steps=steps, invert=invert_gripper)
+    if display_policy_input:
+        typer.secho(
+            "\n  --display-policy-input: Rerun will show the images as the MODEL "
+            "receives them,\n  under policy_input/, alongside the policy's own action "
+            "values. Nothing is sent.",
+            fg=typer.colors.YELLOW,
+        )
 
     if build_only:
         typer.secho(
@@ -397,7 +483,19 @@ def dryrun(
                 f"d={commanded - measured:+.4f}"
             )
 
-    collected = run_dryrun(cfg, steps=steps, on_step=show)
+    from lerobot.utils.visualization_utils import init_visualization, shutdown_visualization
+
+    trace = _make_trace(fps=cfg.fps, enabled=True, display_policy_input=display_policy_input)
+    if display_policy_input:
+        init_visualization("rerun", session_name="dk1-policy-input")
+    try:
+        collected = run_dryrun(
+            cfg, steps=steps, on_step=show, invert_gripper=invert_gripper, trace=trace
+        )
+    finally:
+        if display_policy_input:
+            shutdown_visualization("rerun")
+    _echo_trace_summary(trace)
     typer.secho(
         f"\ndry run complete: {len(collected)} actions computed, none sent.",
         fg=typer.colors.GREEN,
@@ -460,9 +558,12 @@ def run(
         typer.Option("--no-limit", help="Remove the speed cap. Read the warning it prints."),
     ] = False,
     display: Annotated[
-        bool, typer.Option("--display", help="Stream observations to Rerun.")
+        bool, typer.Option("--display", help="Stream robot observations to Rerun.")
     ] = False,
+    display_policy_input: WatchInputOpt = False,
+    trace: TraceOpt = True,
     device: DeviceOpt = "cuda",
+    invert_gripper: InvertOpt = False,
     home: Annotated[
         bool,
         typer.Option("--home", help="Sweep the arms to the \\[home] pose when the run ends."),
@@ -501,6 +602,7 @@ def run(
         execution_horizon=execution_horizon,
         device=device,
         display=display,
+        invert_gripper=invert_gripper,
     )
     # LeRobot's own return_to_initial_position stays off whatever --home says:
     # it fires from teardown on every exit path including a crash, sweeps for a
@@ -509,13 +611,18 @@ def run(
     home_pose = None
     if home:
         home_pose = settings.home if settings.home is not None else HOME_AT_START_POSE
-    _report(cfg, spec, home=home_pose)
+    _report(cfg, spec, home=home_pose, invert=invert_gripper)
 
     if dry_run:
         typer.secho("\n--dry-run: nothing was connected and nothing moved.", fg=typer.colors.GREEN)
         return
 
     notes = ["The POLICY commands the arms. Nobody has verified what it does on this cell."]
+    notes.append(
+        "Gripper inversion is ON (--invert-gripper)."
+        if invert_gripper
+        else "Gripper inversion is OFF — the gripper channels pass through as the model gives them."
+    )
     if limits.max_joint_rate is None:
         notes.append("The speed cap is OFF for this run (--no-limit).")
     if home_pose is not None:
@@ -535,8 +642,18 @@ def run(
             "a second Ctrl-C stops the sweep.\n",
             fg=typer.colors.YELLOW,
         )
-    report = run_rollout(cfg, display=display, home=home_pose)
+    tracer = _make_trace(
+        fps=cfg.fps, enabled=trace, display_policy_input=display_policy_input
+    )
+    report = run_rollout(
+        cfg,
+        display=display,
+        home=home_pose,
+        invert_gripper=invert_gripper,
+        trace=tracer,
+    )
     typer.secho("\nrollout ended; the robot is disconnected.", fg=typer.colors.GREEN)
+    _echo_trace_summary(tracer)
     if report is not None:
         colour = typer.colors.GREEN if report.reached else typer.colors.YELLOW
         typer.secho(report.summary(), fg=colour)

@@ -38,9 +38,10 @@ dk1lab/                 everything this fork adds; the only Python we own
   robot.py              SafeBiDK1Follower — the rate-limited follower
   teleop.py             the one teleoperation implementation
   policy.py             MolmoAct2 deployment: smoke / dryrun / rollout
+  trace.py              per-chunk latency, queue depth, and the policy's OWN action
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
-tests/                  345 tests, none need hardware
+tests/                  370 tests, none need hardware
 GUIDE.md                operator docs
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
@@ -169,13 +170,20 @@ Checkpoint: `lerobot/MolmoAct2-BimanualYAM-LeRobot` (LeRobot format);
   branch says "verified by FK", and the checkpoint's own norm statistics have
   every YAM joint range fitting inside the DK1's configured limits, including the
   asymmetric j2/j3 (0 → +π) and j4.
-- **The gripper channel is inverted.** The YAM server contract is **1 = open,
-  0 = closed**; the DK1 is **0 = open, 1 = closed** (`DK1Robot.command_gripper`,
-  `DK1Leader.get_action`). Sources: `sim_eval/inference/common.py` on the
-  colleague's branch (states it in three places), plus the checkpoint's gripper
-  stats sitting at mean 0.64 / median 0.73, i.e. predominantly open. Use
-  `layout.yam_joint_signs()` / `yam_joint_offsets()` — **on by default** for
-  zero-shot, not an opt-in flag.
+- **The gripper channel is probably inverted, and that is now a flag.** The YAM
+  server contract is **1 = open, 0 = closed**; the DK1 is **0 = open, 1 = closed**
+  (`DK1Robot.command_gripper`, `DK1Leader.get_action`). Sources:
+  `sim_eval/inference/common.py` on the colleague's branch (states it in three
+  places), plus the checkpoint's gripper stats sitting at mean 0.64 / median
+  0.73, i.e. predominantly open. `layout.yam_joint_signs()` /
+  `yam_joint_offsets()` implement it.
+  It was on by default through Phase 3 and is now **off by default**, behind
+  `--invert-gripper`, at Nikolas's request after the second rollout. That is a
+  step back on purpose: the argument is good but it is still an argument, and
+  nothing has yet watched the policy open or close a gripper here. A hypothesis
+  that can be run both ways in consecutive rollouts belongs behind a flag.
+  `dk1lab.trace` records the policy's own gripper channel either way, which is
+  the measurement that settles it.
 - **Image order is already pinned in the checkpoint.** Its `policy_preprocessor.json`
   carries `["...top","...left","...right"]` — read directly, in the converted
   bf16 copy. The inherited claim that the processor sorts alphabetically at
@@ -206,9 +214,12 @@ Checkpoint: `lerobot/MolmoAct2-BimanualYAM-LeRobot` (LeRobot format);
 
 ## Evidence status — keep this line sharp
 
-Nothing about MolmoAct2 on the real DK1 has been verified. No dataset recorded,
-no fine-tune completed, no policy has ever driven these arms. Phase 3 built the
-tooling and read the checkpoint; it has not yet run a single inference here.
+Nothing about MolmoAct2 on the real DK1 has been **evaluated**. No dataset
+recorded, no fine-tune completed, no rollout scored. The policy has now driven
+these arms twice and moved toward the target both times, which is not nothing —
+but it is an impression, not a result, and the second run was still stalling for
+most of every second. That line stays sharp: a policy that reaches is not a
+policy that works.
 
 The zero-shot case rests on the colleague's sim work
 (`sai-prasanna/molmoact2`, branch **`sim-eval-dk1`**, single commit `797b179`).
@@ -303,7 +314,7 @@ ports is open any more.
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
-| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms once**; judder diagnosed and fixed, needs a re-run |
+| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms twice**; judder fixed, the stall is diagnosed but not fixed |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
 **Phase 1** — done. Built `dk1 find cameras` (preview a still per candidate with
@@ -354,6 +365,9 @@ a fifth (`home`) added afterwards that has not:
 | `dk1 policy run` | the rollout | the policy drives the arms |
 | `dk1 policy home` | the home sweep alone, no model | both arms move |
 
+Two flags added after the second rollout, both read-only: `--trace` (on by
+default) and `--display-policy-input`. `--invert-gripper` is now off by default.
+
 `dk1lab/policy.py` is the single implementation; `dk1lab/checkpoint.py` is the
 JSON-only reader behind `check`. Settings are decided in code, not left to a
 command line: gripper inversion on, image keys pinned, `inference_action_mode
@@ -362,8 +376,10 @@ false. `--home` is the one opt-in: it runs `dk1lab.home` rather than LeRobot's
 teardown sweep. The pose has been captured on the arms; **the sweep itself has
 still not run on them** — its logic is tested only against fakes.
 
-All four have been run. `run` produced juddering, stalling motion; the cause was
-found and fixed (see *The first rollout*, below) and it has not been re-run since.
+All four have been run, `run` twice. The first was juddering and stalling; the
+judder was found and fixed. The second judders much less, still stalls, and
+reacts less to the scene — diagnosed to a 900 ms in-situ chunk latency, not yet
+fixed. See *The first rollout* and *The second rollout*, below.
 
 Two things in the bf16 checkpoint's `config.json` are wrong for us and are
 overridden at load: `"device": "cpu"` and a stale absolute `pretrained_path`.
@@ -451,10 +467,96 @@ and both `smoke` and the `run` banner refuse to stay quiet when the blend is
 thinner than `MIN_RTC_BLEND_STEPS`. Measuring only the path you are not going to
 run is what caused this.
 
-**Not yet explained, and the first thing to look at on the re-run:** the
-multi-second stalls, and whether the gripper opens at the right moment. Nothing
-above rules out queue starvation when a chunk lands late, and the gripper
-direction is still inferred rather than observed changing. Both need the arms.
+### The second rollout: the judder is gone, the stall is not
+
+Re-run on the arms with the fixes above, plus the home sweep another session
+added. Reported: **it judders much less, still stalls, and reacts noticeably
+less to the object being moved.** Its log carried two warnings, roughly one pair
+per twenty debug lines:
+
+```
+lerobot.policies.rtc.action_queue: Indexes diff is not equal to real delay.
+                                   indexes_diff=10, real_delay=27
+trlc_dk1_control.robot:            No command for 0.50 s — holding last commanded target.
+```
+
+Those two lines are the same event from both ends, and together they say the
+whole thing. Reading them against `rollout/inference/rtc.py`:
+
+- `real_delay` is **not** the latency tracker. It is `ceil(new_latency / period)`
+  for *this* chunk, computed fresh each iteration. `real_delay=27` therefore
+  means one chunk cost **27 ticks — 900 ms** of wall time, against the 271 ms
+  measured on the bench. Something in situ costs 3.3× the bench number, and
+  nothing measured so far explains it.
+- `_replace_actions_queue` then discards `real_delay` actions from the front of
+  the 30-step chunk, because they describe time that has already passed. 30 − 27
+  leaves **three actions**: 100 ms of motion, then 900 ms of nothing. That is the
+  stall, structurally — not a hiccup but the steady state.
+- `indexes_diff=10` is how many actions the control loop actually consumed while
+  the chunk computed. Ten consumed over twenty-seven ticks means **seventeen
+  ticks with nothing to send**, which is exactly what the motor chain reports as
+  `No command for 0.50 s`.
+- And `delay=27` is also passed into `predict_action_chunk`, so RTC's prefix
+  weights are 1.0 across the entire execution horizon of 20. The new chunk is
+  pinned to the old one for its whole usable length. **That is why it reacts less
+  to the object moving** — it is the `--execution-horizon 30` failure mode
+  arriving through a different door. Less judder and less reactivity is the
+  matching pair of symptoms, and both follow from the one number.
+
+So there is one root cause with two faces, and it is not a tuning constant this
+time: **a chunk that takes 900 ms cannot drive a 30-step chunk at 30 Hz.** RTC
+needs inference well under `chunk / fps` = 1 s, with room to spare. Band-aids
+(trim by consumption instead of wall clock, cap the delay) all amount to
+commanding stale targets. The fix is to find the missing 620 ms.
+
+`dk1lab/trace.py` exists to find it, and it is the deliverable of this round
+rather than a guess at the answer. It times the three things the RTC thread
+does — `predict_action_chunk`, the preprocessor, the postprocessor — and
+subtracts them from RTC's own per-chunk figure. The remainder is time the thread
+was not running at all. The two outcomes point opposite ways:
+
+| what the trace shows | what it means |
+| --- | --- |
+| `model_ms` ≈ 900 | the GPU path really is that slow live; look at the model |
+| `model_ms` ≈ 270, `other` ≈ 620 | the RTC thread is losing the CPU to the control loop's camera and serial work. No model tuning helps; per-tick work has to come down |
+
+The second is the more likely, and it would also revise the "the control loop is
+not GIL-starved by inference" measurement in the table above — that was taken
+with no robot attached, so it measured the loop while nothing was decoding three
+MJPG streams or talking to two CAN adapters.
+
+**Also still unexplained, and needing the arms:** whether the gripper opens at
+the right moment. The direction is still inferred rather than observed changing,
+which is why it is now a flag rather than a default.
+
+### Watching a rollout: `--trace` and `--display-policy-input`
+
+Both added this round, both read-only.
+
+`--trace` (default **on** for `dk1 policy run`) prints one line per chunk — not
+per tick — with the cost breakdown, the consumed count, the queue depth after
+the merge, and the starved ticks; then the policy's **own** action row next to
+the same row after the postprocessor. Those two vectors are kept separate on
+purpose: a question about the policy cannot be answered with a vector LeRobot
+rewrote. At the end it prints a summary that states, in words, whether the queue
+ran dry, whether inference is too slow for RTC to leave anything, where the
+unaccounted milliseconds are, and whether the policy ever moved a gripper.
+`RolloutTrace` works under `--sync` too, where there is no queue: records are cut
+at the postprocessor instead and the queue readings are *absent* rather than
+zero.
+
+`--display-policy-input` opens Rerun and logs, under `policy_input/`, the images
+**as the model receives them** — the preprocessor's output, not the robot-side
+view `--display` shows. Teleop already confirmed the robot-side view is upright
+and correctly named; that was never the open question. What was unverified is
+everything the policy pipeline does after that. Available on `dryrun` as well,
+which is where to check it: arms energised, nothing sent.
+
+Both attach by wrapping, never by replacing: `_TimedPipeline` proxies the
+pipeline objects (forwarding `reset()`, `.steps` and everything else), and the
+queue's `merge` is wrapped on the instance. `attach` runs after `build_context`
+so `prewarm`'s cold call is not counted as a chunk; `attach_queue` runs after
+`strategy.setup`, because the RTC queue does not exist until `engine.start()`.
 
 What remains for this phase: re-run the rollout with the fixes, hand on the
 e-stop, and report what happens plainly — including "it does nothing useful".

@@ -17,14 +17,19 @@ what the rollout runs.
 
 Three decisions are made here rather than left to a command line:
 
-**The gripper channel is inverted, always.** The DK1 is 0 = open, 1 = closed;
-the checkpoint is 1 = open, 0 = closed. That is not an experiment to opt into —
-without it the policy closes the gripper whenever it means to open it. See
-:mod:`dk1lab.layout` for the two independent sources.
+**The gripper inversion is a flag, and it is OFF by default.** The DK1 is
+0 = open, 1 = closed; the checkpoint is 1 = open, 0 = closed, and
+:mod:`dk1lab.layout` gives two independent sources for that. It was on by
+default until the first rollouts, and it is now opt-in (``--invert-gripper``)
+because the argument for it, however good, is still an argument: no run has yet
+been watched to open or close a gripper on this cell, so the sign is a
+hypothesis to test rather than a setting to bake in. Run it both ways and watch
+the grippers; :mod:`dk1lab.trace` records the policy's own gripper channel
+either way, which is the measurement that settles it.
 
-**The inversion is applied to the loaded pipeline objects**, not through the
-policy config, because through the policy config it does not work. See
-:func:`apply_gripper_inversion`.
+**When it is on, the inversion is applied to the loaded pipeline objects**, not
+through the policy config, because through the policy config it does not work.
+See :func:`apply_gripper_inversion`.
 
 **The speed limit is on.** Teleoperation runs uncapped because a human hand is
 on the leader; a policy is exactly the case the limiter was written for, so
@@ -147,6 +152,7 @@ def policy_config(
     device: str = "cuda",
     dtype: str = "bfloat16",
     use_amp: bool = True,
+    invert_gripper: bool = False,
 ) -> Any:
     """The MolmoAct2 policy config, with this cell's deployment settings applied.
 
@@ -186,8 +192,9 @@ def policy_config(
     # tokenizer. RTC requires it, and it is what the checkpoint was evaluated on.
     config.inference_action_mode = "continuous"
     config.image_keys = list(IMAGE_KEYS)
-    config.joint_signs = yam_joint_signs()
-    config.joint_offsets = yam_joint_offsets()
+    if invert_gripper:
+        config.joint_signs = yam_joint_signs()
+        config.joint_offsets = yam_joint_offsets()
     return config
 
 
@@ -230,6 +237,7 @@ def rollout_config(
     dtype: str = "bfloat16",
     display: bool = False,
     return_home: bool = False,
+    invert_gripper: bool = False,
 ) -> Any:
     """Assemble LeRobot's :class:`RolloutConfig` for this cell.
 
@@ -246,6 +254,10 @@ def rollout_config(
             30 Hz, and it needs ``inference_action_mode='continuous'``.
         return_home: sweep the arms back to their startup pose at shutdown.
             **Off**, because stopping is what you do when something is wrong.
+        invert_gripper: whether this run inverts the two gripper channels. Set on
+            the config so that ``_report`` and the banner can state what the run
+            will actually do; the effect itself comes from
+            :func:`apply_gripper_inversion` at :func:`build_context`.
     """
     from lerobot.rollout import RolloutConfig
     from lerobot.rollout.configs import BaseStrategyConfig
@@ -258,7 +270,9 @@ def rollout_config(
 
     return RolloutConfig(
         robot=follower_config(config, limits=limits, control_mode=control_mode),
-        policy=policy_config(checkpoint, device=device, dtype=dtype),
+        policy=policy_config(
+            checkpoint, device=device, dtype=dtype, invert_gripper=invert_gripper
+        ),
         strategy=BaseStrategyConfig(),
         inference=inference,
         fps=fps,
@@ -367,8 +381,12 @@ def apply_gripper_inversion(preprocessor: Any, postprocessor: Any) -> Inversion:
 
 
 def build_context(
-    cfg: Any, shutdown_event: Event | None = None, *, prewarm_engine: bool = True
-) -> tuple[Any, Inversion]:
+    cfg: Any,
+    shutdown_event: Event | None = None,
+    *,
+    prewarm_engine: bool = True,
+    invert_gripper: bool = False,
+) -> tuple[Any, Inversion | None]:
     """Load the policy, connect the robot, and switch the gripper inversion on.
 
     **Connects the arms.** ``build_rollout_context`` loads the policy first and
@@ -384,9 +402,14 @@ def build_context(
     Args:
         prewarm_engine: run one inference before returning, and report the
             resulting RTC headroom. Off only for tests.
+        invert_gripper: apply the gripper inversion. **Off by default** — see
+            :func:`apply_gripper_inversion` for what it does and
+            :mod:`dk1lab.layout` for the argument that it is the right thing to
+            do; it is a flag rather than a fact because nothing has yet watched
+            the policy open or close a gripper on this cell.
 
     Returns:
-        The rollout context and the applied inversion.
+        The rollout context, and the applied inversion or ``None`` if it was off.
     """
     from lerobot.rollout import build_rollout_context
 
@@ -394,7 +417,11 @@ def build_context(
     # Before any strategy runs, and therefore before the RTC thread starts: the
     # inference engine holds references to these pipeline objects, so patching
     # the steps in place reaches it.
-    inversion = apply_gripper_inversion(ctx.policy.preprocessor, ctx.policy.postprocessor)
+    inversion = (
+        apply_gripper_inversion(ctx.policy.preprocessor, ctx.policy.postprocessor)
+        if invert_gripper
+        else None
+    )
     freeze_for_inference(ctx.policy.policy)
     if prewarm_engine:
         latency = prewarm(ctx)
@@ -557,7 +584,8 @@ class SmokeResult:
     #: graph. Reporting only ``chunk_ms`` is what hid the judder.
     rtc_ms: tuple[float, ...]
     peak_gpu_gib: float
-    inversion: Inversion
+    #: ``None`` when the run did not invert the gripper channels.
+    inversion: Inversion | None
 
     @staticmethod
     def _median(values: tuple[float, ...]) -> float:
@@ -589,6 +617,7 @@ def smoke(
     dtype: str = "bfloat16",
     width: int = 640,
     height: int = 360,
+    invert_gripper: bool = False,
 ) -> SmokeResult:
     """Run the deployment inference path on a synthetic observation. No robot.
 
@@ -616,7 +645,9 @@ def smoke(
     from lerobot.utils.constants import ACTION, OBS_STR
     from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 
-    config = policy_config(checkpoint, device=device, dtype=dtype)
+    config = policy_config(
+        checkpoint, device=device, dtype=dtype, invert_gripper=invert_gripper
+    )
     logger.info("loading %s ...", config.pretrained_path)
     policy = get_policy_class(config.type).from_pretrained(
         config.pretrained_path, config=config
@@ -630,7 +661,7 @@ def smoke(
         pretrained_path=config.pretrained_path,
         preprocessor_overrides={"device_processor": {"device": device}},
     )
-    inversion = apply_gripper_inversion(preprocessor, postprocessor)
+    inversion = apply_gripper_inversion(preprocessor, postprocessor) if invert_gripper else None
 
     # The same feature plumbing the rollout builds, from the same layout — so a
     # key-order mistake shows up here rather than on the arms.
@@ -785,6 +816,8 @@ def dryrun(
     *,
     steps: int = 10,
     on_step: Any = None,
+    invert_gripper: bool = False,
+    trace: Any = None,
 ) -> list[DryRunStep]:
     """Run the whole deployment path with the arms attached, and send nothing.
 
@@ -800,18 +833,28 @@ def dryrun(
     Args:
         steps: how many observations to run inference on.
         on_step: optional callback per step, for progressive output.
+        invert_gripper: apply the gripper inversion. Off by default.
+        trace: an optional :class:`~dk1lab.trace.RolloutTrace`. With one attached
+            this is the cheapest way to see the *model's* own action next to the
+            one the postprocessor produced, and — with ``display`` set on it —
+            the images as the model receives them. Nothing is ever sent, so it is
+            also the safe place to check both.
     """
     import torch
     from lerobot.rollout.strategies import BaseStrategy
     from lerobot.utils.constants import OBS_STR
     from lerobot.utils.feature_utils import build_dataset_frame
 
-    ctx, _ = build_context(cfg)
+    ctx, _ = build_context(cfg, invert_gripper=invert_gripper)
     strategy = BaseStrategy(cfg.strategy)
     collected: list[DryRunStep] = []
+    if trace is not None:
+        trace.attach(ctx)
 
     try:
         strategy.setup(ctx)  # builds and starts the inference engine
+        if trace is not None:
+            trace.attach_queue(strategy)
         engine = ctx.policy.inference
         engine.resume()
 
@@ -950,7 +993,14 @@ def _home_rate(cfg: Any) -> float:
     return float(rate) if rate else DEFAULT_HOME_RATE
 
 
-def run(cfg: Any, *, display: bool = False, home: Any | None = None) -> HomeReport | None:
+def run(
+    cfg: Any,
+    *,
+    display: bool = False,
+    home: Any | None = None,
+    invert_gripper: bool = False,
+    trace: Any = None,
+) -> HomeReport | None:
     """Drive the followers with the policy. **Moves the arms.**
 
     LeRobot's ``BaseStrategy`` control loop, unmodified — the same loop
@@ -964,6 +1014,10 @@ def run(cfg: Any, *, display: bool = False, home: Any | None = None) -> HomeRepo
             in. A :class:`~dk1lab.config.HomePose`, or
             :data:`HOME_AT_START_POSE` to use the pose captured at connect. A
             second Ctrl-C during the sweep stops it where the arms are.
+        invert_gripper: apply the gripper inversion. Off by default.
+        trace: an optional :class:`~dk1lab.trace.RolloutTrace`, attached around
+            the engine so the run records per-chunk latency, queue depth and the
+            policy's own actions. It never changes what is sent.
 
     Returns:
         The :class:`~dk1lab.home.HomeReport`, or ``None`` if homing was not asked
@@ -976,15 +1030,22 @@ def run(cfg: Any, *, display: bool = False, home: Any | None = None) -> HomeRepo
     handler = ProcessSignalHandler(use_threads=True, display_pid=False)
     shutdown_event = handler.shutdown_event
 
-    if display:
+    watching = display or (trace is not None and trace.display)
+    if watching:
         init_visualization("rerun", session_name="dk1-policy")
 
-    ctx, _ = build_context(cfg, shutdown_event)
+    ctx, _ = build_context(cfg, shutdown_event, invert_gripper=invert_gripper)
     strategy = BaseStrategy(cfg.strategy)
+    # After build_context, so prewarm's cold call is not counted as a chunk.
+    if trace is not None:
+        trace.attach(ctx)
     report: HomeReport | None = None
     ended: BaseException | None = None
     try:
         strategy.setup(ctx)
+        # After setup: the RTC action queue does not exist until engine.start().
+        if trace is not None:
+            trace.attach_queue(strategy)
         strategy.run(ctx)
     except KeyboardInterrupt as exc:
         # Ctrl-C during the loop. LeRobot's signal handler normally absorbs it
@@ -1009,6 +1070,6 @@ def run(cfg: Any, *, display: bool = False, home: Any | None = None) -> HomeRepo
                 # Never let homing keep the arms connected and energised.
                 logger.exception("home sweep failed; disconnecting anyway")
         strategy.teardown(ctx)
-        if display:
+        if watching:
             shutdown_visualization("rerun")
     return report
