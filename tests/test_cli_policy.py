@@ -216,12 +216,22 @@ def test_dry_run_shows_that_stopping_does_not_move_the_arms(
     runner, config_file, checkpoint_dir, no_motion
 ):
     output = dry_run(runner, config_file, checkpoint_dir).output
-    assert "return to start pose on stop: no" in output
+    assert "disconnect only" in output
+    assert "HOME" not in output
 
 
-def test_return_home_shows_up_when_asked_for(runner, config_file, checkpoint_dir, no_motion):
-    output = dry_run(runner, config_file, checkpoint_dir, "--return-home").output
-    assert "return to start pose on stop: YES" in output
+def test_home_shows_up_when_asked_for(runner, config_file, checkpoint_dir, no_motion):
+    output = dry_run(runner, config_file, checkpoint_dir, "--home").output
+    assert "HOME" in output
+
+
+def test_home_says_which_pose_it_would_use_when_the_file_names_none(
+    runner, config_file, checkpoint_dir, no_motion
+):
+    # The test config has no [home] section, so --home falls back to the pose at
+    # connect — and has to say so, because that is not a pose anyone chose.
+    output = dry_run(runner, config_file, checkpoint_dir, "--home").output
+    assert "captured at connect" in output
 
 
 def test_rtc_is_the_default_for_a_seven_billion_parameter_model(
@@ -291,3 +301,117 @@ def test_smoke_flags_an_rtc_latency_the_default_horizon_cannot_absorb(
 
     assert "no blend" in output.lower()
     assert "judder" in output
+
+
+# --------------------------------------------------------------------------- #
+# home — the pose a run ends at
+# --------------------------------------------------------------------------- #
+
+
+HOME_SECTION = """
+[home]
+left = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0]
+right = [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6, 0.0]
+"""
+
+
+@pytest.fixture
+def no_sweep(monkeypatch):
+    """Replace the two functions that touch the arms; record if they are reached."""
+    from dk1lab import config as config_module
+    from dk1lab import home as home_module
+
+    calls: dict[str, list] = {"sweep": [], "capture": []}
+    # The fixture config names /dev nodes that do not exist on a test machine.
+    monkeypatch.setattr(config_module, "check_devices", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        home_module, "sweep_to_home", lambda *a, **kw: calls["sweep"].append(kw) or _reached()
+    )
+    monkeypatch.setattr(
+        home_module, "capture_pose", lambda *a, **kw: calls["capture"].append(kw) or _pose()
+    )
+    return calls
+
+
+def _reached():
+    from dk1lab.home import HomeReport
+
+    return HomeReport(
+        reached=True, aborted=False, steps=10, elapsed_s=1.0, worst_key="left_joint_1.pos",
+        worst_error=0.001,
+    )
+
+
+def _pose():
+    from dk1lab.config import HomePose
+
+    return HomePose(left=(0.0,) * 7, right=(0.0,) * 7)
+
+
+def test_showing_the_home_pose_touches_nothing(runner, config_file, no_sweep):
+    config_file.write_text(config_file.read_text() + HOME_SECTION)
+    result = invoke(runner, config_file, "home", "--show")
+    assert result.exit_code == 0
+    assert "+0.100" in result.output
+    assert no_sweep["sweep"] == [] and no_sweep["capture"] == []
+
+
+def test_showing_says_so_when_no_home_has_been_captured(runner, config_file, no_sweep):
+    result = invoke(runner, config_file, "home", "--show")
+    assert result.exit_code == 1
+    assert "no [home] section" in result.output
+
+
+def test_driving_home_without_a_configured_pose_refuses_before_connecting(
+    runner, config_file, no_sweep
+):
+    """The fallback to the connect-time pose exists for a run that is already
+    under way. On demand there is nothing to fall back to, so it refuses."""
+    result = invoke(runner, config_file, "home", "--yes")
+    assert result.exit_code == 2
+    assert no_sweep["sweep"] == []
+
+
+def test_driving_home_needs_a_confirmation(runner, config_file, no_sweep):
+    config_file.write_text(config_file.read_text() + HOME_SECTION)
+    result = runner.invoke(app, ["policy", "home", "-c", str(config_file)], input="n\n")
+    assert result.exit_code != 0
+    assert no_sweep["sweep"] == []
+
+
+def test_driving_home_sweeps_at_the_policy_cap(runner, config_file, no_sweep):
+    config_file.write_text(
+        config_file.read_text() + HOME_SECTION + "\n[limits.policy]\nmax_joint_rate = 0.25\n"
+    )
+    result = invoke(runner, config_file, "home", "--yes")
+    assert result.exit_code == 0
+    assert no_sweep["sweep"][0]["limits"].max_joint_rate == 0.25
+    assert no_sweep["sweep"][0]["target"]["left_joint_1.pos"] == 0.1
+
+
+def test_capturing_writes_the_section_and_drives_nothing(runner, config_file, no_sweep):
+    from dk1lab.config import load
+
+    result = invoke(runner, config_file, "home", "--capture", "--yes")
+    assert result.exit_code == 0
+    assert no_sweep["sweep"] == []
+    assert load(config_file).home == _pose()
+
+
+def test_capturing_needs_a_confirmation_because_connecting_energises_the_arms(
+    runner, config_file, no_sweep
+):
+    result = runner.invoke(
+        app, ["policy", "home", "--capture", "-c", str(config_file)], input="n\n"
+    )
+    assert result.exit_code != 0
+    assert no_sweep["capture"] == []
+
+
+def test_the_run_uses_the_configured_pose_when_there_is_one(
+    runner, config_file, checkpoint_dir, no_motion
+):
+    config_file.write_text(config_file.read_text() + HOME_SECTION)
+    output = dry_run(runner, config_file, checkpoint_dir, "--home").output
+    assert "+0.100" in output
+    assert "captured at connect" not in output

@@ -42,10 +42,18 @@ Every command that connects says so in its `--help` and warns again before it
 acts. Commands that only read `/dev` — everything in section 3 — connect to
 nothing.
 
-**Stopping never moves the arms.** LeRobot's rollout defaults to sweeping the
-arms back to their startup pose during teardown. That is motion caused by
+**Stopping never moves the arms — unless you asked for homing.** LeRobot's
+rollout defaults to sweeping the arms back to their startup pose during
+teardown, on every exit path including a crash. That is motion caused by
 pressing stop, which is the opposite of what you want when you stopped because
-something was wrong. It is off by default here. Return-to-home is always opt-in.
+something was wrong. It is forced off here, permanently.
+
+Homing is opt-in and is ours: `dk1 policy run --home` sweeps the arms to the
+`[home]` pose in `dk1.toml` when the run ends — on the duration limit and on
+Ctrl-C alike, but never after an error. It ramps at the same cap the policy ran
+under, stops when the arms have actually arrived rather than after a fixed time,
+and a second Ctrl-C stops the sweep where they are. Without `--home`, stopping
+still disconnects and nothing else. See section 6.
 
 **Keep the hardware e-stop in reach** whenever a policy is driving. A keyboard
 stop needs a focused terminal, a live key listener and a responsive loop — all
@@ -149,6 +157,12 @@ This is the limit that works. Upstream's `joint_velocity_scaling` only reaches
 `control_Pos_Vel`, so it is a silent no-op in impedance mode, which is the mode
 the bimanual follower runs by default. Do not treat it as a safety knob.
 
+**`[home]`** — where `--home` sends the arms when a run ends, seven numbers per
+arm in the 14-D vector's own order (`joint_1 .. joint_6`, then the gripper).
+Optional, and currently absent: capture it with `dk1 policy home --capture`
+rather than typing radians. While it is absent, `--home` falls back to the pose
+the arms were in when the run connected and the banner says so.
+
 **`[capture.policy|teleop]`** — resolution differs by use, device identity does
 not. `fourcc` is `MJPG` everywhere and should stay that way: YUYV at 720p60 needs
 ~884 Mb/s and the uvc driver fails to allocate it, so reads die immediately.
@@ -188,7 +202,8 @@ it connects**, before you touch a leader arm at all:
 
 Ctrl-C stops. Stopping disconnects and does nothing else: the arms are never
 swept home. That is deliberate — sweeping the arms home is the last thing you
-want when you stopped because something was wrong.
+want when you stopped because something was wrong. When you do want it, ask for
+it separately with `dk1 policy home` (section 6).
 
 ### Options worth knowing
 
@@ -272,6 +287,33 @@ It **energises the arms** (connecting always does) but never calls
 **`run`** is the rollout. It is capped by `[limits.policy]` — 0.3 rad/s, about
 17 deg/s — and stopping disconnects without moving anything. Keep a hand on the
 e-stop. `--dry-run` prints the whole configuration without connecting.
+
+### Ending a run at a home pose
+
+```fish
+dk1 policy home --capture     # put the arms where home is, then record it
+dk1 policy home               # drive there now, without loading the model
+dk1 policy home --show        # print the configured pose. No motion.
+dk1 policy run --task "..." --home
+```
+
+`--capture` energises the arms but commands nothing; it reads both arms and
+rewrites only `[home]` in `dk1.toml`. Position them by hand first — note that
+connecting self-zeroes the grippers open, so that is what a captured home
+records for them.
+
+The sweep ramps from the last command at `[limits.policy].max_joint_rate`,
+watches the measured positions, and stops when every arm joint is within
+0.03 rad of home. Grippers are commanded but excluded from the arrival test,
+because a gripper holding something is supposed to stall. If the arms do not
+arrive — something blocking, a cap too low for the distance — it says so and
+disconnects anyway, and **disconnecting disables every motor**, so support
+anything holding itself up.
+
+This deliberately replaces LeRobot's `return_to_initial_position`, which fires
+from teardown on every exit path including a crash, sweeps for a fixed 3 s
+whether or not the arms arrive, and targets the connect-time pose. Behind the
+0.3 rad/s cap, anything further than ~0.9 rad cannot finish in its 3 s.
 
 ### The gripper is inverted, and LeRobot will not do it for you
 

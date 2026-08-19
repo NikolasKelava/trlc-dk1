@@ -320,3 +320,134 @@ def test_the_degenerate_case_really_does_flatten_rtcs_weights():
 
     healthy = processor.get_prefix_weights(10, 20, 30).tolist()
     assert len([w for w in healthy if 0.0 < w < 1.0]) >= 5
+
+
+# --------------------------------------------------------------------------- #
+# Homing at the end of a rollout
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class FakeHardware:
+    initial_position: dict | None = None
+    robot_wrapper: object = None
+
+
+@dataclass
+class FakeContext:
+    hardware: FakeHardware = field(default_factory=FakeHardware)
+
+
+def test_the_configured_home_pose_wins_over_the_start_pose():
+    from dk1lab.config import HomePose
+    from dk1lab.policy import home_target
+
+    ctx = FakeContext(FakeHardware(initial_position=dict.fromkeys(ACTION_KEYS, 9.0)))
+    pose = HomePose(left=(0.1,) * 7, right=(0.2,) * 7)
+    assert home_target(ctx, pose)["left_joint_1.pos"] == 0.1
+
+
+def test_without_a_configured_pose_home_falls_back_to_the_pose_at_connect():
+    from dk1lab.policy import home_target
+
+    ctx = FakeContext(FakeHardware(initial_position=dict.fromkeys(ACTION_KEYS, 0.5)))
+    assert home_target(ctx, None) == dict.fromkeys(ACTION_KEYS, 0.5)
+
+
+def test_homing_refuses_when_there_is_no_pose_at_all():
+    from dk1lab.home import HomeError
+    from dk1lab.policy import home_target
+
+    with pytest.raises(HomeError, match="nothing to home to"):
+        home_target(FakeContext(), None)
+
+
+def test_a_start_pose_that_does_not_cover_the_robot_is_refused():
+    """A short initial_position would sweep some joints and silently leave others."""
+    from dk1lab.home import HomeError
+    from dk1lab.policy import home_target
+
+    partial = dict.fromkeys(ACTION_KEYS, 0.0)
+    del partial["right_gripper.pos"]
+    with pytest.raises(HomeError):
+        home_target(FakeContext(FakeHardware(initial_position=partial)), None)
+
+
+def test_the_home_sweep_inherits_the_speed_cap_the_policy_ran_under(config, checkpoint):
+    from dk1lab.policy import _home_rate
+
+    cfg = rollout_config(config, checkpoint=checkpoint, task="t", limits=POLICY_LIMITS)
+    assert _home_rate(cfg) == POLICY_LIMITS.max_joint_rate
+
+
+def test_an_uncapped_run_does_not_hand_its_lack_of_a_cap_to_the_home_sweep(config, checkpoint):
+    """--no-limit is a deliberate act; a shutdown sweep is not the place to inherit it."""
+    from dk1lab.home import DEFAULT_HOME_RATE
+    from dk1lab.policy import _home_rate
+
+    cfg = rollout_config(
+        config, checkpoint=checkpoint, task="t", limits=POLICY_LIMITS.unlimited()
+    )
+    assert cfg.robot.max_joint_rate is None
+    assert _home_rate(cfg) == DEFAULT_HOME_RATE
+
+
+def test_lerobots_own_return_to_initial_position_stays_off(config, checkpoint):
+    """It fires from teardown on every exit path, sweeps blind for a fixed 3 s,
+    and targets the connect-time pose. dk1lab.home replaces it; it must not also
+    run, or the arms would be swept twice, the second time without a rate that
+    the limiter can satisfy."""
+    cfg = rollout_config(config, checkpoint=checkpoint, task="t")
+    assert cfg.return_to_initial_position is False
+
+
+def test_the_sweep_reads_the_motors_and_not_the_cameras():
+    """A 30 Hz sweep that called get_observation would grab three camera frames
+    per tick and look at none of them."""
+    from dk1lab.policy import measure_fn
+
+    class Inner:
+        def __init__(self):
+            self.reads = 0
+
+        def measured_positions(self):
+            self.reads += 1
+            return dict.fromkeys(ACTION_KEYS, 0.0)
+
+        def get_observation(self):
+            raise AssertionError("get_observation reads the cameras")
+
+    class Wrapper:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def get_observation(self):
+            return self.inner.get_observation()
+
+    inner = Inner()
+    assert measure_fn(Wrapper(inner))() == dict.fromkeys(ACTION_KEYS, 0.0)
+    assert inner.reads == 1
+
+
+def test_a_robot_without_measured_positions_still_gets_a_reader():
+    from dk1lab.policy import measure_fn
+
+    class Plain:
+        def get_observation(self):
+            return {**dict.fromkeys(ACTION_KEYS, 0.25), "observation.images.top": object()}
+
+    assert measure_fn(Plain())() == dict.fromkeys(ACTION_KEYS, 0.25)
+
+
+def test_a_run_that_faulted_is_not_swept_home():
+    """Commanding motion into a failure nobody has looked at is not stopping."""
+    from dk1lab.policy import ended_cleanly
+
+    assert not ended_cleanly(RuntimeError("camera timed out"))
+
+
+def test_the_duration_limit_and_ctrl_c_both_count_as_a_clean_end():
+    from dk1lab.policy import ended_cleanly
+
+    assert ended_cleanly(None)
+    assert ended_cleanly(KeyboardInterrupt())

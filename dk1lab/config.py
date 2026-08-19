@@ -123,6 +123,48 @@ class PolicySettings:
 
 
 @dataclass(frozen=True)
+class HomePose:
+    """``[home]`` — the pose the arms are sent to when a run ends.
+
+    Stored as seven numbers per arm, in the order one arm contributes to the 14-D
+    vector: ``joint_1 .. joint_6`` then the gripper (``layout.ARM_KEYS``). Written
+    as arrays rather than named keys because TOML's dotted keys would turn
+    ``left_joint_1.pos`` into a nested table, and because the order is the same
+    contract everything else in this project derives from :mod:`dk1lab.layout`.
+
+    Optional. Without it, homing falls back to the pose the arms were in when the
+    run connected — which is a pose, but not a *chosen* one. Capture the current
+    pose into the file with ``dk1 policy home --capture``.
+    """
+
+    left: tuple[float, ...]
+    right: tuple[float, ...]
+
+    def as_action_dict(self) -> dict[str, float]:
+        """The pose as the 14 canonical action keys — the form the robot wants."""
+        from .layout import ARM_KEYS
+
+        return {
+            f"{side}_{key}": float(value)
+            for side, values in (("left", self.left), ("right", self.right))
+            for key, value in zip(ARM_KEYS, values, strict=True)
+        }
+
+    @classmethod
+    def from_action_dict(cls, action: dict[str, float]) -> HomePose:
+        """Inverse of :meth:`as_action_dict`, for capturing a live pose."""
+        from .layout import ARM_KEYS
+
+        def arm(side: str) -> tuple[float, ...]:
+            return tuple(float(action[f"{side}_{key}"]) for key in ARM_KEYS)
+
+        return cls(left=arm("left"), right=arm("right"))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"left": list(self.left), "right": list(self.right)}
+
+
+@dataclass(frozen=True)
 class DK1Config:
     """A validated ``dk1.toml``."""
 
@@ -132,6 +174,7 @@ class DK1Config:
     capture: dict[str, CaptureProfile]
     limits: dict[str, LimitProfile] = field(default_factory=dict)
     policy: PolicySettings | None = None
+    home: HomePose | None = None
     path: Path = field(default=DEFAULT_CONFIG_PATH, compare=False)
 
     def camera(self, name: str) -> CameraDevice:
@@ -362,6 +405,9 @@ def parse(raw: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> DK1Config:
             raise ConfigError(f"{path}: [policy] has unknown keys {unexpected}")
         policy = PolicySettings(checkpoint=checkpoint)
 
+    # --- home pose (optional) ---
+    home = _parse_home(raw.get("home"), path)
+
     return DK1Config(
         follower=ports["follower"],
         leader=ports["leader"],
@@ -369,8 +415,50 @@ def parse(raw: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> DK1Config:
         capture=capture,
         limits=limits,
         policy=policy,
+        home=home,
         path=path,
     )
+
+
+def _parse_home(raw: Any, path: Path) -> HomePose | None:
+    """Validate ``[home]``: seven finite numbers per arm, or nothing at all.
+
+    A half-written home pose is worse than none — the joints it omits stay
+    wherever the run left them while the others move, which looks like homing
+    and is not — so every departure from the shape is an error, not a default.
+    """
+    if raw is None:
+        return None
+    from .layout import ARM_KEYS
+
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: [home] must be a table, got {type(raw).__name__}")
+    unexpected = [key for key in raw if key not in _ARM_SIDES]
+    if unexpected:
+        raise ConfigError(f"{path}: [home] has unknown keys {unexpected}; expected left and right")
+
+    values: dict[str, tuple[float, ...]] = {}
+    for side in _ARM_SIDES:
+        if side not in raw:
+            raise ConfigError(
+                f"{path}: [home] is missing `{side}`. Both arms must be given, or the "
+                f"whole section left out — re-capture with `dk1 policy home --capture`."
+            )
+        entry = raw[side]
+        if not isinstance(entry, list) or len(entry) != len(ARM_KEYS):
+            raise ConfigError(
+                f"{path}: [home].{side} must be a list of {len(ARM_KEYS)} numbers "
+                f"({', '.join(ARM_KEYS)}), got {entry!r}"
+            )
+        for index, value in enumerate(entry):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ConfigError(
+                    f"{path}: [home].{side}[{index}] ({ARM_KEYS[index]}) must be a number, "
+                    f"got {value!r}"
+                )
+        values[side] = tuple(float(value) for value in entry)
+
+    return HomePose(left=values["left"], right=values["right"])
 
 
 def load(path: Path | str = DEFAULT_CONFIG_PATH, *, require_devices: bool = False) -> DK1Config:
@@ -499,6 +587,24 @@ def write_cameras(
     # entry that validation would then reject as "unexpected".
     for stale in [key for key in root if key not in CAMERA_NAMES]:
         del root[stale]
+
+    _atomic_write(path, tomlkit.dumps(doc))
+
+
+def write_home(home: HomePose, path: Path | str = DEFAULT_CONFIG_PATH) -> None:
+    """Replace only ``[home]``, leaving every other section and comment untouched.
+
+    Same rules as :func:`write_arms`: the tables are mutated in place, because a
+    replaced table takes the comment introducing the next section with it, and
+    the file is written atomically.
+    """
+    path = Path(path)
+    doc = _load_document(path)
+    table = _subtable(doc, "home")
+    for side in _ARM_SIDES:
+        values = tomlkit.array()
+        values.extend(round(value, 6) for value in getattr(home, side))
+        table[side] = values
 
     _atomic_write(path, tomlkit.dumps(doc))
 

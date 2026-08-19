@@ -31,10 +31,14 @@ on the leader; a policy is exactly the case the limiter was written for, so
 rollout reads ``[limits.policy]`` and :data:`POLICY_LIMITS` caps it if the file
 says nothing. ``--no-limit`` exists, and is a thing to do knowingly.
 
-Stopping never moves the arms: ``return_to_initial_position`` is forced to
-``False`` unless explicitly asked for. LeRobot defaults it to ``True``, which
-means pressing stop sweeps both arms back to their startup pose over ~3 s — the
-exact opposite of what stopping is for.
+**Stopping never moves the arms unless homing was asked for.**
+``return_to_initial_position`` is forced to ``False`` — always, whatever
+``--home`` says. LeRobot defaults it to ``True``, which means every exit path
+including a crash sweeps both arms toward their startup pose for a fixed 3 s and
+disconnects whether or not they arrived. ``--home`` is the deliberate version of
+the same idea and is handled here instead: it runs on a clean end only, targets
+the pose in ``[home]``, ramps at the cap the run drove under, and stops when the
+arms actually arrive. See :mod:`dk1lab.home`.
 """
 
 from __future__ import annotations
@@ -47,6 +51,14 @@ from typing import Any
 
 from .checkpoint import resolve
 from .config import DK1Config, LimitProfile
+from .home import (
+    DEFAULT_HOME_RATE,
+    HomeError,
+    HomeReport,
+    go_home,
+    interrupt_aborts,
+)
+from .home import validate_target as validate_home_target
 from .layout import (
     ACTION_KEYS,
     CAMERA_NAMES,
@@ -117,6 +129,11 @@ MEASURED_RTC_LATENCY_S: float = 0.27
 
 #: Registered name of the rate-limited follower, for the log line and the report.
 ROBOT_TYPE = "bi_dk1_follower_safe"
+
+#: Pass as ``run(home=...)`` to home to the pose captured at connect rather than
+#: to a configured one. A sentinel rather than ``True`` so that "home to the start
+#: pose" and "home to this pose" are the same parameter and cannot both be given.
+HOME_AT_START_POSE = "start-pose"
 
 
 # --------------------------------------------------------------------------- #
@@ -832,13 +849,125 @@ def dryrun(
 # --------------------------------------------------------------------------- #
 
 
-def run(cfg: Any, *, display: bool = False) -> None:
+def measure_fn(robot_wrapper: Any) -> Any:
+    """A positions-only reader for ``robot_wrapper``, avoiding the cameras.
+
+    :meth:`SafeBiDK1Follower.measured_positions` reads the 12 motors and nothing
+    else; ``get_observation`` would also grab three camera frames, on every tick
+    of a sweep that does not look at them. The fallback keeps this working for any
+    robot, and keeps the lock, at the cost of the frames.
+    """
+    inner = getattr(robot_wrapper, "inner", robot_wrapper)
+    if hasattr(inner, "measured_positions"):
+        return inner.measured_positions
+    return lambda: {
+        key: value for key, value in robot_wrapper.get_observation().items() if key.endswith(".pos")
+    }
+
+
+def home_target(ctx: Any, pose: Any | None) -> dict[str, float]:
+    """The pose a home sweep should drive to: the configured one, or the start pose.
+
+    ``ctx.hardware.initial_position`` is what LeRobot captured immediately after
+    ``connect()``, i.e. wherever the arms were standing when the run began. It is
+    the fallback and not the default, because "wherever you left it last time" is
+    a pose, not a home — see :class:`dk1lab.config.HomePose`.
+    """
+    if pose is not None:
+        return validate_home_target(pose.as_action_dict())
+    initial = getattr(ctx.hardware, "initial_position", None)
+    if not initial:
+        raise HomeError(
+            "no [home] in dk1.toml and no start pose was captured, so there is "
+            "nothing to home to. Run `dk1 policy home --capture` first."
+        )
+    return validate_home_target({key: float(value) for key, value in initial.items()})
+
+
+def go_home_before_teardown(
+    ctx: Any,
+    strategy: Any,
+    *,
+    target: dict[str, float],
+    rate: float,
+    fps: float,
+) -> HomeReport:
+    """Stop inference, sweep the arms home, and report. **Moves the arms.**
+
+    Called from :func:`run`'s ``finally`` and *before* ``strategy.teardown``,
+    because teardown disconnects and disconnecting de-energises every motor.
+
+    The inference engine is stopped first. Nothing would send its actions once
+    the control loop has left, but RTC's background thread would otherwise keep
+    running 270 ms forward passes on the GPU while this sweep is trying to hold a
+    30 Hz command rate. ``stop()`` is idempotent, so teardown's own call is fine.
+    """
+    engine = getattr(strategy, "_engine", None)
+    if engine is not None:
+        engine.stop()
+
+    robot_wrapper = ctx.hardware.robot_wrapper
+    with interrupt_aborts() as aborted:
+        report = go_home(
+            measure=measure_fn(robot_wrapper),
+            send=robot_wrapper.send_action,
+            target=target,
+            rate=rate,
+            fps=fps,
+            should_abort=aborted,
+        )
+    logger.info("%s", report.summary())
+    if not report.reached:
+        logger.warning(
+            "the arms did not reach home; disconnecting now disables every motor, "
+            "so support anything that is holding itself up"
+        )
+    return report
+
+
+def ended_cleanly(error: BaseException | None) -> bool:
+    """Whether a finished run earns a home sweep.
+
+    Nothing faulted: the loop hit its duration limit, or the operator stopped it.
+    An exception means something went wrong that nobody has looked at yet, and
+    commanding more motion into that is the opposite of stopping. Ctrl-C is a
+    clean end — the operator asked, and they can ask again during the sweep to
+    stop it where the arms are.
+    """
+    return error is None or isinstance(error, KeyboardInterrupt)
+
+
+def _home_rate(cfg: Any) -> float:
+    """The sweep speed: the same cap this run drove the policy under.
+
+    A home sweep is commanded motion with nobody's hand on a leader arm, so it
+    has no business being faster than the policy was allowed to be. When the run
+    was uncapped (``--no-limit``) there is no number to inherit and
+    :data:`~dk1lab.home.DEFAULT_HOME_RATE` applies — uncapping the policy is a
+    deliberate act, letting an automatic shutdown sweep inherit it is not.
+    """
+    rate = getattr(cfg.robot, "max_joint_rate", None)
+    return float(rate) if rate else DEFAULT_HOME_RATE
+
+
+def run(cfg: Any, *, display: bool = False, home: Any | None = None) -> HomeReport | None:
     """Drive the followers with the policy. **Moves the arms.**
 
     LeRobot's ``BaseStrategy`` control loop, unmodified — the same loop
     teleoperation and recording use. Ctrl-C sets the shutdown event and the loop
-    leaves; teardown disconnects without moving anything, because
-    ``return_to_initial_position`` is off.
+    leaves.
+
+    Args:
+        home: when given, sweep the arms to this pose once the loop has ended —
+            on the duration limit *and* on Ctrl-C, but never after an exception,
+            because a run that ended in a fault is not one to command more motion
+            in. A :class:`~dk1lab.config.HomePose`, or
+            :data:`HOME_AT_START_POSE` to use the pose captured at connect. A
+            second Ctrl-C during the sweep stops it where the arms are.
+
+    Returns:
+        The :class:`~dk1lab.home.HomeReport`, or ``None`` if homing was not asked
+        for or the run ended in an exception.
     """
     from lerobot.rollout.strategies import BaseStrategy
     from lerobot.utils.process import ProcessSignalHandler
@@ -852,12 +981,34 @@ def run(cfg: Any, *, display: bool = False) -> None:
 
     ctx, _ = build_context(cfg, shutdown_event)
     strategy = BaseStrategy(cfg.strategy)
+    report: HomeReport | None = None
+    ended: BaseException | None = None
     try:
         strategy.setup(ctx)
         strategy.run(ctx)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
+        # Ctrl-C during the loop. LeRobot's signal handler normally absorbs it
+        # into the shutdown event, so this is the belt-and-braces path — and it
+        # is still a clean end: the operator asked to stop, nothing faulted.
+        ended = exc
         shutdown_event.set()
+    except BaseException as exc:
+        ended = exc
+        raise
     finally:
+        if home is not None and ended_cleanly(ended):
+            try:
+                report = go_home_before_teardown(
+                    ctx,
+                    strategy,
+                    target=home_target(ctx, None if home is HOME_AT_START_POSE else home),
+                    rate=_home_rate(cfg),
+                    fps=cfg.fps,
+                )
+            except Exception:
+                # Never let homing keep the arms connected and energised.
+                logger.exception("home sweep failed; disconnecting anyway")
         strategy.teardown(ctx)
         if display:
             shutdown_visualization("rerun")
+    return report

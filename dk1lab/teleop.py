@@ -107,6 +107,30 @@ def follower_config(
     )
 
 
+def build_follower(
+    config: DK1Config,
+    *,
+    cameras: bool = True,
+    profile: str = "teleop",
+    control_mode: str = "impedance",
+    limits: LimitProfile | None = None,
+) -> SafeBiDK1Follower:
+    """Construct the follower pair alone. Constructing connects to nothing.
+
+    Split out of :func:`build` for the callers with no use for a leader: the home
+    sweep in :mod:`dk1lab.home` reads and drives the followers only.
+    """
+    return SafeBiDK1Follower(
+        follower_config(
+            config,
+            cameras=cameras,
+            profile=profile,
+            control_mode=control_mode,
+            limits=limits,
+        )
+    )
+
+
 def build(
     config: DK1Config,
     *,
@@ -117,14 +141,12 @@ def build(
 ) -> tuple[BiDK1Leader, SafeBiDK1Follower]:
     """Construct both devices. Constructing connects to nothing."""
     leader = BiDK1Leader(leader_config(config))
-    follower = SafeBiDK1Follower(
-        follower_config(
-            config,
-            cameras=cameras,
-            profile=profile,
-            control_mode=control_mode,
-            limits=limits,
-        )
+    follower = build_follower(
+        config,
+        cameras=cameras,
+        profile=profile,
+        control_mode=control_mode,
+        limits=limits,
     )
     return leader, follower
 

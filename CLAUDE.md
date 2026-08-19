@@ -33,13 +33,14 @@ dk1lab/                 everything this fork adds; the only Python we own
   discovery/formats.py  v4l2 capture-mode probing                      (no lerobot import)
   discovery/preview.py  grab a still and show it                       (cv2, no lerobot)
   checkpoint.py         read a MolmoAct2 checkpoint's metadata     (no lerobot import)
+  home.py               the home sweep: ramp, arrival test, abort  (lerobot lazily)
   cameras.py            builds lerobot OpenCVCameraConfig from config
   robot.py              SafeBiDK1Follower — the rate-limited follower
   teleop.py             the one teleoperation implementation
   policy.py             MolmoAct2 deployment: smoke / dryrun / rollout
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
-tests/                  292 tests, none need hardware
+tests/                  345 tests, none need hardware
 GUIDE.md                operator docs
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
@@ -97,6 +98,13 @@ section, because tomlkit stores it as the previous table's trailing trivia.
 **Nothing else hardcodes a port or a `/dev` path.** Only `dk1.toml`, plus the
 discovery globs.
 
+**`[home]` is optional and all-or-nothing.** Seven numbers per arm in
+`layout.ARM_KEYS` order; a section missing a joint is rejected rather than
+defaulted, because homing thirteen joints and leaving one where the policy put
+it looks like homing and is not. Written by `write_home` (surgical, like the
+others) from `dk1 policy home --capture`; absent, `--home` falls back to the
+pose captured at connect and every banner says which of the two it is using.
+
 ## Safety (non-negotiable)
 
 - **Connecting is not passive.** `connect()` energises every motor and self-zeroes
@@ -108,11 +116,24 @@ discovery globs.
   The inherited wording said "driving them **closed** until they stall" and was
   wrong — a safety notice pointing at the wrong hazard. Corrected in Phase 3
   after Nikolas confirmed the grippers do not close on connect.
-- **Stopping never moves the arms.** `return_to_initial_position` defaults to
-  `true` in LeRobot's rollout — always set it `false`. Return-to-home is opt-in
-  only. Note what "never moves" does and does not mean: nothing is *commanded*,
-  but a clean disconnect in impedance mode reaches `DK1MotorChain.stop()`, which
-  **disables every motor** — so a raised arm sags. Support anything held up.
+- **Stopping never moves the arms** unless homing was asked for.
+  `return_to_initial_position` defaults to `true` in LeRobot's rollout — it is
+  forced `false`, always, including under `--home`. Note what "never moves" does
+  and does not mean: nothing is *commanded*, but a clean disconnect in impedance
+  mode reaches `DK1MotorChain.stop()`, which **disables every motor** — so a
+  raised arm sags. Support anything held up. That is also why a home sweep that
+  does not arrive is reported loudly: the motors go off a second later.
+- **Homing is ours, opt-in, and does not run after a fault.** `dk1lab/home.py`,
+  reached by `dk1 policy run --home` and `dk1 policy home`. LeRobot's built-in
+  return-to-home is wrong here on three counts and is not used: it targets the
+  connect-time pose; it interpolates for a fixed 3 s and disconnects whether or
+  not the arms arrived (behind the 0.3 rad/s cap, anything over ~0.9 rad cannot
+  finish); and it fires from `teardown` on every exit path including a crash.
+  Ours ramps from the previous command at the cap the run drove under, tests
+  arrival against the *measurement*, derives its timeout from the distance, runs
+  on a clean end only (duration limit or Ctrl-C — `policy.ended_cleanly`), and
+  takes SIGINT for the length of the sweep so a second Ctrl-C stops it where the
+  arms are instead of `sys.exit(1)` mid-command.
 - **The speed limit lives in the follower**, and in `dk1.toml`. `SafeBiDK1Follower`
   (`--robot.type=bi_dk1_follower_safe`) limits in *both* control modes; the
   numbers come from `[limits.<activity>]`, where `false` spells "no cap".
@@ -313,7 +334,8 @@ resting in a leader trigger gets pushed. `safety.LEADER_HELP` says so.
 `dk1 teleop --dry-run` builds every config and prints it while connecting to
 nothing.
 
-**Phase 3** — four escalating commands, all built, **all four now run**:
+**Phase 3** — four escalating commands, all built, **all four now run**, plus
+a fifth (`home`) added afterwards that has not:
 
 | | | risk |
 | --- | --- | --- |
@@ -321,12 +343,15 @@ nothing.
 | `dk1 policy smoke` | loads it, runs inference on a synthetic frame | GPU only, nothing connected |
 | `dk1 policy dryrun` | full deployment path, actions **printed, never sent** | arms energised, no pose commanded |
 | `dk1 policy run` | the rollout | the policy drives the arms |
+| `dk1 policy home` | the home sweep alone, no model | both arms move |
 
 `dk1lab/policy.py` is the single implementation; `dk1lab/checkpoint.py` is the
 JSON-only reader behind `check`. Settings are decided in code, not left to a
 command line: gripper inversion on, image keys pinned, `inference_action_mode
 = continuous`, bf16 on cuda, RTC by default, `return_to_initial_position` forced
-false.
+false. `--home` is the one opt-in: it runs `dk1lab.home` rather than LeRobot's
+teardown sweep. **No home sweep has run on the arms** — it is tested only
+against fakes.
 
 All four have been run. `run` produced juddering, stalling motion; the cause was
 found and fixed (see *The first rollout*, below) and it has not been re-run since.
@@ -424,6 +449,9 @@ direction is still inferred rather than observed changing. Both need the arms.
 
 What remains for this phase: re-run the rollout with the fixes, hand on the
 e-stop, and report what happens plainly — including "it does nothing useful".
+Capture a home pose (`dk1 policy home --capture`) and watch `dk1 policy home`
+sweep to it *before* putting `--home` on a rollout: that is a sweep of both arms
+that no hardware has seen yet.
 
 **Phase 4** — record → LoRA from the same checkpoint → deploy → scored, labelled
 eval attempts.

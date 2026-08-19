@@ -21,7 +21,7 @@ import typer
 from .. import checkpoint as ckpt
 from ..config import DEFAULT_CONFIG_PATH, load
 from ..layout import ACTION_KEYS, GRIPPER_INDICES, IMAGE_KEYS
-from ..policy import DEFAULT_EXECUTION_HORIZON, DEFAULT_FPS, POLICY_LIMITS
+from ..policy import DEFAULT_EXECUTION_HORIZON, DEFAULT_FPS, HOME_AT_START_POSE, POLICY_LIMITS
 from .safety import ENERGISE_HELP, MOTION_HELP, confirm_motion
 
 app = typer.Typer(no_args_is_help=True, help=__doc__)
@@ -30,7 +30,7 @@ ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Path to dk1.tom
 CheckpointOpt = Annotated[
     str | None,
     typer.Option(
-        "--checkpoint", help="Checkpoint dir or HF repo id. Default: [policy] in dk1.toml."
+        "--checkpoint", help="Checkpoint dir or HF repo id. Default: \\[policy] in dk1.toml."
     ),
 ]
 TaskOpt = Annotated[str, typer.Option("--task", help="The language instruction to condition on.")]
@@ -252,7 +252,7 @@ def _limits(settings, max_joint_rate: float | None, no_limit: bool):
     return limits
 
 
-def _report(cfg, spec: str, *, steps: int | None = None) -> None:
+def _report(cfg, spec: str, *, steps: int | None = None, home=None) -> None:
     """Print everything that was built, before anything is connected."""
     robot = cfg.robot
 
@@ -299,9 +299,28 @@ def _report(cfg, spec: str, *, steps: int | None = None) -> None:
         typer.echo(f"  stopping after {cfg.duration}s")
     else:
         typer.echo("  until interrupted")
-    typer.echo(
-        f"  return to start pose on stop: {'YES' if cfg.return_to_initial_position else 'no'}"
-    )
+    _echo_home(home)
+
+
+def _echo_home(home) -> None:
+    """What will happen when the loop ends. The last thing printed before it acts."""
+    typer.secho("\nwhen the run ends", bold=True)
+    if home is None:
+        typer.echo("  disconnect only — the arms stay where they are, and the motors")
+        typer.echo("  are disabled, so support anything holding itself up")
+        return
+    if home is HOME_AT_START_POSE:
+        typer.secho(
+            "  HOME to the pose captured at connect (no [home] in dk1.toml)",
+            fg=typer.colors.YELLOW,
+        )
+    else:
+        typer.secho("  HOME to the [home] pose in dk1.toml:", fg=typer.colors.YELLOW)
+        for side in ("left", "right"):
+            values = ", ".join(f"{v:+.3f}" for v in getattr(home, side))
+            typer.echo(f"    {side:5s} [{values}]")
+    typer.echo("  on the duration limit and on Ctrl-C; not after an error.")
+    typer.echo("  Ctrl-C during the sweep stops it where the arms are.")
 
 
 # --------------------------------------------------------------------------- #
@@ -393,10 +412,16 @@ def dryrun(
 HELP_RUN = (
     """Deploy the policy: MolmoAct2 drives the follower arms.
 
-The speed cap comes from [limits.policy] in dk1.toml and is on by default —
+The speed cap comes from \\[limits.policy] in dk1.toml and is on by default —
 this is the case the limiter was written for. Ctrl-C stops; stopping
-disconnects and nothing else, because the arms are never swept home unless you
-ask for it with --return-home.
+disconnects and nothing else, unless you ask for --home.
+
+With --home, the arms are swept back to the \\[home] pose in dk1.toml when the
+run ends — on the duration limit and on Ctrl-C alike, but never after an error.
+The sweep runs at the same speed cap the policy ran under and stops when the
+arms arrive, not after a fixed time. A second Ctrl-C stops it where they are.
+Set the pose with `dk1 policy home --capture`; without one, --home falls back
+to the pose the arms were in when the run connected.
 
 Do `dk1 policy check`, then `smoke`, then `dryrun` first. Keep a hand on the
 e-stop."""
@@ -438,9 +463,9 @@ def run(
         bool, typer.Option("--display", help="Stream observations to Rerun.")
     ] = False,
     device: DeviceOpt = "cuda",
-    return_home: Annotated[
+    home: Annotated[
         bool,
-        typer.Option("--return-home", help="Sweep the arms to their start pose at shutdown."),
+        typer.Option("--home", help="Sweep the arms to the \\[home] pose when the run ends."),
     ] = False,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Build and print everything; connect nothing.")
@@ -476,9 +501,15 @@ def run(
         execution_horizon=execution_horizon,
         device=device,
         display=display,
-        return_home=return_home,
     )
-    _report(cfg, spec)
+    # LeRobot's own return_to_initial_position stays off whatever --home says:
+    # it fires from teardown on every exit path including a crash, sweeps for a
+    # fixed 3 s whether or not the arms arrive, and targets the connect-time
+    # pose. dk1lab.home does the job on our terms. See dk1lab/home.py.
+    home_pose = None
+    if home:
+        home_pose = settings.home if settings.home is not None else HOME_AT_START_POSE
+    _report(cfg, spec, home=home_pose)
 
     if dry_run:
         typer.secho("\n--dry-run: nothing was connected and nothing moved.", fg=typer.colors.GREEN)
@@ -487,16 +518,147 @@ def run(
     notes = ["The POLICY commands the arms. Nobody has verified what it does on this cell."]
     if limits.max_joint_rate is None:
         notes.append("The speed cap is OFF for this run (--no-limit).")
-    if return_home:
-        notes.append("--return-home: stopping will sweep both arms to their start pose.")
+    if home_pose is not None:
+        notes.append("--home: when the run ends, BOTH ARMS SWEEP to the home pose.")
+        if home_pose is HOME_AT_START_POSE:
+            notes.append("        no [home] in dk1.toml, so home = the pose at connect.")
     confirm_motion(
         f"run MolmoAct2 on the follower arms — {task!r}",
         assume_yes=assume_yes,
         notes=notes,
     )
-    typer.secho("\nCtrl-C to stop. Stopping does not move the arms.\n", fg=typer.colors.GREEN)
-    run_rollout(cfg, display=display)
+    if home_pose is None:
+        typer.secho("\nCtrl-C to stop. Stopping does not move the arms.\n", fg=typer.colors.GREEN)
+    else:
+        typer.secho(
+            "\nCtrl-C to stop. Stopping then SWEEPS THE ARMS HOME; "
+            "a second Ctrl-C stops the sweep.\n",
+            fg=typer.colors.YELLOW,
+        )
+    report = run_rollout(cfg, display=display, home=home_pose)
     typer.secho("\nrollout ended; the robot is disconnected.", fg=typer.colors.GREEN)
+    if report is not None:
+        colour = typer.colors.GREEN if report.reached else typer.colors.YELLOW
+        typer.secho(report.summary(), fg=colour)
+        if not report.reached:
+            typer.secho(
+                "the motors are now disabled — support anything holding itself up.",
+                fg=typer.colors.YELLOW,
+            )
+
+
+# --------------------------------------------------------------------------- #
+# 5. home — the pose a run ends at, and how to drive there now
+# --------------------------------------------------------------------------- #
+
+
+HELP_HOME = (
+    """Drive both follower arms to the \\[home] pose in dk1.toml.
+
+This is the same sweep `dk1 policy run --home` does when a run ends, without
+loading the model: ramp at the \\[limits.policy] speed cap, stop when the arms
+arrive rather than after a fixed time, and report where they got to. No
+cameras are opened. Ctrl-C stops the sweep where the arms are.
+
+  --capture   the opposite direction: read where the arms are RIGHT NOW and
+              write that into \\[home] in dk1.toml. Commands no pose, but still
+              energises the arms. Position them by hand first (with everything
+              powered down, or through teleoperation), then capture."""
+    + MOTION_HELP
+)
+
+
+@app.command("home", help=HELP_HOME)
+def home(
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+    capture: Annotated[
+        bool,
+        typer.Option("--capture", help="Write the arms' current pose into \\[home] in dk1.toml."),
+    ] = False,
+    control_mode: Annotated[
+        str, typer.Option("--control-mode", help="Follower control mode: impedance or pos_vel.")
+    ] = "impedance",
+    max_joint_rate: Annotated[
+        float | None,
+        typer.Option("--max-joint-rate", help="Sweep speed, rad/s. Overrides dk1.toml."),
+    ] = None,
+    show: Annotated[
+        bool, typer.Option("--show", help="Print the configured home pose and exit. No motion.")
+    ] = False,
+    assume_yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")
+    ] = False,
+) -> None:
+    from ..config import check_devices, write_home
+    from ..home import DEFAULT_HOME_RATE, capture_pose, sweep_to_home
+
+    if control_mode not in ("impedance", "pos_vel"):
+        raise typer.BadParameter(f"control mode must be impedance or pos_vel, got {control_mode!r}")
+
+    # Devices are checked below, once it is clear something will actually be
+    # connected: `--show` reads the file, and "there is no home pose" is a better
+    # message than "the cameras are missing" when both are true.
+    settings = load(config)
+
+    if show:
+        if settings.home is None:
+            typer.secho(
+                f"{config}: no [home] section — `dk1 policy run --home` would fall back to "
+                f"the pose captured at connect. Set one with `dk1 policy home --capture`.",
+                fg=typer.colors.YELLOW,
+            )
+            raise typer.Exit(code=1)
+        _echo_home(settings.home)
+        return
+
+    if capture:
+        check_devices(settings)
+        confirm_motion(
+            "energise both follower arms and record their current pose as home",
+            assume_yes=assume_yes,
+            notes=["No pose is commanded — but the grippers self-zero OPEN, so that is"
+                   " what gets captured for them."],
+        )
+        pose = capture_pose(settings, control_mode=control_mode)
+        write_home(pose, config)
+        typer.secho(f"\nwrote [home] to {config}:", fg=typer.colors.GREEN)
+        _echo_home(pose)
+        return
+
+    if settings.home is None:
+        typer.secho(
+            f"{config}: no [home] section, so there is nothing to drive to. "
+            f"Position the arms and run `dk1 policy home --capture` first.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    check_devices(settings)
+    limits = _limits(settings, max_joint_rate, no_limit=False)
+    rate = limits.max_joint_rate or DEFAULT_HOME_RATE
+    _echo_home(settings.home)
+    confirm_motion(
+        f"sweep BOTH follower arms to the home pose at {rate} rad/s",
+        assume_yes=assume_yes,
+        notes=["Both arms move. Ctrl-C stops the sweep where they are."],
+    )
+    report = sweep_to_home(
+        settings,
+        target=settings.home.as_action_dict(),
+        limits=limits,
+        control_mode=control_mode,
+    )
+    typer.secho(
+        f"\n{report.summary()}",
+        fg=typer.colors.GREEN if report.reached else typer.colors.YELLOW,
+    )
+    if not report.reached:
+        typer.secho(
+            "the motors are now disabled — support anything holding itself up.",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=1)
 
 
 __all__ = ["app"]

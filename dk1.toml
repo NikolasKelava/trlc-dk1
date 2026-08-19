@@ -179,3 +179,31 @@ max_dt = 0.1
 # "pretrained_path" pointing at the HF cache snapshot it was converted from.
 [policy]
 checkpoint = "~/Documents/RobotLearning/trlc-dk1/outputs/molmoact2_bimanual_yam_bf16"
+
+# --- Home pose ---------------------------------------------------------------
+#
+# Where the arms are sent when a policy run ends with `dk1 policy run --home`,
+# and where `dk1 policy home` drives them on demand. Seven numbers per arm, in
+# the order one arm contributes to the 14-D vector (dk1lab/layout.py):
+#
+#     joint_1, joint_2, joint_3, joint_4, joint_5, joint_6, gripper
+#
+# Joints in radians; the gripper is normalised, 0 = open and 1 = closed — the
+# DK1's own convention, not the checkpoint's inverted one.
+#
+# Do not type these by hand. Put the arms where you want home to be, then:
+#
+#     dk1 policy home --capture
+#
+# which reads both arms and rewrites only this section. Note that connecting
+# self-zeroes the grippers OPEN, so a captured home always has gripper 0 unless
+# something moved them in between.
+#
+# The section is OPTIONAL, and nothing has been captured on this cell yet — so
+# it is absent below. While it is absent, `--home` falls back to the pose the
+# arms were in when the run connected, which is a pose but not a chosen one, and
+# the run banner says so. `dk1 policy home` refuses outright.
+#
+# The sweep is NOT LeRobot's return_to_initial_position, which is forced off:
+# it ramps at [limits.policy].max_joint_rate, stops when the arms actually
+# arrive rather than after a fixed 3 s, and says so when they did not.

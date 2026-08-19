@@ -41,6 +41,15 @@ def show(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
                 f"lag {limit.max_lag} rad  max dt {limit.max_dt}s"
             )
 
+    typer.secho("\nhome pose", bold=True)
+    if cfg.home is None:
+        typer.echo("  none — `dk1 policy run --home` would use the pose at connect")
+        typer.echo("  set one with `dk1 policy home --capture`")
+    else:
+        for side in ("left", "right"):
+            values = ", ".join(f"{value:+.3f}" for value in getattr(cfg.home, side))
+            typer.echo(f"  {side:6s} [{values}]")
+
     typer.secho("\ncapture profiles", bold=True)
     for name, profile in cfg.capture.items():
         typer.echo(f"  {name:8s} {profile.width}x{profile.height} @ {profile.fps} fps  {profile.fourcc}")

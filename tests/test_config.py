@@ -10,13 +10,16 @@ from dk1lab.config import (
     ArmPorts,
     CameraDevice,
     ConfigError,
+    HomePose,
     LimitProfile,
     check_devices,
     load,
     parse,
     write_arms,
     write_cameras,
+    write_home,
 )
+from dk1lab.layout import ACTION_KEYS
 
 
 def test_loads_and_exposes_every_field(config_file):
@@ -361,3 +364,99 @@ def test_writing_arms_leaves_the_limits_section_alone(config_file):
         config_file,
     )
     assert load(config_file).limits["teleop"].max_joint_rate == 0.5
+
+
+# --------------------------------------------------------------------------- #
+# [home] — the pose a run ends at
+# --------------------------------------------------------------------------- #
+
+
+HOME_SECTION = """
+[home]
+left = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0]
+right = [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6, 1.0]
+"""
+
+
+def _with_home(config_file, section: str = HOME_SECTION):
+    config_file.write_text(config_file.read_text() + section)
+    return config_file
+
+
+def test_a_missing_home_section_is_not_an_error(config_file):
+    # Homing is opt-in, and --home falls back to the pose captured at connect.
+    assert load(config_file).home is None
+
+
+def test_home_becomes_the_fourteen_action_keys_in_layout_order(config_file):
+    home = load(_with_home(config_file)).home
+    action = home.as_action_dict()
+    assert list(action) == list(ACTION_KEYS)
+    assert action["left_joint_1.pos"] == 0.1
+    assert action["left_gripper.pos"] == 0.0
+    assert action["right_gripper.pos"] == 1.0
+
+
+def test_home_round_trips_through_an_action_dict(config_file):
+    home = load(_with_home(config_file)).home
+    assert HomePose.from_action_dict(home.as_action_dict()) == home
+
+
+def test_half_a_home_pose_is_refused(config_file):
+    # The joints it omits would stay where the run left them while the rest
+    # move, which looks like homing and is not.
+    with pytest.raises(ConfigError, match="missing `right`"):
+        load(_with_home(config_file, "\n[home]\nleft = [0, 0, 0, 0, 0, 0, 0]\n"))
+
+
+def test_a_home_arm_with_the_wrong_number_of_joints_is_refused(config_file):
+    with pytest.raises(ConfigError, match=r"\[home\].left"):
+        load(_with_home(config_file, "\n[home]\nleft = [0, 0, 0]\nright = [0, 0, 0, 0, 0, 0, 0]\n"))
+
+
+def test_a_non_numeric_home_value_is_refused(config_file):
+    with pytest.raises(ConfigError, match="must be a number"):
+        load(
+            _with_home(
+                config_file,
+                '\n[home]\nleft = [0, 0, 0, 0, 0, 0, "open"]\nright = [0, 0, 0, 0, 0, 0, 0]\n',
+            )
+        )
+
+
+def test_an_unknown_home_key_is_refused(config_file):
+    with pytest.raises(ConfigError, match="unknown keys"):
+        load(
+            _with_home(
+                config_file,
+                "\n[home]\nleft = [0, 0, 0, 0, 0, 0, 0]\n"
+                "right = [0, 0, 0, 0, 0, 0, 0]\nmiddle = [0]\n",
+            )
+        )
+
+
+def test_writing_home_round_trips(config_file):
+    pose = HomePose(left=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.0), right=(0.0,) * 7)
+    write_home(pose, config_file)
+    assert load(config_file).home == pose
+
+
+def test_writing_home_leaves_every_other_section_and_comment_alone(config_file):
+    before = load(config_file)
+    write_home(HomePose(left=(0.0,) * 7, right=(0.0,) * 7), config_file)
+    after = load(config_file)
+    text = config_file.read_text()
+
+    assert after.follower == before.follower
+    assert after.cameras == before.cameras
+    assert after.capture == before.capture
+    assert after.policy == before.policy
+    assert "a comment that must survive every surgical write" in text
+    assert "camera comment" in text
+
+
+def test_capturing_home_twice_replaces_rather_than_appends(config_file):
+    write_home(HomePose(left=(0.1,) * 7, right=(0.1,) * 7), config_file)
+    write_home(HomePose(left=(0.2,) * 7, right=(0.2,) * 7), config_file)
+    assert load(config_file).home.left == (0.2,) * 7
+    assert config_file.read_text().count("[home]") == 1
