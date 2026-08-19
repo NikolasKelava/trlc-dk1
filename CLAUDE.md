@@ -104,6 +104,9 @@ defaulted, because homing thirteen joints and leaving one where the policy put
 it looks like homing and is not. Written by `write_home` (surgical, like the
 others) from `dk1 policy home --capture`; absent, `--home` falls back to the
 pose captured at connect and every banner says which of the two it is using.
+**It is now filled in** — captured on the hardware 2026-08-19, both arms at
+their zero pose (every value within 0.024 rad of zero, both grippers ~0 = open).
+So home is "zero pose, grippers open", not an arbitrary resting position.
 
 ## Safety (non-negotiable)
 
@@ -263,6 +266,12 @@ sent):
   Uninverted, the first tick would have commanded 0.99 = fully closed. Still not
   proof — the model has not been seen to *change* the gripper — but the right sign.
 
+**The home pose is captured** (2026-08-19, `dk1 policy home --capture`): both
+arms at zero, `[home]` in `dk1.toml` reads within 0.024 rad of zero on every
+joint and ~0 on both grippers. That is a *read* — the command energises the arms
+and commands nothing — so it confirms the capture path and the writer, and says
+nothing yet about the sweep that drives back to it.
+
 Also found here: `make_robot_from_config` builds a robot by *class-name lookup*
 in the package holding its config's module, which registration alone does not
 satisfy. `dk1lab/__init__.py` exposes `SafeBiDK1Follower` through a lazy
@@ -350,8 +359,8 @@ JSON-only reader behind `check`. Settings are decided in code, not left to a
 command line: gripper inversion on, image keys pinned, `inference_action_mode
 = continuous`, bf16 on cuda, RTC by default, `return_to_initial_position` forced
 false. `--home` is the one opt-in: it runs `dk1lab.home` rather than LeRobot's
-teardown sweep. **No home sweep has run on the arms** — it is tested only
-against fakes.
+teardown sweep. The pose has been captured on the arms; **the sweep itself has
+still not run on them** — its logic is tested only against fakes.
 
 All four have been run. `run` produced juddering, stalling motion; the cause was
 found and fixed (see *The first rollout*, below) and it has not been re-run since.
@@ -449,9 +458,10 @@ direction is still inferred rather than observed changing. Both need the arms.
 
 What remains for this phase: re-run the rollout with the fixes, hand on the
 e-stop, and report what happens plainly — including "it does nothing useful".
-Capture a home pose (`dk1 policy home --capture`) and watch `dk1 policy home`
-sweep to it *before* putting `--home` on a rollout: that is a sweep of both arms
-that no hardware has seen yet.
+The home pose is captured (see below); what is still unwatched is the *sweep*.
+Run `dk1 policy home` on its own, from a pose the arms are not already in,
+before putting `--home` on a rollout — that is both arms moving along a path no
+hardware has seen yet.
 
 **Phase 4** — record → LoRA from the same checkpoint → deploy → scored, labelled
 eval attempts.

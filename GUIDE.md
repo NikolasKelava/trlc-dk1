@@ -159,9 +159,11 @@ the bimanual follower runs by default. Do not treat it as a safety knob.
 
 **`[home]`** — where `--home` sends the arms when a run ends, seven numbers per
 arm in the 14-D vector's own order (`joint_1 .. joint_6`, then the gripper).
-Optional, and currently absent: capture it with `dk1 policy home --capture`
-rather than typing radians. While it is absent, `--home` falls back to the pose
-the arms were in when the run connected and the banner says so.
+Optional, and now captured: both arms at their zero pose, every value within
+0.024 rad of zero and both grippers open. Re-capture with
+`dk1 policy home --capture` rather than typing radians; `dk1 config show` prints
+what is currently set. If the section were removed, `--home` would fall back to
+the pose the arms were in when the run connected, and the banner would say so.
 
 **`[capture.policy|teleop]`** — resolution differs by use, device identity does
 not. `fourcc` is `MJPG` everywhere and should stay that way: YUYV at 720p60 needs
@@ -302,6 +304,11 @@ rewrites only `[home]` in `dk1.toml`. Position them by hand first — note that
 connecting self-zeroes the grippers open, so that is what a captured home
 records for them.
 
+This has been done: the pose currently in `dk1.toml` was captured with both arms
+at zero, so "home" on this cell means the zero pose with the grippers open. The
+*sweep* to it has not been watched yet — do `dk1 policy home` on its own, from a
+pose the arms are not already in, before you put `--home` on a rollout.
+
 The sweep ramps from the last command at `[limits.policy].max_joint_rate`,
 watches the measured positions, and stops when every arm joint is within
 0.03 rad of home. Grippers are commanded but excluded from the arrival test,
@@ -376,5 +383,11 @@ the policy agrees with the start pose to within 0.065 rad, its intended speed is
 about 0.2 rad/s, and `0 = open` on the grippers is confirmed — they read 0.0000
 standing open, and connecting does not close them.
 
-The policy has still never *driven* these arms, and what it does when it can is
-exactly what Phase 3 is for.
+`dk1 policy run` has driven the arms once. It moved, reached and actuated the
+grippers, but juddered and stalled; the cause was RTC's prefix blend collapsing
+to zero width, which is fixed but not yet re-run. Nothing has been evaluated or
+scored, so what the policy can actually do here is still unknown.
+
+The home pose has been captured on the hardware — that path energises the arms
+and reads them, nothing more. The home *sweep*, which drives both arms, has run
+only against fakes in the test suite.

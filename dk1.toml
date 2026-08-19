@@ -199,11 +199,16 @@ checkpoint = "~/Documents/RobotLearning/trlc-dk1/outputs/molmoact2_bimanual_yam_
 # self-zeroes the grippers OPEN, so a captured home always has gripper 0 unless
 # something moved them in between.
 #
-# The section is OPTIONAL, and nothing has been captured on this cell yet — so
-# it is absent below. While it is absent, `--home` falls back to the pose the
-# arms were in when the run connected, which is a pose but not a chosen one, and
-# the run banner says so. `dk1 policy home` refuses outright.
+# The section is OPTIONAL. It is filled in below, captured on 2026-08-19 with
+# both arms at their zero pose: every value is within 0.024 rad of zero and both
+# grippers read ~0, i.e. open. Were it absent, `--home` would fall back to the
+# pose the arms were in when the run connected — a pose, but not a chosen one —
+# and the banner would say so; `dk1 policy home` would refuse outright.
 #
 # The sweep is NOT LeRobot's return_to_initial_position, which is forced off:
 # it ramps at [limits.policy].max_joint_rate, stops when the arms actually
 # arrive rather than after a fixed 3 s, and says so when they did not.
+
+[home]
+left = [0.020409, -0.010491, 0.005913, 0.01545, 0.000572, -0.001335, 4.1e-05]
+right = [0.023842, -0.00515, 0.005531, 0.005531, 0.003243, -0.006676, 0.000122]
