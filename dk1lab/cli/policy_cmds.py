@@ -665,6 +665,82 @@ def run(
 
 
 # --------------------------------------------------------------------------- #
+# serve — the same policy, over HTTP, for the ManiSkill sim
+# --------------------------------------------------------------------------- #
+
+
+HELP_SERVE = """Serve the rollout checkpoint over the MolmoAct2 /act protocol.
+
+No robot, no /dev node, no motion — this is a GPU-only command, like `smoke`.
+It exists so `sai-prasanna/molmoact2`'s `sim_eval` can drive THE SAME policy the
+arms run, without modifying a line of it. Point it here:
+
+  dk1 policy serve                                    # this terminal
+  uv run python -m sim_eval.run_eval \
+      --policy-type remote-yam \
+      --remote-url http://localhost:8202/act \
+      -e BimanualYAMPutEverythingInBox-v1             # the other terminal
+
+Two structural differences from a rollout, both because the sim has no real-time
+deadline and speaks the checkpoint's own conventions: there is no RTC (sim_eval
+blocks on each response, so there is no latency to compensate), and the gripper
+inversion is off (sim_eval already sends 1=open, which is what the checkpoint
+expects). Behaviour transfers between sim and hardware; timing does not."""
+
+
+@app.command("serve", help=HELP_SERVE)
+def serve(
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+    checkpoint: CheckpointOpt = None,
+    host: Annotated[str, typer.Option("--host", help="Bind address.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Bind port.")] = 8202,
+    device: DeviceOpt = "cuda",
+    task: Annotated[
+        str | None,
+        typer.Option("--task", help="Override the instruction sim_eval sends. Default: use it."),
+    ] = None,
+    invert_gripper: InvertOpt = False,
+    warmup: Annotated[
+        bool, typer.Option("--warmup/--no-warmup", help="Run one inference before listening.")
+    ] = True,
+) -> None:
+    from ..serve import serve as run_server
+
+    settings = load(config, require_devices=False)
+    spec = _checkpoint(settings, checkpoint)
+    capture = settings.profile("policy")
+
+    typer.secho("/act server — no robot is connected by this command", bold=True)
+    typer.echo(f"  checkpoint  {spec}")
+    typer.echo(f"  device      {device}")
+    typer.echo(f"  listening   http://{host}:{port}/act")
+    typer.echo(f"  cameras     {', '.join(IMAGE_KEYS)}")
+    if task:
+        typer.secho(f"  task        OVERRIDDEN to {task!r}", fg=typer.colors.YELLOW)
+    if invert_gripper:
+        typer.secho(
+            "  gripper     INVERTED — note sim_eval already sends 1=open, so this\n"
+            "              is very likely wrong here. See dk1lab/serve.py.",
+            fg=typer.colors.YELLOW,
+        )
+    else:
+        typer.echo("  gripper     pass-through (sim_eval speaks the YAM convention)")
+    typer.echo("\nloading the checkpoint; Ctrl-C to stop the server.\n")
+
+    run_server(
+        spec,
+        host=host,
+        port=port,
+        device=device,
+        width=capture.width,
+        height=capture.height,
+        invert_gripper=invert_gripper,
+        task=task,
+        warmup=warmup,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 5. home — the pose a run ends at, and how to drive there now
 # --------------------------------------------------------------------------- #
 

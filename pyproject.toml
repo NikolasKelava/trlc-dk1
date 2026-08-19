@@ -16,6 +16,11 @@ dependencies = [
   "typer>=0.12",
   "tomlkit>=0.13",
   "opencv-python>=4.9",
+  # `dk1 policy serve` — the /act endpoint sai-prasanna/molmoact2's sim_eval
+  # talks to. Three small pure-Python packages; the model itself is lerobot's.
+  "fastapi>=0.116",
+  "uvicorn>=0.35",
+  "json-numpy>=2.1",
 ]
 
 authors = [

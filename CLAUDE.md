@@ -39,9 +39,10 @@ dk1lab/                 everything this fork adds; the only Python we own
   teleop.py             the one teleoperation implementation
   policy.py             MolmoAct2 deployment: smoke / dryrun / rollout
   trace.py              per-chunk latency, queue depth, and the policy's OWN action
+  serve.py              the /act HTTP endpoint sim_eval drives — no robot
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
-tests/                  370 tests, none need hardware
+tests/                  387 tests, none need hardware
 GUIDE.md                operator docs
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
@@ -221,6 +222,11 @@ but it is an impression, not a result, and the second run was still stalling for
 most of every second. That line stays sharp: a policy that reaches is not a
 policy that works.
 
+It now also scores **0/10 in the colleague's own simulator**, on the checkpoint's
+own embodiment, with perfect tracking and none of this cell's timing or
+gripper-sign problems — see *The sim run*, below. That is the strongest evidence
+yet, and it points at the policy rather than at us.
+
 The zero-shot case rests on the colleague's sim work
 (`sai-prasanna/molmoact2`, branch **`sim-eval-dk1`**, single commit `797b179`).
 Nikolas reports it "works quite well" and that nothing changed since that commit.
@@ -315,6 +321,7 @@ ports is open any more.
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
 | **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms twice**; judder fixed, the stall is diagnosed but not fixed |
+| **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **run: 0/10, and it is not the plumbing** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
 **Phase 1** — done. Built `dk1 find cameras` (preview a still per candidate with
@@ -567,6 +574,77 @@ hardware has seen yet.
 
 **Phase 4** — record → LoRA from the same checkpoint → deploy → scored, labelled
 eval attempts.
+
+### The sim run: the policy behaves the same way with every hardware excuse removed
+
+`sai-prasanna/molmoact2`'s `sim_eval` is a **pure HTTP client** — it posts three
+camera frames, a 14-D state and an instruction to an `/act` endpoint and executes
+the chunk that comes back. It never imports a model. So `dk1lab/serve.py` answers
+that endpoint with **the exact checkpoint the arms run**, through the same
+LeRobot pipelines, and `sim_eval` is used byte-identical to upstream.
+
+Clone at `~/Documents/RobotLearning/molmoact2` (scratch, not tracked here). Two
+forced deviations, both recorded there: `torch` repinned from `2.5.1+cu121` to
+`>=2.7+cu128`, because the 5090 is sm_120 and the pinned wheels have no kernel
+image for it; and ManiSkill's YCB asset pack downloaded separately
+(`python -m mani_skill.utils.download_asset ycb`), which the sim_eval README does
+not mention.
+
+Two structural differences from a rollout, both deliberate and both *in our
+favour* for this experiment:
+
+- **No RTC.** `sim_eval` blocks on each response, so there is no deadline, no
+  latency to compensate, no queue to starve and no seam to blend. Every timing
+  fault found on the arms is absent by construction.
+- **No gripper inversion.** The wire protocol *is* the YAM convention —
+  `sim_eval`'s own `yam_state_adapter` sends `grip in [0,1] (1=open)` and
+  `yam_action_adapter` maps `1.0` back to ManiSkill's `-1.0` = open. That is a
+  **third** independent statement of the convention, and it means the sim tests
+  the policy with the DK1's gripper sign out of the picture entirely.
+
+`BimanualYAMPutEverythingInBox-v1`, "put everything into the box", 10 episodes,
+800 steps: **success 0/10**. Also 0/3 at `--n-action-steps 10` and 0/3 at `5`,
+so it is not the 1-second open-loop chunk the repo defaults to.
+
+It is not the plumbing, and these are the numbers that say so (one 400-step
+episode, recorded state and action):
+
+| | |
+| --- | --- |
+| tracking, median \|commanded − measured\| per arm joint | **0.001 – 0.009 rad** |
+| right-arm travel, total per joint | up to **3.4 rad** |
+| left-arm travel, total per joint | 0.16 – 0.72 rad |
+| gripper state seen by the policy | **0.000 → 1.000, both hands** |
+| gripper commanded | left −1.00 → +0.83, right −1.00 → +0.45 |
+
+The first row is the important one: the simulator executes what the policy asks
+to within a milliradian. Nothing is being lost between the model and the robot.
+The policy reaches with the right arm and **opens and closes both grippers** —
+so "the policy never actuates a gripper" is now dead as a hypothesis in sim, as
+it already is on hardware. It simply does not do the task.
+
+The camera views were checked by eye and are well-formed: an overhead view with
+the box, the lego and the tennis ball, and two wrist views.
+
+**What this does and does not establish.** On its own embodiment, in its own
+simulator, with its own gripper convention, perfect tracking, no latency and no
+queue, zero-shot MolmoAct2 scores 0/10 on the task the repo ships. That is the
+same *class* of behaviour seen on the arms — moves, reaches, does not accomplish
+— and it makes "the DK1 cell is what is breaking it" much harder to sustain.
+
+The one thing not yet ruled out is **this server versus the reference one**:
+`examples/yam/host_server_yam.py` loads `allenai/MolmoAct2-BimanualYAM` in HF
+format through `transformers`' `predict_action`, which is a different code path
+from our LeRobot bf16 copy. Running both and comparing is the last step that
+would close this, and it costs a ~20 GB download. Until then, "the policy is
+weak zero-shot here" and "our LeRobot packaging is subtly wrong" are not fully
+separated — though the perfect tracking and the sane action ranges argue hard
+for the first.
+
+The colleague's `sim-eval-dk1` branch turns out to carry a **full DK1 in sim** —
+`bimanual_dk1.urdf`, the meshes, `robots/bimanual_dk1.py`, a DK1 task and DK1
+adapters — so running our own embodiment in sim is a checkout away, not a build.
+That is the agreed next step after YAM.
 
 ## Environment
 

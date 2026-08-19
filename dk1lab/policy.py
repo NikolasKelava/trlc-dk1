@@ -555,6 +555,30 @@ def report_rtc_headroom(latency_s: float, *, fps: float, execution_horizon: int 
     )
 
 
+def dataset_features(*, width: int, height: int) -> dict:
+    """The LeRobot feature dict this cell presents to the policy.
+
+    Derived from :mod:`dk1lab.layout` rather than restated, so the 14 state and
+    action slots and the three camera names cannot drift between the paths that
+    build one of these — the smoke test, and the ``/act`` server in
+    :mod:`dk1lab.serve`. The rollout gets its own from the connected robot, and
+    ``tests/test_layout.py`` asserts the two agree.
+
+    The image ``shape`` is nominal: ``build_dataset_frame`` passes image arrays
+    through untouched, so a frame of a different size still works. It is set
+    from ``[capture.policy]`` anyway, because a wrong number here would be read
+    as a claim.
+    """
+    from lerobot.utils.constants import ACTION, OBS_STR
+    from lerobot.utils.feature_utils import hw_to_dataset_features
+
+    observation_hw: dict[str, Any] = {key: float for key in STATE_KEYS}
+    observation_hw.update({name: (height, width, 3) for name in CAMERA_NAMES})
+    features = hw_to_dataset_features(observation_hw, OBS_STR, use_video=False)
+    features.update(hw_to_dataset_features({key: float for key in ACTION_KEYS}, ACTION))
+    return features
+
+
 # --------------------------------------------------------------------------- #
 # 1. Smoke test — GPU only, no robot
 # --------------------------------------------------------------------------- #
@@ -642,8 +666,8 @@ def smoke(
     import torch
     from lerobot.policies.factory import get_policy_class, make_pre_post_processors
     from lerobot.rollout.inference.sync import SyncInferenceEngine
-    from lerobot.utils.constants import ACTION, OBS_STR
-    from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
+    from lerobot.utils.constants import OBS_STR
+    from lerobot.utils.feature_utils import build_dataset_frame
 
     config = policy_config(
         checkpoint, device=device, dtype=dtype, invert_gripper=invert_gripper
@@ -665,10 +689,7 @@ def smoke(
 
     # The same feature plumbing the rollout builds, from the same layout — so a
     # key-order mistake shows up here rather than on the arms.
-    observation_hw: dict[str, Any] = {key: float for key in STATE_KEYS}
-    observation_hw.update({name: (height, width, 3) for name in CAMERA_NAMES})
-    features = hw_to_dataset_features(observation_hw, OBS_STR, use_video=False)
-    features.update(hw_to_dataset_features({key: float for key in ACTION_KEYS}, ACTION))
+    features = dataset_features(width=width, height=height)
 
     engine = SyncInferenceEngine(
         policy=policy,

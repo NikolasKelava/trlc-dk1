@@ -398,6 +398,41 @@ hypothesis belongs behind a flag you can turn both ways in consecutive runs.
 `--trace` records the policy's own gripper channel either way, so the run that
 settles it will have the evidence in its own log.
 
+## 6b. The same policy, in simulation
+
+`sai-prasanna/molmoact2`'s `sim_eval` drives a ManiSkill scene over HTTP. It
+never imports a model — it posts three frames, a 14-D state and an instruction to
+an `/act` endpoint and executes what comes back. `dk1 policy serve` answers that
+endpoint with **the checkpoint from `[policy]` in `dk1.toml`**, through the same
+LeRobot pipelines a rollout uses, so the sim drives the same policy the arms do.
+
+Two terminals:
+
+```fish
+# here
+uv run dk1 policy serve                      # GPU only. No robot, no /dev, no motion.
+
+# in the molmoact2 clone
+uv run python -m sim_eval.run_eval \
+    --policy-type remote-yam \
+    --remote-url http://127.0.0.1:8202/act \
+    -e BimanualYAMPutEverythingInBox-v1 -n 10
+```
+
+Videos, the policy's own camera frames and `results.json` land in
+`sim_eval/outputs/<timestamp>/`.
+
+`serve` deliberately runs **without RTC** (the client blocks on each response, so
+there is no real-time deadline to compensate for) and **without the gripper
+inversion** (`sim_eval` already speaks the checkpoint's 1=open convention). Both
+mean behaviour transfers between sim and hardware but timing does not — and that
+the sim tests the policy with this cell's gripper-sign question removed.
+
+Setup notes, once: the clone needs `torch` repinned off its `cu121` wheels (the
+5090 is sm_120 and they have no kernel image for it), its own
+`sim_eval/scripts/download_assets.py`, and ManiSkill's YCB pack via
+`python -m mani_skill.utils.download_asset ycb`.
+
 ## 7. Fine-tune and deploy
 
 Not built yet — Phase 4, and gated on looking at the Phase 3 results together.
@@ -451,8 +486,10 @@ of wall time, three times the 271 ms measured on the bench, and then discards
 that many actions from a 30-step chunk — leaving three. `--trace` was built to
 find out where those 900 ms go. That is what the next run is for.
 
-Nothing has been evaluated or scored, so what the policy can actually do here is
-still unknown.
+Nothing on the hardware has been scored. In simulation it now has been:
+**0/10** on `BimanualYAMPutEverythingInBox-v1`, on the checkpoint's own
+embodiment, with the simulator tracking its commands to within a milliradian.
+It moves and it works both grippers; it does not do the task.
 
 The home pose has been captured on the hardware — that path energises the arms
 and reads them, nothing more. The home *sweep*, which drives both arms, has run
