@@ -33,12 +33,30 @@ SCHEMA_VERSION = 1
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "dk1.toml"
 
 _VALID_ROTATIONS = (0, 90, 180, 270)
+#: The hand-tuned crop adjustments, in dk1lab.fov.REFERENCE_WIDTH pixels.
+_CROP_TUNING_KEYS = ("crop_inset", "crop_shift_x", "crop_shift_y")
 _ARM_ROLES = ("follower", "leader")
 _ARM_SIDES = ("left", "right")
 
 
 class ConfigError(Exception):
     """Raised for any unusable ``dk1.toml``, with a message naming the key."""
+
+
+def _optional_pixels(table: dict, key: str, name: str, path: Path) -> float:
+    """One optional crop adjustment from a ``[cameras.*]`` table, in pixels.
+
+    Signed — a shift goes either way — and defaulting to ``0.0``, which is the
+    value that means "leave the box where the field of view put it".
+    """
+    if key not in table:
+        return 0.0
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            f"{path}: [cameras.{name}].{key} must be a number of pixels, got {value!r}"
+        )
+    return float(value)
 
 
 def _optional_hfov(table: dict, key: str, name: str, path: Path) -> float | None:
@@ -87,12 +105,22 @@ class CameraDevice:
     becomes a :class:`dk1lab.crop.CroppedOpenCVCamera`, leave it out and the
     camera is an ordinary ``OpenCVCamera``. See :mod:`dk1lab.fov` for why the
     wrist views need cropping and the top view does not.
+
+    ``crop_inset`` / ``crop_shift_x`` / ``crop_shift_y`` are the hand-tuned
+    adjustments on top of the computed field of view, in pixels at
+    :data:`dk1lab.fov.REFERENCE_WIDTH` and scaled to whatever the camera
+    delivers. They are inert without ``target_hfov``, and are rejected rather
+    than ignored if set without it — a shift that silently does nothing is
+    worse than one that will not load.
     """
 
     path: str
     rotation: int = 0
     hfov: float | None = None
     target_hfov: float | None = None
+    crop_inset: float = 0.0
+    crop_shift_x: float = 0.0
+    crop_shift_y: float = 0.0
 
     @property
     def cropped(self) -> bool:
@@ -105,6 +133,10 @@ class CameraDevice:
             out["hfov"] = self.hfov
         if self.target_hfov is not None:
             out["target_hfov"] = self.target_hfov
+        for key in _CROP_TUNING_KEYS:
+            value = getattr(self, key)
+            if value:
+                out[key] = value
         return out
 
 
@@ -378,11 +410,20 @@ def parse(raw: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> DK1Config:
                     f"across the output's width, so a horizontal field of view no "
                     f"longer describes it."
                 )
+        tuning = {key: _optional_pixels(table, key, name, path) for key in _CROP_TUNING_KEYS}
+        set_without_target = [key for key, value in tuning.items() if value and target_hfov is None]
+        if set_without_target:
+            raise ConfigError(
+                f"{path}: [cameras.{name}] sets {set_without_target} but has no "
+                f"target_hfov, so there is no crop for them to adjust and they would "
+                f"do nothing. Add target_hfov, or remove them."
+            )
         cameras[name] = CameraDevice(
             path=device_path,
             rotation=int(rotation),
             hfov=hfov,
             target_hfov=target_hfov,
+            **tuning,
         )
 
     by_path: dict[str, str] = {}
@@ -659,7 +700,17 @@ def write_cameras(
         table = _subtable(root, name)  # in place — see write_arms
         table["path"] = device.path
         table["rotation"] = device.rotation
-        for key, value in (("hfov", device.hfov), ("target_hfov", device.target_hfov)):
+        written = [("hfov", device.hfov), ("target_hfov", device.target_hfov)]
+        # 0.0 is "no adjustment", so it is written as absence rather than as a
+        # row of zeroes nobody has to read — and the adjustments go entirely when
+        # there is no crop for them to adjust, because `load` rejects that
+        # combination and a writer must not be able to emit a file that will not
+        # load back.
+        written += [
+            (key, (getattr(device, key) or None) if device.cropped else None)
+            for key in _CROP_TUNING_KEYS
+        ]
+        for key, value in written:
             if value is None:
                 if key in table:
                     del table[key]

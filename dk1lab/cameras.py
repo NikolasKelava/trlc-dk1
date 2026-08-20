@@ -45,6 +45,9 @@ def _camera_config(
         **common,
         source_hfov_deg=device.hfov,
         target_hfov_deg=device.target_hfov,
+        crop_inset=device.crop_inset,
+        crop_shift_x=device.crop_shift_x,
+        crop_shift_y=device.crop_shift_y,
     )
 
 
@@ -84,9 +87,20 @@ def crop_summary(camera) -> str | None:
     target = getattr(camera, "target_hfov_deg", None)
     if source is None or target is None or not camera.width or not camera.height:
         return None
-    box = fov.crop_box(camera.width, camera.height, source, target)
+    box = fov.crop_box(
+        camera.width,
+        camera.height,
+        source,
+        target,
+        inset=getattr(camera, "crop_inset", 0.0),
+        shift_x=getattr(camera, "crop_shift_x", 0.0),
+        shift_y=getattr(camera, "crop_shift_y", 0.0),
+    )
     got = fov.hfov_from_scale(source, box.width / camera.width)
-    return f"crop {box.width}x{box.height} -> {got:.1f} deg H"
+    line = f"crop {box.width}x{box.height} -> {got:.1f} deg H"
+    if box.shift_x or box.shift_y:
+        line += f", offset {box.shift_x:+d},{box.shift_y:+d} px"
+    return line
 
 
 def cameras_cli_argument(config: DK1Config, profile: str = "policy") -> str:
@@ -111,5 +125,9 @@ def cameras_cli_argument(config: DK1Config, profile: str = "policy") -> str:
             entry += (
                 f", source_hfov_deg: {device.hfov:g}, target_hfov_deg: {device.target_hfov:g}"
             )
+            for key in ("crop_inset", "crop_shift_x", "crop_shift_y"):
+                value = getattr(device, key)
+                if value:
+                    entry += f", {key}: {value:g}"
         entries.append(entry + "}")
     return "{ " + ", ".join(entries) + " }"

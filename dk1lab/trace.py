@@ -45,12 +45,13 @@ trace that is not attached costs nothing.
 from __future__ import annotations
 
 import logging
+import math
 import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .layout import ACTION_KEYS, GRIPPER_INDICES
+from .layout import ACTION_KEYS, GRIPPER_INDICES, IMAGE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -411,11 +412,7 @@ class RolloutTrace:
     def _record_pre(self, ms: float, _value: Any, result: Any) -> None:
         self._pre_ms = ms
         if self.display:
-            self._images = {
-                key: value
-                for key, value in (result or {}).items()
-                if isinstance(key, str) and "image" in key
-            }
+            self._images = model_input_images(result)
 
     def _record_post(self, ms: float, value: Any, result: Any) -> None:
         self._post_ms = ms
@@ -454,14 +451,15 @@ class RolloutTrace:
     def _log_rerun(self, record: ChunkRecord) -> None:
         """Log what the model actually received and said, to Rerun.
 
-        The point of logging the **preprocessed** images rather than the robot's
-        is that they are not the same picture. Teleoperation already showed that
-        the robot-side view is right way up — that is `--display`, and it is not
-        in question. What is in question is everything the policy pipeline does
-        after that: the rename, the ordering of the three keys, the channel
-        layout, the resize. This logs the tensors as the model sees them, under
-        ``policy_input/``, so "correct in Rerun during teleop" and "correct at
-        the model's input" stop being the same claim.
+        The images come from :func:`model_input_images`, which reconstructs them
+        from ``pixel_values`` — the tensor the VLM is handed. That is a stronger
+        claim than the observation dict can make: ``observation.images.*``
+        survives the pipeline **unchanged**, at the camera's own size, so logging
+        those would show a picture that looks like the model input and is not
+        one. Teleoperation already showed the robot-side view is right way up;
+        that is ``--display`` and it was never in question. What is in question
+        is the rename, the key order, the channel layout and the 378x378 resize,
+        and only the packed tensor has been through all four.
 
         Called from the RTC background thread; Rerun's recording stream is
         global and thread-safe, so this needs no handshake with the control loop.
@@ -472,10 +470,8 @@ class RolloutTrace:
         except ImportError:  # pragma: no cover - display is opt-in
             return
 
-        for key, tensor in self._images.items():
-            array = _as_image(tensor, np)
-            if array is not None:
-                rr.log(f"policy_input/{key.rsplit('.', 1)[-1]}", rr.Image(array))
+        for key, array in self._images.items():
+            rr.log(f"policy_input/{key}", rr.Image(array))
 
         for name, values in (("policy_output", record.raw), ("to_robot", record.robot)):
             for key, value in zip(ACTION_KEYS, values, strict=False):
@@ -514,14 +510,64 @@ class RolloutTrace:
         )
 
 
-def _as_image(tensor: Any, np: Any) -> Any:
-    """A torch or numpy image in whatever layout, as HWC uint8. ``None`` if it isn't one."""
+#: What ``molmoact2_pack_inputs`` normalises with — ``image_mean`` / ``image_std``
+#: from the checkpoint's ``processor_config.json``. Undoing it is what turns the
+#: packed tensor back into a picture.
+_IMAGE_MEAN, _IMAGE_STD = 0.5, 0.5
+
+
+def model_input_images(batch: Any) -> dict[str, Any]:
+    """The images the VLM is actually handed, as ``HxWx3`` uint8, keyed by camera.
+
+    ``molmoact2_pack_inputs`` leaves ``observation.images.*`` in the batch
+    untouched — same size, same dtype as the robot produced — and puts what the
+    model consumes in ``pixel_values``: one row per image, patchified into
+    ``patch_size x patch_size x 3`` blocks and normalised. So the two disagree
+    about resolution, aspect ratio and value range, and only the second one is
+    evidence about what the policy sees.
+
+    This undoes the packing: un-patchify to ``378x378`` (27x27 patches of 14),
+    un-normalise, and scale back to bytes. Camera names come from
+    :data:`dk1lab.layout.IMAGE_KEYS`, which is the order the checkpoint's
+    preprocessor pins, so row *i* really is that camera.
+
+    Returns an empty dict rather than raising for anything unexpected: this
+    feeds a display, and a display must never take a rollout down.
+    """
     try:
-        array = tensor.detach().float().cpu().numpy() if hasattr(tensor, "detach") else np.asarray(tensor)
-        while array.ndim > 3:
-            array = array[0]
-        if array.ndim != 3:
-            return None
+        import numpy as np
+
+        pixel_values = batch.get("pixel_values") if hasattr(batch, "get") else None
+        if pixel_values is None:
+            return {}
+        values = (
+            pixel_values.detach().float().cpu().numpy()
+            if hasattr(pixel_values, "detach")
+            else np.asarray(pixel_values, dtype=np.float32)
+        )
+        if values.ndim == 4 and values.shape[0] == 1:  # a batch dimension, if any
+            values = values[0]
+        if values.ndim != 3:
+            return {}
+        count, patches, depth = values.shape
+        side = int(round(math.sqrt(patches)))
+        patch = int(round(math.sqrt(depth / 3)))
+        if side * side != patches or patch * patch * 3 != depth:
+            return {}
+        names = [key.rsplit(".", 1)[-1] for key in IMAGE_KEYS]
+        images: dict[str, Any] = {}
+        for index in range(min(count, len(names))):
+            image = (
+                values[index]
+                .reshape(side, side, patch, patch, 3)
+                .transpose(0, 2, 1, 3, 4)
+                .reshape(side * patch, side * patch, 3)
+            )
+            image = image * _IMAGE_STD + _IMAGE_MEAN
+            images[names[index]] = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+        return images
+    except Exception:  # noqa: BLE001 - a trace must never break a rollout
+        return {}
         if array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
             array = array.transpose(1, 2, 0)
         if array.dtype != np.uint8:

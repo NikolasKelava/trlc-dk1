@@ -17,11 +17,13 @@ the configured ``width x height``.
 **Why it resizes back instead of returning the smaller crop.** Keeping the
 output shape fixed is what makes this seamless — every feature shape, every
 recorded video, every ``dk1.toml`` capture profile and every test stays as it
-was. The cost is one resample, and it is close to free here: MolmoAct2's
-preprocessor resizes each view to 224x224, and the crop (467x263 for our
-wrists) is larger than that in both axes, so the upscale to 640x360 is undone by
-a downscale before the model sees anything. No detail the policy could use is
-created or lost.
+was. The cost is one resample, and it is only free while the crop stays larger
+than what the model asks for: MolmoAct2's HF image processor resizes each view
+to **378x378** (``crop_mode: "resize"``, ``size: 378``, ``patch_size: 14``), so
+the crop has to clear 378 in both axes for the round trip through the configured
+frame size to be a no-op. At ``[capture.policy]`` 1280x720 the wrist crop is
+909x511 and it does. At 640x360 it was 455x256 and it did not — 256 rows were
+being upsampled to fill 378.
 
 **Rotation.** The crop is applied *after* the rotation the base class does, so
 the box is centred on the picture as it is finally seen. That is right for 0 and
@@ -59,10 +61,23 @@ class CroppedOpenCVCameraConfig(OpenCVCameraConfig):
             105.0 for the Innomaker U30CAM-4K-S1, per its user manual.
         target_hfov_deg: what to crop to. 87.0 for the BimanualYAM wrist views
             (RealSense D405), 69.4 for its top view (D435i).
+        crop_inset: extra pixels off the left and right edges, beyond the field
+            of view, with the top and bottom following to keep the aspect ratio.
+        crop_shift_x: move the box right (+) or left (-).
+        crop_shift_y: move the box down (+) or **up** (-). Up shows more of what
+            is above the lens's centre line.
+
+    The three pixel offsets are quoted at :data:`dk1lab.fov.REFERENCE_WIDTH` and
+    scaled to whatever frame the camera delivers, so the geometry is the same at
+    every capture resolution. That is what lets the teleop view be evidence about
+    the policy view when the two run at different sizes.
     """
 
     source_hfov_deg: float | None = None
     target_hfov_deg: float | None = None
+    crop_inset: float = 0.0
+    crop_shift_x: float = 0.0
+    crop_shift_y: float = 0.0
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -91,6 +106,9 @@ class CroppedOpenCVCamera(OpenCVCamera):
         self.config: CroppedOpenCVCameraConfig = config
         self.source_hfov_deg: float = float(config.source_hfov_deg)
         self.target_hfov_deg: float = float(config.target_hfov_deg)
+        self.crop_inset: float = float(config.crop_inset)
+        self.crop_shift_x: float = float(config.crop_shift_x)
+        self.crop_shift_y: float = float(config.crop_shift_y)
         self._box: CropBox | None = None
 
     # ----------------------------------------------------------------- report
@@ -105,7 +123,13 @@ class CroppedOpenCVCamera(OpenCVCamera):
         """
         if self._box is None and self.width and self.height:
             self._box = crop_box(
-                int(self.width), int(self.height), self.source_hfov_deg, self.target_hfov_deg
+                int(self.width),
+                int(self.height),
+                self.source_hfov_deg,
+                self.target_hfov_deg,
+                inset=self.crop_inset,
+                shift_x=self.crop_shift_x,
+                shift_y=self.crop_shift_y,
             )
         return self._box
 
@@ -137,7 +161,13 @@ class CroppedOpenCVCamera(OpenCVCamera):
                 "(frame size not known until connect)"
             )
         return describe(
-            int(self.width), int(self.height), self.source_hfov_deg, self.target_hfov_deg
+            int(self.width),
+            int(self.height),
+            self.source_hfov_deg,
+            self.target_hfov_deg,
+            inset=self.crop_inset,
+            shift_x=self.crop_shift_x,
+            shift_y=self.crop_shift_y,
         )
 
     def __str__(self) -> str:

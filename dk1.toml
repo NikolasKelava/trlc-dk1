@@ -88,43 +88,66 @@ right = "/dev/ttyACM2"
 #     top    69.4 deg  -- RealSense D435i
 #     wrists 87.0 deg  -- RealSense D405
 #
-# Only the wrists are cropped here, by request. The crop is:
+# Only the wrists are cropped here, by request. The field of view sets the size:
 #     scale = tan(87/2) / tan(105/2) = 0.7282
-#     640x360 -> keep the centre 467x263, i.e. 87.1 deg H / 56.3 deg V
-# against the trained 87.0 / 56.2. Every rounding takes the LARGER box, so the
-# policy is shown a hair more of the scene than training rather than a hair
-# less. dk1lab/fov.py does the arithmetic; dk1lab/crop.py moves the pixels.
+# Every rounding takes the LARGER box, so the policy is never shown less of the
+# scene than training. dk1lab/fov.py does the arithmetic; dk1lab/crop.py moves
+# the pixels.
 #
-# The crop costs no detail the policy can use: MolmoAct2 resizes every view to
-# 224x224, and 467x263 is bigger than that in both axes, so the stretch back to
-# 640x360 is undone before the model sees anything.
+# --- The three hand-tuned adjustments -----------------------------------------
+#
+# crop_inset    extra pixels off the LEFT and RIGHT edges, beyond what the field
+#               of view asks for. Top and bottom follow in proportion so the box
+#               keeps the frame's aspect ratio -- a box that did not would be
+#               stretched anisotropically on the way back out, which is the exact
+#               distortion this whole section exists to remove. Positive narrows.
+# crop_shift_x  move the box right (+) or left (-).
+# crop_shift_y  move the box down (+) or UP (-). Up shows more of what is above
+#               the lens's centre line and drops the same amount off the bottom.
+#
+# ALL THREE ARE IN PIXELS AT 640 WIDE (dk1lab.fov.REFERENCE_WIDTH), scaled to
+# whatever the camera actually delivers. They are eyeballed on a picture, so
+# pixels are the natural unit -- but a pixel is a different angle at every
+# capture resolution and this cell runs two. Quoting them at one reference and
+# scaling keeps the geometry identical in teleop and rollout, which is the only
+# thing that makes "it looked right in teleop" evidence about what the policy
+# gets. Change the capture resolution and these numbers keep their meaning.
+#
+# Current values, set 2026-08-20 from watching the third rollout: inset 6, and
+# the view lifted 20 px. At [capture.policy] 1280x720 that is the box
+#     909x511 at (185,64) = 85.6 deg H / 55.0 deg V, sitting 40 px above centre
+# and at [capture.teleop] the same angles. `dk1 config show` prints it.
 #
 # It applies to EVERY image this cell produces -- teleop display, recording and
 # rollout alike -- because it is done in the camera, not in a policy processor.
-# `dk1 teleop --display` is therefore how you check it looks right.
+# `dk1 teleop --display` is therefore how you check it looks right, and
+# `dk1 policy dryrun --display-policy-input` shows the model's own 378x378.
 
 [cameras.top]
 path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:10.1:1.0-video-index0"
 rotation = 180
 hfov = 105.0
-# No target_hfov: the top view is left alone. Cropping it to the trained 69.4
-# would mean keeping only 341x192 of 640x360, and unlike the wrists those 192
-# rows are FEWER than the 224 the model resizes to -- so it would cost real
-# detail, not just reframe. Whether the overhead view wants the same treatment
-# is a separate experiment, and a higher-resolution [capture.policy] is the way
-# to run it.
+# No target_hfov: the top view is left alone, by request. Note that at the
+# 1280x720 capture below there is now headroom to crop it to the trained 69.4
+# deg -- that would keep 683x384, still above the model's 378 rows -- so this is
+# a live experiment rather than an arithmetic impossibility. It was not at
+# 640x360, where the same crop kept only 341x192.
 
 [cameras.left]
 path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.3:1.0-video-index0"
 rotation = 180
 hfov = 105.0
 target_hfov = 87.0
+crop_inset = 6.0
+crop_shift_y = -20.0
 
 [cameras.right]
 path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.4:1.0-video-index0"
 rotation = 180
 hfov = 105.0
 target_hfov = 87.0
+crop_inset = 6.0
+crop_shift_y = -20.0
 
 # --- Capture profiles --------------------------------------------------------
 #
@@ -135,18 +158,35 @@ target_hfov = 87.0
 # uvc driver fails to allocate the bandwidth — reads fail immediately.
 # VERIFIED on hardware.
 
-# What the policy sees. 640x360 is 16:9, matching the images the BimanualYAM
-# checkpoint was trained on (sai-prasanna/molmoact2 @ sim-eval-dk1 renders its
-# cameras at 640x360). MolmoAct2 resizes every view to 224x224, so what matters
-# here is the aspect ratio, not the pixel count: a 4:3 capture would stretch the
-# scene differently than training did.
+# What the policy sees. 16:9 is the aspect the BimanualYAM checkpoint was
+# trained on (sai-prasanna/molmoact2 @ sim-eval-dk1 renders its cameras at
+# 640x360), and a 4:3 capture would stretch the scene differently than training
+# did. Keep the ratio; the pixel count is a separate question, answered below.
 #
-# VERIFIED on hardware: all three cameras advertise 640x360 MJPG at 30, 50 and
-# 60 fps. Re-check any time with `dk1 config check --formats`, which reads the
+# RAISED to 1280x720 on 2026-08-20. MolmoAct2 does NOT resize to 224x224 -- the
+# 224s in the checkpoint's normalizer are declared feature shapes under an
+# IDENTITY norm and never resize anything. The real resize is in the HF image
+# processor (processor_config.json: crop_mode "resize", size 378x378, patch 14),
+# and the packed tensor confirms it: pixel_values is [3, 729, 588] = 3 images of
+# 27x27 patches of 14x14x3 = 378x378.
+#
+# At 640x360 the wrist crop kept 455x256, so 256 real rows were being upsampled
+# 1.5x to fill a 378-row model input -- inventing detail the sensor never
+# captured. At 1280x720 the same crop keeps 909x511, and 511 -> 378 is a genuine
+# downscale. The top view goes 720 -> 378 likewise.
+#
+# It costs nothing on the control loop. MEASURED here: all three cameras sustain
+# 30.3 fps at 1280x720 MJPG, OpenCVCamera decodes on a per-camera background
+# thread rather than in the loop, and the crop-and-resize costs 1.6 ms per frame
+# on that thread (0.22 ms at 640x360). Read latency is frame-rate bound and
+# identical at both sizes.
+#
+# VERIFIED on hardware: all three cameras advertise both 640x360 and 1280x720
+# MJPG. Re-check any time with `dk1 config check --formats`, which reads the
 # advertised modes without opening a stream.
 [capture.policy]
-width = 640
-height = 360
+width = 1280
+height = 720
 fps = 30
 fourcc = "MJPG"
 

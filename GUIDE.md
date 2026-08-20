@@ -153,14 +153,27 @@ stretched back to the configured size, so the picture spans the narrower angle.
 
 Both wrist cameras are set to **87°**, which is what the MolmoAct2 BimanualYAM
 checkpoint was trained on (its simulated wrist cameras are RealSense D405s, and
-their intrinsics are built straight from that angle). At 640×360 that keeps the
-middle **467×263**, which really spans 87.1° — every rounding takes the *larger*
-box, so the policy is never shown less of the scene than it was trained on.
+their intrinsics are built straight from that angle). Every rounding takes the
+*larger* box, so the policy is never shown less of the scene than it was trained
+on. The top camera is deliberately **left alone**.
 
-The top camera is deliberately **left alone**. Its trained angle is 69.4°
-(D435i), which would keep only 341×192 — and 192 rows is fewer than the 224
-MolmoAct2 resizes to, so unlike the wrists it would cost real detail rather than
-just reframing. Cropping it wants a higher-resolution `[capture.policy]` first.
+**`crop_inset` / `crop_shift_x` / `crop_shift_y`** — the hand-tuned adjustments
+on top of that. `crop_inset` takes extra pixels off the left and right edges
+(top and bottom follow in proportion, so the box keeps the frame's aspect ratio
+— a box that did not would come back out stretched, which is the distortion this
+is all trying to remove). The two shifts move the box: **negative `crop_shift_y`
+moves it up**, showing more of what is above the lens's centre line and dropping
+the same amount off the bottom.
+
+All three are in **pixels at 640 wide**, scaled to whatever the camera actually
+delivers. They are eyeballed on a picture, so pixels are the natural unit — but
+a pixel is a different angle at every capture resolution and this cell runs two,
+so quoting them at one reference is what keeps teleop and rollout geometrically
+identical. Change `[capture.policy]` and these numbers keep their meaning.
+
+Currently `inset = 6`, `crop_shift_y = -20`. At the 1280×720 the policy captures
+that is the box **909×511 at (185, 64)** = 85.6° H / 55.0° V, sitting 40 px above
+centre. `dk1 config show` prints exactly this, so you never have to work it out.
 
 Two things to know about this crop. It is done **in the camera**, so it applies to
 everything this cell produces — what teleop displays, what recording stores, what
@@ -204,6 +217,15 @@ because OpenCV will not. Given a size a camera does not offer, OpenCV accepts it
 and silently substitutes the nearest one it does — so a profile that looks fine in
 the config would quietly hand the policy a different aspect ratio than it was
 trained on. Both profiles are confirmed offered by all three cameras.
+
+**Why the policy profile is 1280×720 and not 640×360.** MolmoAct2 resizes every
+view to **378×378** — not 224×224, which is what the checkpoint's normalizer
+*declares* but never applies. At 640×360 the cropped wrist box was 455×256, so
+256 real rows were being upsampled to fill a 378-row model input: inventing
+detail the sensor never captured. At 1280×720 the crop is 909×511 and 511 → 378
+is a genuine downscale. It is free on the control loop — all three cameras
+sustain 30.3 fps at 720p, decoding happens on per-camera background threads, and
+the crop costs 1.6 ms per frame there.
 
 A bad config fails on load with a message naming the offending key, and
 `config check` reports *all* missing devices in one pass rather than stopping at
@@ -354,11 +376,19 @@ background thread not running at all, and whether the policy ever moved a
 gripper. `--no-trace` turns the per-chunk printing off; the summary stays.
 
 **`--display-policy-input`** opens Rerun and logs, under `policy_input/`, the
-images **as the model receives them** — after the policy preprocessor, not the
-robot-side view. This is not the same picture as `--display`, and the difference
-is the point: teleop already showed the robot-side view is right way up, and
-that is not what was in question. It also logs the policy's own action channels
-and the RTC queue depth as scalars, so a gripper that moves shows up as a line.
+images **as the model receives them**: the 378×378 tensors unpacked straight out
+of `pixel_values`, which is what the VLM is handed. Not the same picture as
+`--display`, and the difference is the point — teleop already showed the
+robot-side view is right way up, and that was never what was in question. What
+was is everything after it: the key order, the channel layout, and the resize to
+a square. It also logs the policy's own action channels and the RTC queue depth
+as scalars, so a gripper that moves shows up as a line.
+
+If you saw this panel before 2026-08-20, it was lying to you. It logged the
+`observation.images.*` entries of the preprocessor's output, and MolmoAct2's pack
+step leaves those **untouched** — so the panel showed the robot-side view at the
+camera's own size, captioned as the model's input. It could not have caught a
+resize or aspect bug, which is most of what it is for.
 
 Do it on `dryrun` first. That energises the arms and sends nothing, so you can
 check the orientation with no risk at all.

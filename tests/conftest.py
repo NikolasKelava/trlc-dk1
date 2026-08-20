@@ -32,6 +32,8 @@ path = "/dev/v4l/by-path/pci-left-video-index0"
 rotation = 180
 hfov = 105.0
 target_hfov = 87.0
+crop_inset = 6.0
+crop_shift_y = -20.0
 
 [cameras.right]
 path = "/dev/v4l/by-path/pci-right-video-index0"

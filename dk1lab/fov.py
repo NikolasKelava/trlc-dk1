@@ -54,19 +54,50 @@ class FOVError(ValueError):
     """Raised for a field of view that cannot be reached by cropping."""
 
 
+#: The frame width the hand-tuned pixel offsets below are quoted against.
+#:
+#: ``crop_inset`` and ``crop_shift_*`` are eyeballed on a picture, so they are
+#: natural to state in pixels — but a pixel means a different angle at every
+#: capture resolution, and this cell runs two (``[capture.policy]`` and
+#: ``[capture.teleop]``). Quoting them at one reference width and scaling to the
+#: frame in hand keeps the geometry identical in both, which is the only thing
+#: that makes "it looked right in teleop" evidence about what the policy gets.
+#:
+#: 640 because that is the width the checkpoint's own training images had, and
+#: the width the numbers in ``dk1.toml`` were judged at.
+REFERENCE_WIDTH = 640
+
+
 @dataclass(frozen=True)
 class CropBox:
-    """A centred crop rectangle, in pixels of the frame it applies to."""
+    """A crop rectangle, in pixels of the frame it applies to."""
 
     x: int
     y: int
     width: int
     height: int
+    frame_width: int
+    frame_height: int
 
     @property
     def is_full_frame(self) -> bool:
         """True when the box keeps everything — nothing to do."""
-        return self.x == 0 and self.y == 0
+        return (
+            self.x == 0
+            and self.y == 0
+            and self.width == self.frame_width
+            and self.height == self.frame_height
+        )
+
+    @property
+    def shift_y(self) -> int:
+        """How far off centre the box sits vertically. Negative is upward."""
+        return self.y - (self.frame_height - self.height) // 2
+
+    @property
+    def shift_x(self) -> int:
+        """How far off centre the box sits horizontally. Negative is leftward."""
+        return self.x - (self.frame_width - self.width) // 2
 
     def apply(self, frame):
         """Slice ``frame`` (an ``H x W x C`` array) to this box."""
@@ -116,9 +147,33 @@ def vfov(hfov_deg: float, width: int, height: int) -> float:
 
 
 def crop_box(
-    width: int, height: int, source_hfov_deg: float, target_hfov_deg: float
+    width: int,
+    height: int,
+    source_hfov_deg: float,
+    target_hfov_deg: float,
+    *,
+    inset: float = 0.0,
+    shift_x: float = 0.0,
+    shift_y: float = 0.0,
+    reference_width: int = REFERENCE_WIDTH,
 ) -> CropBox:
-    """The centred box of a ``width x height`` frame that spans ``target_hfov_deg``.
+    """The box of a ``width x height`` frame to keep.
+
+    The field of view sets the size; ``inset`` and the two shifts are the
+    hand-tuned corrections on top of it, in :data:`REFERENCE_WIDTH` pixels and
+    scaled to the frame in hand.
+
+    Args:
+        inset: extra pixels to remove from the **left and right** edges, beyond
+            what the field of view asks for. The top and bottom shrink in
+            proportion so the box keeps the frame's aspect ratio — a box that
+            did not would be stretched anisotropically on the way back out, and
+            distorting the geometry is the exact thing this module exists to
+            undo. Positive narrows.
+        shift_x: move the box right (positive) or left (negative).
+        shift_y: move the box **down** (positive) or **up** (negative). Negative
+            shows more of what is above the centre of the lens.
+        reference_width: the frame width ``inset`` and the shifts are quoted at.
 
     Raises:
         FOVError: if the target is wider than the source. Cropping only ever
@@ -128,6 +183,8 @@ def crop_box(
     """
     if width <= 0 or height <= 0:
         raise FOVError(f"frame must be positive, got {width}x{height}")
+    if reference_width <= 0:
+        raise FOVError(f"reference_width must be positive, got {reference_width!r}")
     source = check_hfov(source_hfov_deg, "source hfov")
     target = check_hfov(target_hfov_deg, "target hfov")
     if target > source:
@@ -137,28 +194,64 @@ def crop_box(
             f"target and no image processing can fix that."
         )
 
+    px = width / reference_width  # one reference pixel, in this frame's pixels
     scale = hfov_scale(source, target)
-    # ceil throughout: every rounding takes the wider field of view.
+    # ceil: every rounding from the field of view takes the wider box.
     crop_w = min(width, math.ceil(width * scale))
-    crop_h = min(height, math.ceil(crop_w * height / width))
-    # Centred, and biased left/up by the odd pixel so the box stays in frame.
+    crop_w = max(1, crop_w - 2 * round(inset * px))
+    # Derive the height so the box stays similar to the frame. round(), not
+    # ceil(), because here it is a shape constraint and not a field of view —
+    # rounding the aspect outward is not "more field of view", it is a stretch.
+    crop_h = min(height, max(1, round(crop_w * height / width)))
+
+    x = (width - crop_w) // 2 + round(shift_x * px)
+    y = (height - crop_h) // 2 + round(shift_y * px)
+    # Clamp rather than raise: a shift that runs off the sensor is a number to
+    # retune, not a reason to refuse to produce a picture mid-rollout. What it
+    # actually did is readable from CropBox.shift_x / .shift_y.
+    x = max(0, min(x, width - crop_w))
+    y = max(0, min(y, height - crop_h))
     return CropBox(
-        x=(width - crop_w) // 2, y=(height - crop_h) // 2, width=crop_w, height=crop_h
+        x=x, y=y, width=crop_w, height=crop_h, frame_width=width, frame_height=height
     )
 
 
-def describe(width: int, height: int, source_hfov_deg: float, target_hfov_deg: float) -> str:
+def describe(
+    width: int,
+    height: int,
+    source_hfov_deg: float,
+    target_hfov_deg: float,
+    *,
+    inset: float = 0.0,
+    shift_x: float = 0.0,
+    shift_y: float = 0.0,
+    reference_width: int = REFERENCE_WIDTH,
+) -> str:
     """One line naming the box and the field of view it really achieves.
 
-    The achieved figure is not the requested one — the ceil rounding above leaves
-    it a little wider — and printing the requested number instead would hide
-    exactly the discrepancy an operator wants to see.
+    The achieved figure is not the requested one — the rounding above leaves it
+    a little wider and ``inset`` then narrows it — and printing the requested
+    number instead would hide exactly the discrepancy an operator wants to see.
     """
-    box = crop_box(width, height, source_hfov_deg, target_hfov_deg)
+    box = crop_box(
+        width,
+        height,
+        source_hfov_deg,
+        target_hfov_deg,
+        inset=inset,
+        shift_x=shift_x,
+        shift_y=shift_y,
+        reference_width=reference_width,
+    )
     got_h = hfov_from_scale(source_hfov_deg, box.width / width)
     got_v = vfov(got_h, box.width, box.height)
-    return (
+    line = (
         f"{width}x{height} @ {source_hfov_deg:g} deg -> crop {box.width}x{box.height} "
         f"at ({box.x},{box.y}) -> {got_h:.1f} deg H / {got_v:.1f} deg V "
-        f"(asked {target_hfov_deg:g})"
+        f"(asked {target_hfov_deg:g}"
     )
+    if inset:
+        line += f", inset {inset:g}"
+    if shift_x or shift_y:
+        line += f", shift {shift_x:+g},{shift_y:+g}"
+    return line + ")"

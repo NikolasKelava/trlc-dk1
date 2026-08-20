@@ -114,16 +114,31 @@ def test_the_crop_follows_the_camera_into_every_profile(config_file):
         assert camera_configs(cfg, profile)["left"].type == "opencv_cropped"
 
 
-def test_crop_summary_names_the_box_for_a_cropped_camera(config_file):
+def test_crop_summary_names_the_box_and_the_offset(config_file):
     configs = camera_configs(load(config_file), "policy")
-    assert crop_summary(configs["left"]) == "crop 467x263 -> 87.1 deg H"
+    assert crop_summary(configs["left"]) == "crop 455x256 -> 85.6 deg H, offset +0,-20 px"
     assert crop_summary(configs["top"]) is None
 
 
-def test_crop_summary_is_sized_to_the_profile_not_the_lens(config_file):
-    """1280x720 is the same 16:9, so the box scales and the angle does not."""
+def test_crop_summary_is_sized_to_the_profile_but_the_angle_is_not(config_file):
+    """1280x720 is the same 16:9, so the box doubles, the angle stays, and the
+    offset doubles with it — that is the point of the reference width."""
     teleop = camera_configs(load(config_file), "teleop")["left"]
-    assert crop_summary(teleop) == "crop 933x525 -> 87.1 deg H"
+    assert crop_summary(teleop) == "crop 909x511 -> 85.6 deg H, offset +0,-40 px"
+
+
+def test_the_crop_adjustments_reach_the_camera_config(config_file):
+    left = camera_configs(load(config_file))["left"]
+    assert left.crop_inset == 6.0
+    assert left.crop_shift_y == -20.0
+
+
+def test_cli_argument_carries_the_crop_adjustments(config_file):
+    argument = cameras_cli_argument(load(config_file))
+    assert "crop_inset: 6" in argument
+    assert "crop_shift_y: -20" in argument
+    # zero adjustments are omitted, like everywhere else
+    assert "crop_shift_x" not in argument
 
 
 def test_cli_argument_carries_the_crop(config_file):

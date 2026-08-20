@@ -233,10 +233,12 @@ Checkpoint: `lerobot/MolmoAct2-BimanualYAM-LeRobot` (LeRobot format);
 ## Evidence status — keep this line sharp
 
 Nothing about MolmoAct2 on the real DK1 has been **scored**. No dataset
-recorded, no fine-tune completed, no success rate measured on the arms. And the
-wrist crop built on 2026-08-20 to address the third rollout's misalignment has
-**not been run on the arms** — it is checked against the live cameras and the
-test suite, and that is all. The
+recorded, no fine-tune completed, no success rate measured on the arms. The
+wrist crop **has** now run on the arms — the fourth rollout — and alignment is
+better and the gripper waits for a good position before closing. The retune on
+top of it (inset 6, view lifted 20, capture raised to 1280×720) has **not**:
+that is checked against the live cameras, the real preprocessor and the test
+suite, and that is all. The
 policy has now driven these arms three times. The third run — after the limit
 and engine changes below — moves **smoothly, without stalling**, visually
 tracks the dice and reaches for it, and **misaligns the gripper with the dice**.
@@ -352,7 +354,7 @@ ports is open any more.
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
-| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms three times**; judder and stall both fixed, it tracks and reaches, gripper misaligns. Wrist crop to the trained FOV **built, not yet run on the arms** |
+| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms four times**; judder and stall fixed, wrist FOV crop improved alignment and the gripper now waits for position. Crop retune + 720p capture **built, not yet run** |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **run: 3/3 with a 120 s budget; 0/10 was a too-short episode** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
@@ -649,6 +651,24 @@ Two things still not established by this run, and worth stating: nothing was
 **scored** (no success/failure count over labelled attempts), and the gripper
 inversion was still never *watched* to open and close correctly on the arms.
 
+### The fourth rollout: the crop helped
+
+Run on the arms 2026-08-20 with the wrist crop (87.1°, no inset, no shift) and
+`[capture.policy]` still at 640×360. Reported by Nikolas:
+
+- **Alignment is better.** The spatial failure the third rollout ended on is
+  reduced, which is the first evidence that the field-of-view mismatch was
+  really part of it.
+- **The gripper hesitates to close until it is in a good position.** That is a
+  *behaviour*, not a fault — and it is the first time the gripper channel has
+  been watched doing something sensible on the arms, which the inversion
+  question has been waiting for. It is still not a controlled test of the
+  inversion, and `--invert-gripper` is still off by default.
+
+Not scored, again. But the crop is now a change with evidence behind it rather
+than an argument, and the follow-up work in this round — the retune, the capture
+raise, and the corrected `--display-policy-input` — all comes from it.
+
 ### The camera crop: our lens is 105 degrees, the checkpoint's wrists are 87
 
 Built 2026-08-20 in response to the third rollout's spatial failure. Nothing has
@@ -667,18 +687,42 @@ the correction well-posed.
 
 **The correction.** On a pinhole, the fraction of the frame width that spans the
 target is `tan(target/2) / tan(source/2)` = `tan(43.5°)/tan(52.5°)` = **0.7282**.
-At 640×360 that is the centre **467×263**, which really spans **87.1° H / 56.3° V**
-against the trained 87.0 / 56.2. Every rounding takes the *larger* box, at
-Nikolas's stated preference: too much field of view degrades more gracefully than
-too little.
+Every rounding takes the *larger* box, at Nikolas's stated preference: too much
+field of view degrades more gracefully than too little.
 
-**It costs no detail.** MolmoAct2 resizes every view to 224×224, and 467×263 is
-bigger than that in both axes, so the stretch back to 640×360 is undone by a
-downscale before the model sees anything. That is also precisely why **the top
-camera is left alone** — cropping it to 69.4° would keep 341×192, and 192 rows is
-*fewer* than 224, so it would throw away real detail rather than reframe.
-Cropping the overhead view wants a higher-resolution `[capture.policy]` first,
-and is a separate experiment.
+**On top of that sit three hand-tuned adjustments**, added after the fourth
+rollout: `crop_inset` (extra pixels off the left and right edges, with top and
+bottom following so the box keeps the frame's aspect ratio — an anisotropic box
+would be stretched on the way back out, which is the exact distortion this is
+undoing), and `crop_shift_x` / `crop_shift_y`. Currently **inset 6, shift_y −20**,
+i.e. the view is lifted. At 1280×720 that is the box **909×511 at (185, 64)** =
+**85.6° H / 55.0° V**, sitting 40 px above centre.
+
+**All three are quoted in pixels at a 640-wide reference** (`fov.REFERENCE_WIDTH`)
+and scaled to whatever frame the camera delivers. They are eyeballed on a
+picture, so pixels are the natural unit — but a pixel is a different angle at
+every capture resolution and this cell runs two. Scaling from one reference is
+what keeps teleop and rollout geometrically identical, which is the only thing
+that makes "it looked right in teleop" evidence about what the policy gets. It
+also means changing the capture resolution does not silently retune the crop.
+A shift that would run off the sensor is **clamped, not raised** — retuning a
+number beats refusing to produce a picture mid-rollout — and `CropBox.shift_y`
+reports what it actually achieved, so a clamped shift is visible.
+
+**The model input is 378×378, not 224×224.** This was wrong here for a day and
+it matters. The 224s in the checkpoint's `molmoact2_masked_normalizer` are
+declared feature shapes under `VISUAL: IDENTITY` — they normalise nothing and
+resize nothing. The real resize is in the HF image processor
+(`processor_config.json`: `crop_mode: "resize"`, `size: 378×378`,
+`patch_size: 14`, `resample: 2`), and the packed tensor proves it: `pixel_values`
+comes out `[3, 729, 588]` = three images of 27×27 patches of 14×14×3 = **378×378**.
+It is a *stretch*, not a letterbox — 16:9 becomes 1:1 — which is what training
+did too, so it is consistent.
+
+**So the crop only costs no detail if it clears 378 in both axes**, and at
+`[capture.policy]` 640×360 it did not: the tuned wrist box was 455×256, and 256
+rows were being upsampled 1.5× to fill a 378-row input. That is why the policy
+capture is now **1280×720** — see *The capture resolution*, below.
 
 **Where it lives, and why there.** `dk1lab/fov.py` is the arithmetic (no lerobot
 import, like every other decision module here); `dk1lab/crop.py` is
@@ -702,11 +746,16 @@ name in the package holding the config's module. Same trap as
 `SafeBiDK1Follower`, same fix — `dk1lab/__init__.py`'s lazy `__getattr__`.
 
 **Checked on the real cameras** (video devices only; no arms, nothing energised):
-all three connect and deliver 640×360, the wrists report the 467×263 box, and a
-still through the cropped path is upright, correctly framed and visibly tighter.
-One thing the stills showed that the datasheet does not: the uncropped 105° frame
-has **black vignette corners** — the lens's image circle does not quite cover the
-sensor — and the crop removes them entirely.
+all three connect and deliver 1280×720, the wrists report the 909×511 box, and
+stills through the cropped path are upright, correctly framed and visibly
+tighter. One thing the stills showed that the datasheet does not: the uncropped
+105° frame has **black vignette corners** — the lens's image circle does not
+quite cover the sensor — and the crop removes them entirely.
+
+Checked end to end as well, on the same read-only path: real frames from all
+three cameras pushed through the **real** preprocessor come out as three upright,
+correctly ordered 378×378 tensors. That is the check `--display-policy-input`
+now does live — see *Watching what the model sees*.
 
 **What this does not fix.** The lens has real barrel distortion (the manual
 specifies TV distortion < −6.2%, and it is obvious in the stills: straight edges
@@ -715,6 +764,56 @@ centre of the frame and only approximately at the edges; undistorting properly
 needs a calibration this cell does not have. Mounting pose is untouched too —
 the sim's wrist cameras sit at a specific place on `link_6` and ours sit where
 they sit. So this narrows one known divergence and leaves two.
+
+### The capture resolution: 378 rows in, so more than 378 rows out
+
+`[capture.policy]` was raised from **640×360 to 1280×720** on 2026-08-20, once
+the 378×378 model input was established. The arithmetic is the whole argument:
+
+| | wrist crop | rows the model wants | verdict |
+| --- | --- | --- | --- |
+| 640×360 | 455×256 | 378 | **1.5× upsample** — detail the sensor never caught |
+| **1280×720** | **909×511** | 378 | genuine downscale |
+
+The top view goes 720 → 378 likewise, where it was 360 → 378 before.
+
+**It costs nothing on the control loop, and that was measured, not assumed.**
+All three cameras sustain **30.3 fps** at 1280×720 MJPG; `OpenCVCamera` decodes
+on a **per-camera background thread**, so `async_read` picks up the latest frame
+rather than paying for the decode; and our crop-and-resize costs **1.6 ms per
+frame** on that thread (0.22 ms at 640×360). Read latency measured from the loop
+is frame-rate bound and identical at both sizes — median 32–33 ms against a
+33.3 ms budget either way. `dk1 config check --formats` confirms all three
+cameras advertise the mode.
+
+One consequence worth noting: cropping the **top** view to its trained 69.4° is
+now arithmetically possible — it would keep 683×384, still above 378 — where at
+640×360 it kept 341×192 and was not. It is left uncropped by request, but it has
+moved from "impossible" to "an experiment we could run".
+
+### Watching what the model sees: `--display-policy-input`, corrected
+
+The flag existed before this round and was showing the wrong thing. It logged
+the `observation.images.*` entries of the **preprocessor's output** — but
+`molmoact2_pack_inputs` leaves those **untouched**, at the camera's own size and
+dtype, and puts what the model consumes in `pixel_values`. So the panel showed a
+picture that looked like the model's input, was captioned as the model's input,
+and was in fact the robot-side view at a different resolution and aspect ratio —
+the one thing `--display` already showed. It could not have caught a resize or
+aspect bug, which is most of what it was for.
+
+`dk1lab.trace.model_input_images` now reconstructs the real thing: un-patchify
+`pixel_values` (27×27 patches of 14×14×3 → 378×378), undo the `mean 0.5 /
+std 0.5` normalisation, scale to bytes. Camera names come from
+`layout.IMAGE_KEYS`, which is the order the checkpoint's preprocessor pins, so
+row *i* really is that camera. It returns `{}` rather than raising on anything
+unexpected — a display must never take a rollout down.
+
+`dk1 policy dryrun --display-policy-input` is the way to check camera
+orientation: arms energised, nothing sent, and Rerun carries both the robot-side
+view under `--display` and the model's own 378×378 under `policy_input/`.
+Verified here against the live cameras: upright, correctly ordered, correctly
+stretched.
 
 ### The sim run: the policy behaves the same way with every hardware excuse removed
 

@@ -143,7 +143,7 @@ def nearest_aspect(modes: Iterable[Mode], *, fourcc: str, aspect: float) -> list
 
     Used to suggest a fallback when a profile's exact size is unavailable: what
     matters for the policy is the aspect ratio, since MolmoAct2 resizes every
-    view to 224x224 regardless.
+    view to 378x378 regardless.
     """
     matching = [m for m in modes if m.fourcc == fourcc and m.height]
     return sorted(matching, key=lambda m: (abs(m.width / m.height - aspect), m.width * m.height))
@@ -179,7 +179,7 @@ class ProfileCheck:
 
         ``None`` when the profile matched, when there is no fallback, or when the
         fallback's aspect ratio is close enough to make no visual difference.
-        MolmoAct2 resizes every view to 224x224, so the aspect ratio is what
+        MolmoAct2 resizes every view to 378x378, so the aspect ratio is what
         survives the resize — a 4:3 capture stretches the scene differently than
         the 16:9 the checkpoint was trained on.
         """

@@ -46,7 +46,16 @@ def show(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
         # repeating back the number that was asked for.
         capture = cfg.profile("policy")
         typer.echo(
-            f"  {name:6s} {fov.describe(capture.width, capture.height, device.hfov, device.target_hfov)}"
+            f"  {name:6s} "
+            + fov.describe(
+                capture.width,
+                capture.height,
+                device.hfov,
+                device.target_hfov,
+                inset=device.crop_inset,
+                shift_x=device.crop_shift_x,
+                shift_y=device.crop_shift_y,
+            )
         )
 
     if cfg.limits:

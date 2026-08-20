@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from dk1lab.layout import ACTION_KEYS, DOF, GRIPPER_INDICES
-from dk1lab.trace import ChunkRecord, RolloutTrace, _as_image, _first_row
+from dk1lab.trace import ChunkRecord, RolloutTrace, _first_row, model_input_images
 
 
 # --------------------------------------------------------------------------- #
@@ -281,44 +281,78 @@ def test_a_sync_postprocessor_call_is_itself_a_record():
 # The model-eye view
 # --------------------------------------------------------------------------- #
 
-
-def test_a_chw_float_image_becomes_hwc_uint8():
-    """What the preprocessor hands the model is CHW and normalised; Rerun wants neither."""
-    array = _as_image(np.full((3, 4, 6), 0.5, dtype=np.float32), np)
-    assert array.shape == (4, 6, 3)
-    assert array.dtype == np.uint8
-    assert int(array[0, 0, 0]) == 127
+#: What MolmoAct2 actually packs: 27x27 patches of 14x14x3, i.e. 378x378.
+SIDE, PATCH = 27, 14
 
 
-def test_an_already_hwc_uint8_image_is_left_alone():
-    source = np.zeros((4, 6, 3), dtype=np.uint8)
-    source[1, 2] = 200
-    array = _as_image(source, np)
-    assert array.shape == (4, 6, 3)
-    assert int(array[1, 2, 0]) == 200
+def packed(count: int = 3, value: float = 0.0) -> np.ndarray:
+    """A ``pixel_values`` tensor shaped exactly as the pack step emits one."""
+    return np.full((count, SIDE * SIDE, PATCH * PATCH * 3), value, dtype=np.float32)
 
 
-def test_a_batched_image_loses_its_batch_dimension():
-    assert _as_image(np.zeros((1, 3, 4, 6), dtype=np.float32), np).shape == (4, 6, 3)
+def test_the_packed_tensor_unpacks_to_the_size_the_model_sees():
+    images = model_input_images({"pixel_values": packed()})
+    assert list(images) == ["top", "left", "right"]
+    for image in images.values():
+        assert image.shape == (SIDE * PATCH, SIDE * PATCH, 3) == (378, 378, 3)
+        assert image.dtype == np.uint8
 
 
-def test_something_that_is_not_an_image_is_skipped_rather_than_raised():
-    assert _as_image(np.zeros((14,), dtype=np.float32), np) is None
-    assert _as_image("not an array", np) is None
+def test_the_normalisation_is_undone():
+    """mean 0.5 / std 0.5, so 0.0 in the tensor is mid grey and +1.0 is white."""
+    assert int(model_input_images({"pixel_values": packed(value=0.0)})["top"][0, 0, 0]) == 127
+    assert int(model_input_images({"pixel_values": packed(value=1.0)})["top"][0, 0, 0]) == 255
+    assert int(model_input_images({"pixel_values": packed(value=-1.0)})["top"][0, 0, 0]) == 0
 
 
-def test_only_image_keys_are_kept_for_display():
+def test_patches_are_laid_back_out_in_raster_order():
+    """A single lit patch must come back at that patch's place in the picture."""
+    values = packed(count=1)
+    values[0, SIDE + 2] = 1.0  # row 1, column 2 of the patch grid
+    image = model_input_images({"pixel_values": values})["top"]
+    assert int(image[PATCH + 1, 2 * PATCH + 1, 0]) == 255
+    assert int(image[1, 1, 0]) == 127  # patch (0,0) untouched
+
+
+def test_the_camera_names_come_from_the_pinned_key_order():
+    """Row i is camera i only because the checkpoint pins top/left/right."""
+    values = packed()
+    values[1] = 1.0
+    images = model_input_images({"pixel_values": values})
+    assert int(images["left"][0, 0, 0]) == 255
+    assert int(images["top"][0, 0, 0]) == 127
+    assert int(images["right"][0, 0, 0]) == 127
+
+
+def test_a_batch_dimension_is_dropped():
+    assert model_input_images({"pixel_values": packed()[None]})["top"].shape == (378, 378, 3)
+
+
+def test_anything_unexpected_yields_nothing_rather_than_raising():
+    """A display must never take a rollout down."""
+    assert model_input_images({}) == {}
+    assert model_input_images({"pixel_values": np.zeros((3, 5, 7), dtype=np.float32)}) == {}
+    assert model_input_images(None) == {}
+    assert model_input_images({"pixel_values": "not a tensor"}) == {}
+
+
+def test_the_pass_through_observation_images_are_not_what_gets_logged():
+    """They survive the pipeline unchanged, so they would show a picture that
+    looks like the model's input and is not one — different size, different
+    aspect ratio. Only pixel_values has been through the resize."""
     trace, _ctx, engine, _q, _pre, _post = build(display=True)
     engine._preprocessor(None)
     trace._record_pre(
         0.0,
         None,
         {
-            "observation.images.top": np.zeros((3, 4, 6), dtype=np.float32),
+            "observation.images.top": np.zeros((360, 640, 3), dtype=np.uint8),
             "observation.state": np.zeros((DOF,), dtype=np.float32),
+            "pixel_values": packed(),
         },
     )
-    assert list(trace._images) == ["observation.images.top"]
+    assert list(trace._images) == ["top", "left", "right"]
+    assert trace._images["top"].shape == (378, 378, 3)
 
 
 def test_the_gripper_channels_come_from_the_shared_layout():

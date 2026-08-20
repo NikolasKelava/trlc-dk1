@@ -146,3 +146,55 @@ def test_lerobot_can_build_the_camera_from_the_config():
         }
     )
     assert isinstance(built["left"], CroppedOpenCVCamera)
+
+
+# --------------------------------------------------------------------------- #
+# The hand-tuned adjustments, through the camera
+# --------------------------------------------------------------------------- #
+
+
+def test_the_adjustments_reach_the_box():
+    cam = camera(crop_inset=6, crop_shift_y=-20)
+    assert (cam.crop.width, cam.crop.height) == (455, 256)
+    assert cam.crop.shift_y == -20
+    assert cam.achieved_hfov_deg == pytest.approx(85.6, abs=0.05)
+
+
+def test_shifting_up_keeps_the_top_of_the_frame_and_drops_the_bottom():
+    """A row that was inside the unshifted box's top edge must now be inside it,
+    and one near the bottom edge must have fallen out."""
+    plain, moved = camera(), camera(crop_shift_y=-20)
+    assert moved.crop.y == plain.crop.y - 20
+    assert moved.crop.y + moved.crop.height == plain.crop.y + plain.crop.height - 20
+
+
+def test_the_output_shape_survives_every_adjustment():
+    out = camera(crop_inset=6, crop_shift_x=5, crop_shift_y=-20)._postprocess_image(
+        np.zeros((360, 640, 3), np.uint8)
+    )
+    assert out.shape == (360, 640, 3)
+
+
+def test_a_shifted_box_takes_its_pixels_from_the_shifted_place():
+    cam = camera(crop_shift_y=-20)
+    frame = np.zeros((360, 640, 3), np.uint8)
+    cam.crop.apply(frame)[:] = 255
+    assert (cam._postprocess_image(frame) == 255).all()
+    # and the unshifted camera, given the same frame, sees black at the bottom
+    assert camera()._postprocess_image(frame)[-1, 320, 0] < 255
+
+
+def test_the_tuned_wrist_crop_clears_the_models_input_size_at_720p():
+    """378x378 is what MolmoAct2 resizes to; a smaller crop invents detail."""
+    cam = camera(width=1280, height=720, crop_inset=6, crop_shift_y=-20)
+    assert cam.crop.width >= 378
+    assert cam.crop.height >= 378
+
+
+def test_the_geometry_is_the_same_at_both_capture_resolutions():
+    """What you approve in teleop is what the policy gets in a rollout."""
+    small = camera(width=640, height=360, crop_inset=6, crop_shift_y=-20)
+    large = camera(width=1280, height=720, crop_inset=6, crop_shift_y=-20)
+    assert small.achieved_hfov_deg == pytest.approx(large.achieved_hfov_deg, abs=0.1)
+    assert small.achieved_vfov_deg == pytest.approx(large.achieved_vfov_deg, abs=0.1)
+    assert large.crop.shift_y == 2 * small.crop.shift_y

@@ -59,8 +59,9 @@ WatchInputOpt = Annotated[
     typer.Option(
         "--display-policy-input",
         help=(
-            "Open Rerun and log the images and actions as the MODEL sees them, "
-            "after the policy preprocessor — not the robot-side view --display shows."
+            "Open Rerun and log the images and actions as the MODEL sees them: the "
+            "378x378 tensors unpacked from pixel_values, not the robot-side view "
+            "--display shows. This is where to check camera orientation."
         ),
     ),
 ]
@@ -462,9 +463,9 @@ def dryrun(
     _report(cfg, spec, steps=steps, invert=invert_gripper)
     if display_policy_input:
         typer.secho(
-            "\n  --display-policy-input: Rerun will show the images as the MODEL "
-            "receives them,\n  under policy_input/, alongside the policy's own action "
-            "values. Nothing is sent.",
+            "\n  --display-policy-input: Rerun will show the 378x378 images the MODEL "
+            "is handed,\n  unpacked from pixel_values, under policy_input/ — alongside "
+            "the policy's own\n  action values. Nothing is sent.",
             fg=typer.colors.YELLOW,
         )
 

@@ -49,7 +49,7 @@ def report_formats(
             typer.secho(
                 f"{indent}  aspect mismatch: the profile wants {check.aspect:.3f}, the closest "
                 f"mode is {best.width / best.height:.3f} (off by {gap:.3f}). MolmoAct2 resizes "
-                f"every view to 224x224, so a different aspect ratio stretches the scene "
+                f"every view to 378x378, so a different aspect ratio stretches the scene "
                 f"differently than training did.",
                 fg=typer.colors.YELLOW,
             )

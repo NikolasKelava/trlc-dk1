@@ -544,7 +544,11 @@ def test_write_cameras_can_remove_a_crop(config_file):
     cameras["left"] = replace(cameras["left"], target_hfov=None)
     write_cameras(cameras, path)
     assert load(path).camera("left").target_hfov is None
-    assert "target_hfov" not in path.read_text().split("[cameras.left]")[1].split("[")[0]
+    left = path.read_text().split("[cameras.left]")[1].split("[")[0]
+    assert "target_hfov" not in left
+    # and the adjustments go with it: load() rejects them without a crop, so a
+    # writer that left them behind would emit a file that will not load back.
+    assert "crop_inset" not in left and "crop_shift_y" not in left
 
 
 def test_write_cameras_still_leaves_every_other_section_alone(config_file):
@@ -555,3 +559,51 @@ def test_write_cameras_still_leaves_every_other_section_alone(config_file):
     assert "# a comment that must survive every surgical write" in text
     assert "# camera comment" in text
     assert '[capture.policy]' in text and "fourcc" in text
+
+
+def test_the_crop_adjustments_load(config_file):
+    left = load(config_file).camera("left")
+    assert left.crop_inset == 6.0
+    assert left.crop_shift_y == -20.0
+    assert left.crop_shift_x == 0.0
+
+
+def test_the_crop_adjustments_default_to_zero(config_file):
+    """Zero is "leave the box where the field of view put it"."""
+    top = load(config_file).camera("top")
+    assert (top.crop_inset, top.crop_shift_x, top.crop_shift_y) == (0.0, 0.0, 0.0)
+
+
+def test_an_adjustment_without_a_crop_is_rejected(config_file):
+    """It would silently do nothing, which is worse than failing to load."""
+    path = _edited(config_file, "rotation = 0", "rotation = 0\ncrop_shift_y = -20.0")
+    with pytest.raises(ConfigError, match="no target_hfov"):
+        load(path)
+
+
+def test_a_zero_adjustment_without_a_crop_is_fine(config_file):
+    """Zero changes nothing, so there is nothing to complain about."""
+    path = _edited(config_file, "rotation = 0", "rotation = 0\ncrop_shift_y = 0.0")
+    assert load(path).camera("right").crop_shift_y == 0.0
+
+
+@pytest.mark.parametrize("bad", ['"6"', "true"])
+def test_a_non_numeric_adjustment_is_rejected(config_file, bad):
+    path = _edited(config_file, "crop_inset = 6.0", f"crop_inset = {bad}")
+    with pytest.raises(ConfigError, match="crop_inset"):
+        load(path)
+
+
+def test_write_cameras_round_trips_the_crop_adjustments(config_file):
+    write_cameras(load(config_file).cameras, config_file)
+    after = load(config_file)
+    assert after.camera("left").crop_inset == 6.0
+    assert after.camera("left").crop_shift_y == -20.0
+
+
+def test_write_cameras_omits_an_adjustment_that_is_zero(config_file):
+    """A row of zeroes is noise in a file meant to be read."""
+    write_cameras(load(config_file).cameras, config_file)
+    left = config_file.read_text().split("[cameras.left]")[1].split("[")[0]
+    assert "crop_inset" in left
+    assert "crop_shift_x" not in left
