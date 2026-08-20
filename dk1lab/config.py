@@ -41,6 +41,26 @@ class ConfigError(Exception):
     """Raised for any unusable ``dk1.toml``, with a message naming the key."""
 
 
+def _optional_hfov(table: dict, key: str, name: str, path: Path) -> float | None:
+    """One optional field-of-view angle from a ``[cameras.*]`` table, in degrees.
+
+    ``bool`` is excluded explicitly: ``True`` is an ``int`` in Python and would
+    otherwise sail through as a one-degree field of view.
+    """
+    if key not in table:
+        return None
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            f"{path}: [cameras.{name}].{key} must be a number of degrees, got {value!r}"
+        )
+    if not 0.0 < float(value) < 180.0:
+        raise ConfigError(
+            f"{path}: [cameras.{name}].{key} must be in (0, 180) degrees, got {value!r}"
+        )
+    return float(value)
+
+
 # --------------------------------------------------------------------------- #
 # Dataclasses
 # --------------------------------------------------------------------------- #
@@ -59,13 +79,33 @@ class ArmPorts:
 
 @dataclass(frozen=True)
 class CameraDevice:
-    """One camera's stable device node and mounting rotation."""
+    """One camera's stable device node, mounting rotation and field of view.
+
+    ``hfov`` is the lens's own horizontal field of view in degrees, and
+    ``target_hfov`` is the one the images should be cropped to. Both are
+    optional and only ``target_hfov`` changes behaviour: set it and this camera
+    becomes a :class:`dk1lab.crop.CroppedOpenCVCamera`, leave it out and the
+    camera is an ordinary ``OpenCVCamera``. See :mod:`dk1lab.fov` for why the
+    wrist views need cropping and the top view does not.
+    """
 
     path: str
     rotation: int = 0
+    hfov: float | None = None
+    target_hfov: float | None = None
+
+    @property
+    def cropped(self) -> bool:
+        """True when this camera's frames are narrowed to ``target_hfov``."""
+        return self.target_hfov is not None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"path": self.path, "rotation": self.rotation}
+        out: dict[str, Any] = {"path": self.path, "rotation": self.rotation}
+        if self.hfov is not None:
+            out["hfov"] = self.hfov
+        if self.target_hfov is not None:
+            out["target_hfov"] = self.target_hfov
+        return out
 
 
 @dataclass(frozen=True)
@@ -314,7 +354,36 @@ def parse(raw: dict[str, Any], path: Path = DEFAULT_CONFIG_PATH) -> DK1Config:
                 f"{path}: [cameras.{name}].rotation must be one of {list(_VALID_ROTATIONS)}, "
                 f"got {rotation!r}"
             )
-        cameras[name] = CameraDevice(path=device_path, rotation=int(rotation))
+        hfov = _optional_hfov(table, "hfov", name, path)
+        target_hfov = _optional_hfov(table, "target_hfov", name, path)
+        if target_hfov is not None:
+            if hfov is None:
+                raise ConfigError(
+                    f"{path}: [cameras.{name}].target_hfov is set but hfov is not. "
+                    f"Cropping to a field of view needs to know the one the lens "
+                    f"already has — there is no default, because it is a property of "
+                    f"the camera you plugged in."
+                )
+            if target_hfov > hfov:
+                raise ConfigError(
+                    f"{path}: [cameras.{name}].target_hfov ({target_hfov:g}) is wider "
+                    f"than its hfov ({hfov:g}). Cropping only ever narrows the field "
+                    f"of view; a lens narrower than the target cannot be fixed in "
+                    f"software."
+                )
+            if int(rotation) in (90, 270):
+                raise ConfigError(
+                    f"{path}: [cameras.{name}] has rotation {int(rotation)} and a "
+                    f"target_hfov. A quarter turn puts the sensor's vertical axis "
+                    f"across the output's width, so a horizontal field of view no "
+                    f"longer describes it."
+                )
+        cameras[name] = CameraDevice(
+            path=device_path,
+            rotation=int(rotation),
+            hfov=hfov,
+            target_hfov=target_hfov,
+        )
 
     by_path: dict[str, str] = {}
     for name, device in cameras.items():
@@ -565,7 +634,14 @@ def write_arms(ports: dict[str, ArmPorts], path: Path | str = DEFAULT_CONFIG_PAT
 def write_cameras(
     cameras: dict[str, CameraDevice], path: Path | str = DEFAULT_CONFIG_PATH
 ) -> None:
-    """Replace only ``[cameras.*]``, leaving ``[arms]`` and comments untouched."""
+    """Replace only ``[cameras.*]``, leaving ``[arms]`` and comments untouched.
+
+    ``hfov`` / ``target_hfov`` round-trip: set on the device and the key is
+    written, unset and any existing key is removed. That means a caller that
+    builds :class:`CameraDevice` objects without them — ``dk1 find cameras``
+    discovers device nodes, not lens geometry — would erase them, so that command
+    carries the current values through rather than dropping them.
+    """
     from .layout import CAMERA_NAMES
 
     path = Path(path)
@@ -583,6 +659,12 @@ def write_cameras(
         table = _subtable(root, name)  # in place — see write_arms
         table["path"] = device.path
         table["rotation"] = device.rotation
+        for key, value in (("hfov", device.hfov), ("target_hfov", device.target_hfov)):
+            if value is None:
+                if key in table:
+                    del table[key]
+            else:
+                table[key] = value
     # Drop any camera name no longer in use, so a rename cannot leave a stale
     # entry that validation would then reject as "unexpected".
     for stale in [key for key in root if key not in CAMERA_NAMES]:

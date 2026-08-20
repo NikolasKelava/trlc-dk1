@@ -25,10 +25,13 @@ right = "/dev/ttyACM2"
 [cameras.top]
 path = "/dev/v4l/by-path/pci-top-video-index0"
 rotation = 180
+hfov = 105.0
 
 [cameras.left]
 path = "/dev/v4l/by-path/pci-left-video-index0"
 rotation = 180
+hfov = 105.0
+target_hfov = 87.0
 
 [cameras.right]
 path = "/dev/v4l/by-path/pci-right-video-index0"

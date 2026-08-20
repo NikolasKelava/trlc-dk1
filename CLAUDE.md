@@ -32,6 +32,8 @@ dk1lab/                 everything this fork adds; the only Python we own
   discovery/cameras.py  by-path enumeration + the labelling loop       (no lerobot import)
   discovery/formats.py  v4l2 capture-mode probing                      (no lerobot import)
   discovery/preview.py  grab a still and show it                       (cv2, no lerobot)
+  fov.py                field-of-view arithmetic: the crop box     (no lerobot import)
+  crop.py               CroppedOpenCVCamera — the crop, in the camera
   checkpoint.py         read a MolmoAct2 checkpoint's metadata     (no lerobot import)
   home.py               the home sweep: ramp, arrival test, abort  (lerobot lazily)
   cameras.py            builds lerobot OpenCVCameraConfig from config
@@ -88,6 +90,14 @@ Never restate this as a literal anywhere else; derive from `layout.ACTION_KEYS`.
 are `observation.images.{top,left,right}`; LeRobot derives them from the robot's
 camera keys and the rollout context fails on a mismatch. Note the order is *not*
 alphabetical — sorted would be left/right/top.
+
+**The wrist cameras are cropped, the top one is not.** `[cameras.*].target_hfov`
+in `dk1.toml`; the crop lives in the *camera* (`dk1lab/crop.py`), not in a policy
+processor, so it is true of every image this cell produces — teleop display,
+recording and rollout alike. A crop that applied to only some of them would be
+worse than none: a recorded dataset and the rollout it was fine-tuned for would
+disagree about what the lens does. Frame size is unchanged (the crop is stretched
+back to the configured `width x height`), so nothing downstream had to move.
 
 **Config writes are surgical.** `write_arms` touches only the arms tables,
 `write_cameras` only the cameras tables; comments and all other sections survive
@@ -211,16 +221,22 @@ Checkpoint: `lerobot/MolmoAct2-BimanualYAM-LeRobot` (LeRobot format);
 - **Camera geometry from the colleague's sim**: 640×360 (16:9), top cam on the
   base at `p=[0.15, 0, 0.8]` pitched ~60° down (D435i, 69.4° HFOV), wrist cams on
   `link6-7` at `p=[0.076, 0, 0.094]` (D405, 87° HFOV), arms at y = ±0.24 m both
-  facing +X (not mirrored). Our Innomaker U30CAM-4K have neither FOV. The old
-  line here said this was "a divergence we cannot fix in software" and that is
-  **wrong in one direction**: a camera whose FOV is too *wide* can be cropped
-  down to the trained one, and only a too-narrow one is unfixable. That crop is
-  the agreed next step — see *The third rollout*.
+  facing +X (not mirrored). **Ours are 105° HFOV / 116° diagonal** — read out of
+  the Innomaker U30CAM-4K-S1 user manual (`INNO-MAKER/U30CAM-4K-S1` on GitHub),
+  a 2.25 mm f/2.0 M12 lens on a 1/2.8" IMX415. The model string is confirmed off
+  the USB descriptor on this machine, so it is the right datasheet.
+  The old line here said the mismatch was "a divergence we cannot fix in
+  software" and that is **wrong in one direction**: too *wide* can be cropped
+  down, only too narrow is unfixable. Ours is wide, so **the wrist crop is now
+  built and configured** — see *The camera crop*.
 
 ## Evidence status — keep this line sharp
 
 Nothing about MolmoAct2 on the real DK1 has been **scored**. No dataset
-recorded, no fine-tune completed, no success rate measured on the arms. The
+recorded, no fine-tune completed, no success rate measured on the arms. And the
+wrist crop built on 2026-08-20 to address the third rollout's misalignment has
+**not been run on the arms** — it is checked against the live cameras and the
+test suite, and that is all. The
 policy has now driven these arms three times. The third run — after the limit
 and engine changes below — moves **smoothly, without stalling**, visually
 tracks the dice and reaches for it, and **misaligns the gripper with the dice**.
@@ -336,7 +352,7 @@ ports is open any more.
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
-| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms three times**; judder and stall both fixed, it tracks and reaches, gripper misaligns |
+| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms three times**; judder and stall both fixed, it tracks and reaches, gripper misaligns. Wrist crop to the trained FOV **built, not yet run on the arms** |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **run: 3/3 with a 120 s budget; 0/10 was a too-short episode** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
@@ -585,11 +601,11 @@ queue's `merge` is wrapped on the instance. `attach` runs after `build_context`
 so `prewarm`'s cold call is not counted as a chunk; `attach_queue` runs after
 `strategy.setup`, because the RTC queue does not exist until `engine.start()`.
 
-What remains for this phase: **the camera field of view**. The motion faults
-are closed and the failure is now spatial — see *The third rollout*. Measure the
-three cameras' actual HFOV, then crop toward the 69.4° (top) / 87° (wrist) the
-checkpoint was trained on. After that, a scored run: labelled attempts with a
-success count, which is the input to the Phase 4 decision.
+What remains for this phase: **a scored run with the crop on**. The motion
+faults are closed, the failure is spatial, and the wrist crop that addresses it
+is built and configured but **has never driven a rollout** — see *The camera
+crop*. Run it, then score it: labelled attempts with a success count, which is
+the input to the Phase 4 decision.
 
 Still unwatched, and unchanged by any of this: the home *sweep*. The pose is
 captured, but run `dk1 policy home` on its own, from a pose the arms are not
@@ -624,14 +640,81 @@ sensor differently than in training — which is exactly a consistent misalignme
 on top of correct tracking.
 
 **The next step is therefore to crop the camera images to the trained field of
-view**, not to touch the policy. Cropping only works in the direction of a
-too-wide lens; measuring the actual HFOV of the three cameras is the first task,
-because if ours are narrower than 69.4° / 87° no crop can recover it and the
-answer becomes fine-tuning (Phase 4) or different optics.
+view**, not to touch the policy. That is now done for the wrist views and is
+described in *The camera crop*, below: ours are 105°, comfortably wider than the
+87° the wrists were trained at, so the crop is possible. It has not yet driven a
+rollout, so it is a built change and not a result.
 
 Two things still not established by this run, and worth stating: nothing was
 **scored** (no success/failure count over labelled attempts), and the gripper
 inversion was still never *watched* to open and close correctly on the arms.
+
+### The camera crop: our lens is 105 degrees, the checkpoint's wrists are 87
+
+Built 2026-08-20 in response to the third rollout's spatial failure. Nothing has
+been run on the arms with it yet.
+
+**The two numbers.** Ours is **105° HFOV / 116° diagonal**, from the Innomaker
+U30CAM-4K-S1 user manual — a 2.25 mm f/2.0 M12 lens on a 1/2.8" IMX415. The
+model string is confirmed off the USB descriptor here (`0bda:5883
+Innomaker-U30CAM-4K-S1`), so it is the right datasheet, but the angle is the
+manufacturer's figure and not a measurement. Theirs is in
+`sim_eval/robots/bimanual_yam.py` on the colleague's `sim-eval-dk1` branch, and
+it is not a lens spec at all — the sim *builds its intrinsics from an angle*:
+`fx = (w/2)/tan(hfov/2)`, `fy = fx`, top 69.4° (D435i), wrists 87.0° (D405). So
+the trained geometry is exactly a pinhole at those angles, which is what makes
+the correction well-posed.
+
+**The correction.** On a pinhole, the fraction of the frame width that spans the
+target is `tan(target/2) / tan(source/2)` = `tan(43.5°)/tan(52.5°)` = **0.7282**.
+At 640×360 that is the centre **467×263**, which really spans **87.1° H / 56.3° V**
+against the trained 87.0 / 56.2. Every rounding takes the *larger* box, at
+Nikolas's stated preference: too much field of view degrades more gracefully than
+too little.
+
+**It costs no detail.** MolmoAct2 resizes every view to 224×224, and 467×263 is
+bigger than that in both axes, so the stretch back to 640×360 is undone by a
+downscale before the model sees anything. That is also precisely why **the top
+camera is left alone** — cropping it to 69.4° would keep 341×192, and 192 rows is
+*fewer* than 224, so it would throw away real detail rather than reframe.
+Cropping the overhead view wants a higher-resolution `[capture.policy]` first,
+and is a separate experiment.
+
+**Where it lives, and why there.** `dk1lab/fov.py` is the arithmetic (no lerobot
+import, like every other decision module here); `dk1lab/crop.py` is
+`CroppedOpenCVCamera`, an `OpenCVCamera` subclass whose only addition is a crop
+and resize at the end of `_postprocess_image`. In the *camera*, not in a LeRobot
+processor and not in `dk1lab/policy.py`, because the crop has to be true of every
+image this cell produces: a processor step covers rollout and misses teleop, and
+a `policy.py` step covers rollout and misses **recording**, which is the one that
+would quietly poison a Phase 4 fine-tune. Frame size is unchanged, so no feature
+shape, no capture profile and no test downstream had to move.
+
+Two mechanical notes worth keeping. The crop runs *after* the base class's
+rotation, so the box is centred on the picture as finally seen — right at 0° and
+180°, meaningless at 90°/270°, where the output's width is the sensor's vertical
+axis; that combination is rejected in `config.load` and again in the config
+dataclass rather than cropped wrongly. And registering
+`CroppedOpenCVCameraConfig` under `type: opencv_cropped` is not enough on its
+own: `make_cameras_from_configs` has a hardcoded branch per built-in type and
+falls through to `make_device_from_device_class`, which looks the *class* up by
+name in the package holding the config's module. Same trap as
+`SafeBiDK1Follower`, same fix — `dk1lab/__init__.py`'s lazy `__getattr__`.
+
+**Checked on the real cameras** (video devices only; no arms, nothing energised):
+all three connect and deliver 640×360, the wrists report the 467×263 box, and a
+still through the cropped path is upright, correctly framed and visibly tighter.
+One thing the stills showed that the datasheet does not: the uncropped 105° frame
+has **black vignette corners** — the lens's image circle does not quite cover the
+sensor — and the crop removes them entirely.
+
+**What this does not fix.** The lens has real barrel distortion (the manual
+specifies TV distortion < −6.2%, and it is obvious in the stills: straight edges
+bow). The crop is a pinhole correction, so it matches the trained geometry at the
+centre of the frame and only approximately at the edges; undistorting properly
+needs a calibration this cell does not have. Mounting pose is untouched too —
+the sim's wrist cameras sit at a specific place on `link_6` and ours sit where
+they sit. So this narrows one known divergence and leaves two.
 
 ### The sim run: the policy behaves the same way with every hardware excuse removed
 

@@ -7,6 +7,7 @@ from typing import Annotated
 
 import typer
 
+from .. import fov
 from ..cameras import cameras_cli_argument
 from ..config import DEFAULT_CONFIG_PATH, ConfigError, check_devices, load
 from .formats_report import report_formats
@@ -31,6 +32,22 @@ def show(config: ConfigOpt = DEFAULT_CONFIG_PATH) -> None:
     typer.secho("\ncameras", bold=True)
     for name, device in cfg.cameras.items():
         typer.echo(f"  {name:6s} rotation {device.rotation:3d}  {device.path}")
+
+    typer.secho("\nfield of view", bold=True)
+    for name, device in cfg.cameras.items():
+        if device.hfov is None:
+            typer.echo(f"  {name:6s} unstated — no crop")
+            continue
+        if not device.cropped:
+            typer.echo(f"  {name:6s} {device.hfov:g} deg, uncropped")
+            continue
+        # Describe against the policy profile: that is the frame the crop is
+        # sized for, and printing the box makes the rounding visible instead of
+        # repeating back the number that was asked for.
+        capture = cfg.profile("policy")
+        typer.echo(
+            f"  {name:6s} {fov.describe(capture.width, capture.height, device.hfov, device.target_hfov)}"
+        )
 
     if cfg.limits:
         typer.secho("\nspeed limits", bold=True)

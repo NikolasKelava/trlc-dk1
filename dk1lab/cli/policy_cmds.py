@@ -19,6 +19,7 @@ from typing import Annotated
 import typer
 
 from .. import checkpoint as ckpt
+from ..cameras import crop_summary
 from ..config import DEFAULT_CONFIG_PATH, load
 from ..layout import ACTION_KEYS, GRIPPER_INDICES, IMAGE_KEYS
 from ..policy import DEFAULT_EXECUTION_HORIZON, DEFAULT_FPS, HOME_AT_START_POSE, POLICY_LIMITS
@@ -329,6 +330,10 @@ def _report(cfg, spec: str, *, steps: int | None = None, home=None, invert: bool
         typer.echo(
             f"  {name:6s} {camera.width}x{camera.height} @ {camera.fps} {camera.fourcc}"
             f"  rotation {int(camera.rotation)}  {camera.index_or_path}"
+            # What the policy is actually shown. A wrist view cropped to the
+            # trained field of view and one left at the lens's own 105 degrees
+            # are the same size and the same file; this is what tells them apart.
+            + (f"  [{crop}]" if (crop := crop_summary(camera)) else "")
         )
 
     _echo_inversion(invert)

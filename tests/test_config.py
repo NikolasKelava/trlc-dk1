@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tomllib
+from dataclasses import replace
 
 import pytest
 
@@ -460,3 +461,97 @@ def test_capturing_home_twice_replaces_rather_than_appends(config_file):
     write_home(HomePose(left=(0.2,) * 7, right=(0.2,) * 7), config_file)
     assert load(config_file).home.left == (0.2,) * 7
     assert config_file.read_text().count("[home]") == 1
+
+
+# --------------------------------------------------------------------------- #
+# Camera field of view
+# --------------------------------------------------------------------------- #
+
+
+def _edited(config_file, old: str, new: str):
+    """Rewrite one fragment of the fixture config in place, and hand it back."""
+    text = config_file.read_text()
+    assert old in text, old
+    config_file.write_text(text.replace(old, new, 1))
+    return config_file
+
+
+def test_hfov_and_target_load_as_floats(config_file):
+    cfg = load(config_file)
+    assert cfg.camera("left").hfov == 105.0
+    assert cfg.camera("left").target_hfov == 87.0
+    assert cfg.camera("left").cropped
+
+
+def test_a_camera_without_a_target_is_not_cropped(config_file):
+    cfg = load(config_file)
+    assert cfg.camera("top").hfov == 105.0
+    assert cfg.camera("top").target_hfov is None
+    assert not cfg.camera("top").cropped
+
+
+def test_both_angles_are_optional(config_file):
+    """[cameras.right] has neither, and that is a valid camera."""
+    right = load(config_file).camera("right")
+    assert right.hfov is None and right.target_hfov is None
+
+
+def test_a_target_without_an_hfov_is_rejected(config_file):
+    """There is no default lens: it is a property of what you plugged in."""
+    path = _edited(config_file, "rotation = 0", "rotation = 0\ntarget_hfov = 87.0")
+    with pytest.raises(ConfigError, match="target_hfov is set but hfov is not"):
+        load(path)
+
+
+def test_a_target_wider_than_the_lens_is_rejected(config_file):
+    """Cropping only narrows; a too-narrow lens is a hardware problem."""
+    path = _edited(config_file, "target_hfov = 87.0", "target_hfov = 120.0")
+    with pytest.raises(ConfigError, match="wider than its hfov"):
+        load(path)
+
+
+def test_a_quarter_turn_with_a_target_is_rejected(config_file):
+    """Rotated 90 degrees, the output's width is the sensor's vertical axis."""
+    path = _edited(
+        config_file,
+        'path = "/dev/v4l/by-path/pci-left-video-index0"\nrotation = 180',
+        'path = "/dev/v4l/by-path/pci-left-video-index0"\nrotation = 90',
+    )
+    with pytest.raises(ConfigError, match="horizontal field of view"):
+        load(path)
+
+
+@pytest.mark.parametrize("bad", ["0", "180", "-5", "true", '"105"'])
+def test_a_field_of_view_outside_zero_to_one_eighty_is_rejected(config_file, bad):
+    path = _edited(config_file, "hfov = 105.0\ntarget_hfov", f"hfov = {bad}\ntarget_hfov")
+    with pytest.raises(ConfigError, match="hfov"):
+        load(path)
+
+
+def test_write_cameras_round_trips_the_field_of_view(config_file):
+    path = config_file
+    write_cameras(load(path).cameras, path)
+    after = load(path)
+    assert after.camera("left").hfov == 105.0
+    assert after.camera("left").target_hfov == 87.0
+    assert after.camera("right").target_hfov is None
+
+
+def test_write_cameras_can_remove_a_crop(config_file):
+    """Unset on the device means the key goes, not that it is left behind."""
+    path = config_file
+    cameras = dict(load(path).cameras)
+    cameras["left"] = replace(cameras["left"], target_hfov=None)
+    write_cameras(cameras, path)
+    assert load(path).camera("left").target_hfov is None
+    assert "target_hfov" not in path.read_text().split("[cameras.left]")[1].split("[")[0]
+
+
+def test_write_cameras_still_leaves_every_other_section_alone(config_file):
+    """The property the fov keys must not have broken."""
+    path = config_file
+    write_cameras(load(path).cameras, path)
+    text = path.read_text()
+    assert "# a comment that must survive every surgical write" in text
+    assert "# camera comment" in text
+    assert '[capture.policy]' in text and "fourcc" in text

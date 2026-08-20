@@ -219,13 +219,26 @@ def cameras(
         typer.secho(f"\n{exc}\n", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
+    # Carry the lens geometry through. This command discovers which device node
+    # is which view; it learns nothing about hfov / target_hfov, and rebuilding
+    # the devices from scratch would silently drop the crop the wrist cameras
+    # depend on.
     devices = {
-        name: CameraDevice(path=candidate.by_path, rotation=rotation)
+        name: CameraDevice(
+            path=candidate.by_path,
+            rotation=rotation,
+            hfov=settings.cameras[name].hfov if name in settings.cameras else None,
+            target_hfov=settings.cameras[name].target_hfov if name in settings.cameras else None,
+        )
         for name, candidate in labelled.items()
     }
     typer.echo("")
     for name in CAMERA_NAMES:
-        typer.echo(f"  {name:6s} {devices[name].path}  rotation {rotation}")
+        device = devices[name]
+        line = f"  {name:6s} {device.path}  rotation {rotation}"
+        if device.cropped:
+            line += f"  crop {device.hfov:g} -> {device.target_hfov:g} deg"
+        typer.echo(line)
     if not typer.confirm("\nwrite this to dk1.toml?", default=True):
         typer.echo("nothing written.")
         raise typer.Exit(code=1)

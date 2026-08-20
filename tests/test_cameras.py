@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from dk1lab.cameras import camera_configs, cameras_cli_argument
+from dk1lab.cameras import camera_configs, cameras_cli_argument, crop_summary
 from dk1lab.config import ConfigError, load
 from dk1lab.layout import CAMERA_NAMES
 
@@ -82,3 +82,54 @@ def test_cli_argument_carries_the_same_values_as_the_objects(config_file):
     assert "fourcc: MJPG" in argument
     # rotation 0 is the default and is omitted rather than written out
     assert argument.count("rotation: 180") == 2
+
+
+def test_a_camera_with_a_target_becomes_a_cropping_camera(config_file):
+    """And one without stays an ordinary OpenCVCamera — same file, same size."""
+    configs = camera_configs(load(config_file))
+    assert configs["left"].type == "opencv_cropped"
+    assert configs["top"].type == "opencv"
+    assert configs["right"].type == "opencv"
+
+
+def test_the_crop_angles_reach_the_camera_config(config_file):
+    left = camera_configs(load(config_file))["left"]
+    assert left.source_hfov_deg == 105.0
+    assert left.target_hfov_deg == 87.0
+
+
+def test_cropping_does_not_change_the_frame_size(config_file):
+    """Which is what lets it be invisible to every downstream feature shape."""
+    configs = camera_configs(load(config_file), "policy")
+    assert (configs["left"].width, configs["left"].height) == (640, 360)
+    assert (configs["top"].width, configs["top"].height) == (640, 360)
+
+
+def test_the_crop_follows_the_camera_into_every_profile(config_file):
+    """Teleop, recording and rollout see the same field of view or none of this
+    is worth doing — an operator checking the view in teleop would be checking a
+    picture the policy never gets."""
+    cfg = load(config_file)
+    for profile in ("policy", "teleop"):
+        assert camera_configs(cfg, profile)["left"].type == "opencv_cropped"
+
+
+def test_crop_summary_names_the_box_for_a_cropped_camera(config_file):
+    configs = camera_configs(load(config_file), "policy")
+    assert crop_summary(configs["left"]) == "crop 467x263 -> 87.1 deg H"
+    assert crop_summary(configs["top"]) is None
+
+
+def test_crop_summary_is_sized_to_the_profile_not_the_lens(config_file):
+    """1280x720 is the same 16:9, so the box scales and the angle does not."""
+    teleop = camera_configs(load(config_file), "teleop")["left"]
+    assert crop_summary(teleop) == "crop 933x525 -> 87.1 deg H"
+
+
+def test_cli_argument_carries_the_crop(config_file):
+    argument = cameras_cli_argument(load(config_file))
+    assert "type: opencv_cropped" in argument
+    assert "source_hfov_deg: 105" in argument
+    assert "target_hfov_deg: 87" in argument
+    # the uncropped cameras stay plain
+    assert argument.count("type: opencv,") == 2

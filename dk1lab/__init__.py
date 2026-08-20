@@ -11,7 +11,7 @@ usable on a machine with no robot stack installed. :mod:`dk1lab.cameras` and
 :mod:`dk1lab.robot` are where LeRobot enters.
 """
 
-__all__ = ["SafeBiDK1Follower", "__version__"]
+__all__ = ["CroppedOpenCVCamera", "SafeBiDK1Follower", "__version__"]
 
 __version__ = "0.1.0"
 
@@ -43,4 +43,14 @@ def __getattr__(name: str):
         from .robot import SafeBiDK1Follower
 
         return SafeBiDK1Follower
+    if name == "CroppedOpenCVCamera":
+        # Same story, one layer down: LeRobot's `make_cameras_from_configs` has
+        # a hardcoded branch per built-in camera type and falls through to
+        # `make_device_from_device_class` for anything else, which looks for
+        # `CroppedOpenCVCamera` in the package holding `CroppedOpenCVCameraConfig`
+        # — that is, here. Registering the config subclass only decides what a
+        # `type: opencv_cropped` string parses into.
+        from .crop import CroppedOpenCVCamera
+
+        return CroppedOpenCVCamera
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -13,6 +13,7 @@ from typing import Annotated
 
 import typer
 
+from ..cameras import crop_summary
 from ..config import DEFAULT_CONFIG_PATH, load
 from ..teleop import DEFAULT_FPS, TELEOP_LIMITS, build, run
 from .safety import LEADER_HELP, MOTION_HELP, confirm_motion
@@ -68,6 +69,9 @@ def _report(follower, leader, *, fps: int, display: bool, duration_s: float | No
         typer.echo(
             f"  {name:6s} {camera.width}x{camera.height} @ {camera.fps} {camera.fourcc}"
             f"  rotation {int(camera.rotation)}  {camera.index_or_path}"
+            # The crop is what --display shows, so it belongs in the banner you
+            # read just before deciding whether the view looks right.
+            + (f"  [{crop}]" if (crop := crop_summary(camera)) else "")
         )
 
     typer.secho("\nloop", bold=True)

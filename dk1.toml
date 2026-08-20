@@ -67,17 +67,64 @@ right = "/dev/ttyACM2"
 # overhead view of the mat; between 4.3 and 4.4 a fixed object shifts left, so
 # 4.4 is the further-right camera).
 
+# --- Field of view ---
+#
+# hfov         the lens's own horizontal field of view, degrees. Optional, and
+#              documentation unless target_hfov is also set.
+# target_hfov  crop every frame's centre out until it spans this angle, then
+#              stretch it back to the configured capture size. Optional; absent
+#              means no crop and an ordinary OpenCVCamera.
+#
+# OURS: 105 degrees horizontal (116 diagonal), from the Innomaker
+# U30CAM-4K-S1 user manual -- a 2.25 mm f/2.0 M12 lens on a 1/2.8" IMX415.
+# That is the manufacturer's figure, not a measurement here, and the same lens
+# is specified at TV distortion < -6.2%, i.e. visibly barrel. So the crop lands
+# us close to the trained geometry rather than exactly on it, and it matches
+# best at the centre of the frame.
+#
+# THEIRS: the MolmoAct2 BimanualYAM checkpoint was trained against pinhole
+# cameras whose intrinsics come straight from an HFOV
+# (sim_eval/robots/bimanual_yam.py, fx = (w/2)/tan(hfov/2), fy = fx):
+#     top    69.4 deg  -- RealSense D435i
+#     wrists 87.0 deg  -- RealSense D405
+#
+# Only the wrists are cropped here, by request. The crop is:
+#     scale = tan(87/2) / tan(105/2) = 0.7282
+#     640x360 -> keep the centre 467x263, i.e. 87.1 deg H / 56.3 deg V
+# against the trained 87.0 / 56.2. Every rounding takes the LARGER box, so the
+# policy is shown a hair more of the scene than training rather than a hair
+# less. dk1lab/fov.py does the arithmetic; dk1lab/crop.py moves the pixels.
+#
+# The crop costs no detail the policy can use: MolmoAct2 resizes every view to
+# 224x224, and 467x263 is bigger than that in both axes, so the stretch back to
+# 640x360 is undone before the model sees anything.
+#
+# It applies to EVERY image this cell produces -- teleop display, recording and
+# rollout alike -- because it is done in the camera, not in a policy processor.
+# `dk1 teleop --display` is therefore how you check it looks right.
+
 [cameras.top]
 path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:10.1:1.0-video-index0"
 rotation = 180
+hfov = 105.0
+# No target_hfov: the top view is left alone. Cropping it to the trained 69.4
+# would mean keeping only 341x192 of 640x360, and unlike the wrists those 192
+# rows are FEWER than the 224 the model resizes to -- so it would cost real
+# detail, not just reframe. Whether the overhead view wants the same treatment
+# is a separate experiment, and a higher-resolution [capture.policy] is the way
+# to run it.
 
 [cameras.left]
 path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.3:1.0-video-index0"
 rotation = 180
+hfov = 105.0
+target_hfov = 87.0
 
 [cameras.right]
 path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.4:1.0-video-index0"
 rotation = 180
+hfov = 105.0
+target_hfov = 87.0
 
 # --- Capture profiles --------------------------------------------------------
 #

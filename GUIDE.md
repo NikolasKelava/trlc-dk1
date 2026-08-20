@@ -145,6 +145,36 @@ hub port. The alternatives do not work: `/dev/videoN` moves between reboots, and
 so only one wins the symlink. `rotation` is per camera; all three are currently
 mounted upside down (180).
 
+**`hfov` / `target_hfov`** — the field of view, in degrees, and what to crop it
+down to. `hfov` is the lens's own: **105°** for our Innomaker U30CAM-4K-S1, from
+its user manual. `target_hfov` is optional and is the only one that changes
+anything — set it and every frame from that camera has its centre cropped out and
+stretched back to the configured size, so the picture spans the narrower angle.
+
+Both wrist cameras are set to **87°**, which is what the MolmoAct2 BimanualYAM
+checkpoint was trained on (its simulated wrist cameras are RealSense D405s, and
+their intrinsics are built straight from that angle). At 640×360 that keeps the
+middle **467×263**, which really spans 87.1° — every rounding takes the *larger*
+box, so the policy is never shown less of the scene than it was trained on.
+
+The top camera is deliberately **left alone**. Its trained angle is 69.4°
+(D435i), which would keep only 341×192 — and 192 rows is fewer than the 224
+MolmoAct2 resizes to, so unlike the wrists it would cost real detail rather than
+just reframing. Cropping it wants a higher-resolution `[capture.policy]` first.
+
+Two things to know about this crop. It is done **in the camera**, so it applies to
+everything this cell produces — what teleop displays, what recording stores, what
+the policy is fed. `dk1 teleop --display` is therefore how you check it looks
+right, and `dk1 config show` prints the box and the angle it achieves. And it is a
+**pinhole** correction: our lens has real barrel distortion (the manual specifies
+TV distortion < −6.2%), so the crop matches the trained geometry best at the
+centre of the frame and only approximately at its edges. Fixing that needs a
+calibration this cell does not have.
+
+A side benefit visible immediately: the uncropped 105° frame has black vignette
+corners, because the lens's image circle does not quite cover the sensor. The
+crop removes them.
+
 **`[limits.<activity>]`** — how fast the followers may move, per activity.
 `dk1 teleop` reads `[limits.teleop]`. `max_joint_rate = false` means no limiting
 at all (TOML has no null, so `false` is how "off" is spelled); anything else must
