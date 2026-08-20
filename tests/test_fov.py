@@ -54,15 +54,15 @@ def test_the_wrist_crop_is_the_box_dk1_toml_documents():
 
 
 def test_the_tuned_wrist_box_is_the_one_dk1_toml_configures():
-    """inset 6, lifted 20 — at the 1280x720 the policy actually captures."""
-    box = crop_box(1280, 720, OURS, WRIST, inset=6, shift_y=-20)
-    assert (box.width, box.height) == (909, 511)
-    assert (box.x, box.y) == (185, 64)
+    """inset 7, lifted 50 — at the 1280x720 the policy actually captures."""
+    box = crop_box(1280, 720, OURS, WRIST, inset=7, shift_y=-50)
+    assert (box.width, box.height) == (905, 509)
+    assert (box.x, box.y) == (187, 5)
 
 
 def test_the_tuned_box_still_clears_the_models_input_size():
     """378 rows is what MolmoAct2 resizes to; fewer means inventing detail."""
-    box = crop_box(1280, 720, OURS, WRIST, inset=6, shift_y=-20)
+    box = crop_box(1280, 720, OURS, WRIST, inset=7, shift_y=-50)
     assert box.height >= 378
     assert box.width >= 378
 
@@ -206,3 +206,17 @@ def test_describe_names_the_adjustments_when_there_are_any():
     line = describe(1280, 720, OURS, WRIST, inset=6, shift_y=-20)
     assert "inset 6" in line and "shift +0,-20" in line
     assert "inset" not in describe(1280, 720, OURS, WRIST)
+
+
+def test_describe_says_so_when_a_shift_was_clamped():
+    """Reporting the number that was asked for would be a lie in exactly the
+    case an operator most needs to know about."""
+    assert "CLAMPED" in describe(1280, 720, OURS, WRIST, inset=7, shift_y=-60)
+    assert "CLAMPED" not in describe(1280, 720, OURS, WRIST, inset=7, shift_y=-50)
+
+
+def test_the_configured_shift_is_inside_the_sensor():
+    """dk1.toml asks for -50 at 1280x720, and the box has 5 px left to give."""
+    box = crop_box(1280, 720, OURS, WRIST, inset=7, shift_y=-50)
+    assert box.y == 5
+    assert box.shift_y == -100

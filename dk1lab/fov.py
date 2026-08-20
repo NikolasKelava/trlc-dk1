@@ -254,4 +254,16 @@ def describe(
         line += f", inset {inset:g}"
     if shift_x or shift_y:
         line += f", shift {shift_x:+g},{shift_y:+g}"
-    return line + ")"
+    line += ")"
+    # A shift that ran off the sensor is clamped, and reporting the number that
+    # was *asked* for would then be a lie in exactly the case an operator most
+    # needs to know about. box.shift_* is what it actually achieved, in this
+    # frame's pixels, so scale the request the same way before comparing.
+    px = width / reference_width
+    wanted = (round(shift_x * px), round(shift_y * px))
+    if (box.shift_x, box.shift_y) != wanted:
+        line += (
+            f"  CLAMPED: wanted {wanted[0]:+d},{wanted[1]:+d} px, "
+            f"got {box.shift_x:+d},{box.shift_y:+d}"
+        )
+    return line

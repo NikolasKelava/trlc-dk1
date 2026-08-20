@@ -171,9 +171,15 @@ a pixel is a different angle at every capture resolution and this cell runs two,
 so quoting them at one reference is what keeps teleop and rollout geometrically
 identical. Change `[capture.policy]` and these numbers keep their meaning.
 
-Currently `inset = 6`, `crop_shift_y = -20`. At the 1280×720 the policy captures
-that is the box **909×511 at (185, 64)** = 85.6° H / 55.0° V, sitting 40 px above
+Currently `inset = 7`, `crop_shift_y = -50`. At the 1280×720 the policy captures
+that is the box **905×509 at (187, 5)** = 85.3° H / 54.8° V, sitting 100 px above
 centre. `dk1 config show` prints exactly this, so you never have to work it out.
+
+That `y` of 5 is five pixels off the top of the sensor, so **−52 is about as far
+as this box can be lifted**. Past that the shift clamps rather than failing — a
+rollout must not stop for a bad number — and `dk1 config show` prints `CLAMPED`
+with what it actually achieved. To lift further, drop `crop_inset` (a smaller box
+has more room to move) or widen `target_hfov`.
 
 Two things to know about this crop. It is done **in the camera**, so it applies to
 everything this cell produces — what teleop displays, what recording stores, what

@@ -695,9 +695,10 @@ field of view degrades more gracefully than too little.
 rollout: `crop_inset` (extra pixels off the left and right edges, with top and
 bottom following so the box keeps the frame's aspect ratio — an anisotropic box
 would be stretched on the way back out, which is the exact distortion this is
-undoing), and `crop_shift_x` / `crop_shift_y`. Currently **inset 6, shift_y −20**,
-i.e. the view is lifted. At 1280×720 that is the box **909×511 at (185, 64)** =
-**85.6° H / 55.0° V**, sitting 40 px above centre.
+undoing), and `crop_shift_x` / `crop_shift_y`. Currently **inset 7, shift_y −50**,
+i.e. the view is lifted. At 1280×720 that is the box **905×509 at (187, 5)** =
+**85.3° H / 54.8° V**, sitting 100 px above centre — and note the `y` of 5, which
+means about −52 is as far as this box can be raised before the shift clamps.
 
 **All three are quoted in pixels at a 640-wide reference** (`fov.REFERENCE_WIDTH`)
 and scaled to whatever frame the camera delivers. They are eyeballed on a
@@ -707,8 +708,10 @@ what keeps teleop and rollout geometrically identical, which is the only thing
 that makes "it looked right in teleop" evidence about what the policy gets. It
 also means changing the capture resolution does not silently retune the crop.
 A shift that would run off the sensor is **clamped, not raised** — retuning a
-number beats refusing to produce a picture mid-rollout — and `CropBox.shift_y`
-reports what it actually achieved, so a clamped shift is visible.
+number beats refusing to produce a picture mid-rollout — and `fov.describe`
+prints `CLAMPED` with the shift it actually achieved, because reporting the
+number that was *asked* for would be a lie in exactly the case an operator most
+needs to know about.
 
 **The model input is 378×378, not 224×224.** This was wrong here for a day and
 it matters. The 224s in the checkpoint's `molmoact2_masked_normalizer` are

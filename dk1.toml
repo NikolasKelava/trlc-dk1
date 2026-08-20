@@ -113,10 +113,16 @@ right = "/dev/ttyACM2"
 # thing that makes "it looked right in teleop" evidence about what the policy
 # gets. Change the capture resolution and these numbers keep their meaning.
 #
-# Current values, set 2026-08-20 from watching the third rollout: inset 6, and
-# the view lifted 20 px. At [capture.policy] 1280x720 that is the box
-#     909x511 at (185,64) = 85.6 deg H / 55.0 deg V, sitting 40 px above centre
+# Current values, tightened 2026-08-20 after the fourth rollout: inset 7, and
+# the view lifted 50 px. At [capture.policy] 1280x720 that is the box
+#     905x509 at (187,5) = 85.3 deg H / 54.8 deg V, sitting 100 px above centre
 # and at [capture.teleop] the same angles. `dk1 config show` prints it.
+#
+# NOTE the y of 5: that lift is 5 px off the top of the sensor, so -52 is about
+# the most this box can be raised. Past that the shift CLAMPS -- it will not
+# refuse to produce a picture mid-rollout -- and `dk1 config show` says CLAMPED
+# and prints what it actually achieved. To lift further, lower crop_inset (a
+# smaller box has more room to move) or widen target_hfov.
 #
 # It applies to EVERY image this cell produces -- teleop display, recording and
 # rollout alike -- because it is done in the camera, not in a policy processor.
@@ -138,16 +144,16 @@ path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.3:1.0-video-index0"
 rotation = 180
 hfov = 105.0
 target_hfov = 87.0
-crop_inset = 6.0
-crop_shift_y = -20.0
+crop_inset = 7.0
+crop_shift_y = -50.0
 
 [cameras.right]
 path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.4:1.0-video-index0"
 rotation = 180
 hfov = 105.0
 target_hfov = 87.0
-crop_inset = 6.0
-crop_shift_y = -20.0
+crop_inset = 7.0
+crop_shift_y = -50.0
 
 # --- Capture profiles --------------------------------------------------------
 #
