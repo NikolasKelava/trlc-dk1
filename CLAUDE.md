@@ -339,9 +339,11 @@ Added in Phase 3, on this machine (GPU only — no robot was involved):
   loop every 30th tick and RTC is not optional. First call 953 ms (warmup +
   CUDA-graph capture), peak GPU memory 11.1 GiB on the 32 GB card.
 - **Timing `select_action` naively measures nothing.** It serves from the cached
-  30-step chunk, so 29 calls in 30 cost ~12 ms; only a reset forces a real
-  forward pass. `dk1 policy smoke` measures the two separately — the first
-  version of it reported 12 ms and was wrong.
+  30-step chunk, so 29 calls in 30 cost ~12 ms *in total*; only a reset forces a
+  real forward pass. `dk1 policy smoke` measures the two separately — the first
+  version of it reported 12 ms and was wrong. Note "cheap" is relative: measured
+  live at 30 Hz a cached call is ~5.5 ms, of which 1.8 ms is `self.eval()`
+  walking 1737 submodules. See *The 27.7 Hz loop*.
 - The gripper inversion applies cleanly to both loaded pipeline steps.
 
 **The arm sides are confirmed** — Nikolas verified the four ports in `dk1.toml`
@@ -355,7 +357,7 @@ ports is open any more.
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
-| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms four times**; judder and stall fixed, wrist FOV crop improved alignment and the gripper now waits for position. Crop retune + 720p capture **built, not yet run** |
+| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms four times**; judder and stall fixed, wrist FOV crop improved alignment and the gripper now waits for position. Crop retune + 720p capture **built, not yet run**. The 27.7 Hz loop is **diagnosed, not fixed** |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **run: 3/3 with a 120 s budget; 0/10 was a too-short episode** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
@@ -587,9 +589,11 @@ purpose: a question about the policy cannot be answered with a vector LeRobot
 rewrote. At the end it prints a summary that states, in words, whether the queue
 ran dry, whether inference is too slow for RTC to leave anything, where the
 unaccounted milliseconds are, and whether the policy ever moved a gripper.
-`RolloutTrace` works under `--sync` too, where there is no queue: records are cut
-at the postprocessor instead and the queue readings are *absent* rather than
-zero.
+`RolloutTrace` works under `--sync` too, and on its own terms: a record is the
+window between two real inference calls, its total is measured wall clock, its
+costs are **per tick**, and the queue readings are *absent* rather than zero.
+Cutting a record at the postprocessor — which is what it used to do — cut one
+per tick and reported nonsense; see *The 27.7 Hz loop*.
 
 `--display-policy-input` opens Rerun and logs, under `policy_input/`, the images
 **as the model receives them** — the preprocessor's output, not the robot-side
@@ -841,58 +845,153 @@ model's view track. `dk1lab/modelview.py`:
   `_ensure_blueprint` returns early when it is already set. A coupling to an
   upstream implementation detail, written down as one.
 
-### OPEN: the 27.7 Hz loop, and a trace that lies under `--sync`
+### The 27.7 Hz loop: the capture raise is innocent, the per-tick engine is not
 
-Reported after the retune, from a rollout log. **Not diagnosed. This is the next
-session's job.** Two separate things:
+Two problems were open here. Both are now closed as *diagnoses*; the fix for the
+second is chosen but not built, and nothing in this round has been on the arms.
 
-```
-chunk 4390      0 ms =  0 ticks (model 132 · pre 27 · post 0 · other -160)  consumed  0  queue ->  0
-WARNING lerobot.rollout.strategies.base: Record loop is running slower (27.7 Hz) than the target FPS (30 Hz)
-```
+#### B (fixed): `--trace` no longer lies under `--sync`
 
-**A. The loop is 2.3 Hz short.** 27.7 Hz is 36.1 ms per tick against a 33.3 ms
-budget. The leading suspect is **this repo's own change**: `SyncInferenceEngine.
-get_action` (`rollout/inference/sync.py:114`) runs `preprocessor → select_action
-→ postprocessor` **every tick**. `select_action` serves from the cached 30-step
-chunk on 29 ticks out of 30, but the preprocessor does not — MolmoAct2's image
-packing re-runs on all three views every single tick. Measured here, GPU only:
+The old accounting cut a record at the **postprocessor**, and the sync engine
+runs the postprocessor every tick — so a 180 s run reported `chunk 4390`, one
+per tick, each handed RTC's `real_delay` of 0 as its total. Hence
+`0 ms = 0 ticks` and `other -160`: three timers minus a total of nothing.
 
-| `[capture.policy]` | preprocessor, per tick |
+A chunk boundary under sync is **the tick that actually ran the model**, and
+nothing else is. MolmoAct2's `select_action` calls `predict_action_chunk` only
+when its own 30-deep queue is empty, so wrapping `predict_action_chunk` — which
+`dk1lab/trace.py` already did — is enough to detect one. `RolloutTrace` now
+folds sync ticks into a `SyncWindow` between two inference calls and measures
+what actually matters at 27.7 Hz: **where each tick goes**.
+
+| | |
 | --- | --- |
-| 640×360 | **6.1 ms** |
-| 1280×720 (current) | **11.0 ms** |
+| `wall_ms` | measured wall clock across the window, not inferred from a delay |
+| `ticks` | ticks in it — 30 here: one inference, 29 cached |
+| `model_ms` | the one real forward pass, at the head of the window |
+| `pre_ms` / `post_ms` / `select_ms` | per **cached** tick, median |
+| `outside_ms` | tick period minus the engine call: everything else in the loop |
 
-So raising the capture to 1280×720 on 2026-08-20 added ~4.9 ms to *every* tick,
-and the in-situ trace reports `pre 27` — higher again, presumably contention with
-the three camera decode threads. That is the right order of magnitude to explain
-the shortfall, and it is **not confirmed**: nobody has yet correlated the two by
-re-running the same rollout at 640×360.
+The inference tick is reported separately as `infer_ms` rather than averaged in,
+because it carries the whole forward pass and would hide the per-tick cost the
+other 29 are paying. `unaccounted_ms` under sync is wall clock minus **every**
+engine call, so it cannot go negative. `total_ticks`, `consumed`, `queue_after`
+and `starved` are RTC readings and are simply absent. `trace.close()` cuts the
+window still open when the run ends, so the last chunk is not dropped.
 
-LeRobot knows about this. There is a comment block directly above the class
-naming the fix — drive the policy via `predict_action_chunk` and serve a local
-FIFO of postprocessed actions — and listing why upstream has not done it (SAC,
-ACT temporal ensembling and the Diffusion obs-history queues all depend on
-`select_action`'s side effects). MolmoAct2 has none of those dependencies.
+Sample, from the real engine and the real cameras with no robot attached:
 
-Three ways out, in increasing order of nerve: revert `[capture.policy]` to
-640×360 and accept the 378-row upsample; drop the loop to 25 Hz; or build the
-FIFO upstream sketched. Do not pick one before measuring which tick actually
-overruns — `--trace` already breaks the cost out, once B is fixed.
+```
+chunk   2    1156 ms over  30 ticks  = 25.9 Hz  (pause 186 ms, model 118)
+  per cached tick   33.4 ms = 29.9 Hz  (pre 17.5 · select 5.6 · post 0.2 · loop 10.2)
+```
 
-**B. `--trace` reports nonsense under `--sync`, and B blocks A.** `chunk 4390` in
-a 180 s run is ~one "chunk" per *tick*, not one per 30. `_record_post` cuts a
-record at the postprocessor, and the sync engine runs the postprocessor every
-tick — so `total_ms` is measured across something that is not a chunk boundary
-(hence `0 ms = 0 ticks`) and `other = total − (model+pre+post)` goes **negative**
-(−160). `consumed` and `queue` are meaningless here by design. The `model 132` is
-real but is the *cached* `select_action` path on most ticks, not an inference.
-Fix the accounting before trusting any number in A.
+#### A: it is not the capture resolution — measured, paired, three rounds
 
-Note what is **not** wrong in that log: the `policy` and `robot` rows differ
-because one is the raw normalised model output and the other is post-
+The suspicion was that raising `[capture.policy]` to 1280x720 added ~5 ms to
+every tick, because the sync engine re-runs the whole preprocessor per tick.
+**It did not.** The paired A/B — one model load, one process, cameras swapped
+between 720p and 360p and back, three rounds, 145 timed cached ticks each:
+
+| | engine per cached tick | `pack_inputs` |
+| --- | --- | --- |
+| 1280x720 | 22.72 ms | 15.90 ms |
+| 640x360 | 21.83 ms | 15.86 ms |
+| **difference** | **+0.89 ms** | **+0.04 ms** |
+
+Round-to-round variance is ~1.5 ms, i.e. **larger than the effect**. So
+reverting the capture would buy under a millisecond of the ~3 ms needed, and
+would cost the policy the thing the raise was for: at 640x360 the tuned wrist
+box is 455x256 and 256 rows get upsampled 1.5x into a 378-row model input.
+**Do not revert it.** That option is closed.
+
+The 6.1 / 11.0 ms figures this section previously carried are not reproducible
+and were measured some other way. Two confounds that produce exactly that kind
+of error, both hit while chasing this:
+
+- **A flat-out loop and a paced one disagree about the same function.** Run
+  back-to-back, `pack_inputs` costs 7.5 ms at 360p and 14.0 at 720p — resolution
+  matters and the effect is large. Paced at 30 Hz, which is what a rollout does,
+  both sit at ~15.5 ms. Benchmark the duty cycle you are going to run.
+- **Separate processes drift.** Run one resolution per process, the engine reads
+  23.2 vs 20.0 ms and the story looks confirmed. Feed both to the *same* loaded
+  engine and the gap collapses to 0.89 ms. The 3 ms was between-run variance.
+
+Not the GIL: `thread_time` equals wall time inside `pack_inputs` to within
+0.06 ms with all three camera decode threads running, so it is real CPU burn in
+the calling thread, not waiting behind the cameras. Not core placement either —
+pinning to a P-core changes nothing (the machine is a 14900K on the `powersave`
+governor, so this was worth ruling out).
+
+#### A: what it actually is — 22 ms of engine on a 33.3 ms tick, thrown away 29 times in 30
+
+Measured with the real `SyncInferenceEngine`, the real bf16 checkpoint and the
+real cameras, paced at 30 Hz, **no robot attached**:
+
+| per cached tick | |
+| --- | --- |
+| `MolmoAct2PackInputsProcessorStep` | **15.9 ms** |
+| the rest of the preprocessor (rename, batch, normalise, clamp, device) | 0.8 ms |
+| `select_action` and the engine's own per-tick work | **5.5 ms** |
+| postprocessor (clamp, unnormalise, frame transform, device) | 0.2 ms |
+| **the inference engine, total** | **~22 ms of a 33.3 ms budget** |
+
+and once per chunk, a **118 ms** model call inside a **~190 ms** engine call.
+
+On 29 of those 30 ticks **every millisecond of it is discarded**:
+`select_action` looks at its queue first, finds it non-empty, and returns
+`popleft()` without reading the batch at all. So the three camera views are
+resized to 378x378, patchified and normalised, and thrown away, thirty times per
+chunk instead of once.
+
+Two smaller findings inside that 5.5 ms: `select_action` calls `self.eval()` on
+every call, and walking 1737 submodules of a 7B model costs **1.83 ms** each
+time; the remainder is `prepare_observation_for_inference`, the `copy`, and
+`action.squeeze(0).cpu()` synchronising the device for 14 floats. The
+"29 calls in 30 cost ~12 ms" line recorded earlier in this file is a *total* for
+29 calls; per call it is ~5.5 ms, and only ~0.4 ms of that is the queue.
+
+The arithmetic against the in-situ 36.1 ms tick: the engine is ~22 ms of it, so
+the robot reads, the limiter and the dataset write are ~14 ms. Remove the engine
+from the 29 cached ticks and the tick is ~14.5 ms — 30 Hz with room to spare.
+Revert the capture instead and it is ~35.2 ms, still 28.4 Hz. Only one of those
+two is a fix.
+
+#### The fix, chosen and not built
+
+Build the FIFO that LeRobot's own comment block above `SyncInferenceEngine`
+sketches: drive the policy with `predict_action_chunk`, postprocess the whole
+chunk at once, and serve postprocessed rows from a local deque. Subclass in
+`dk1lab/`, like `SafeBiDK1Follower` and `CroppedOpenCVCamera` — do not patch
+upstream.
+
+Upstream lists three reasons it has not done this, and **none of them apply
+here**: SAC raises from `predict_action_chunk`, ACT's temporal ensembler lives
+inside `select_action`, and the Diffusion family fills its observation-history
+queues as a side effect of `select_action`. MolmoAct2 has none of the three —
+its `select_action` *is* a `predict_action_chunk` call plus a deque. The
+postprocessor is four stateless per-element steps (clamp, unnormalise, frame
+transform, device move), so postprocessing 30 rows at once is equivalent to
+postprocessing them one at a time; RTC already does exactly that. And upstream's
+fourth caveat, relative-action drift, is an argument *for* the FIFO and moot
+here anyway — this checkpoint is absolute joint pose.
+
+Expected: ~22 ms off 29 ticks in 30, the loop back over 30 Hz, and the visible
+per-chunk pause unchanged at ~190 ms. Dropping the loop to 25 Hz is the fallback
+if that turns out to be wrong; it is worse, because the checkpoint's chunk is
+30 steps at 30 Hz and a slower loop stretches every motion.
+
+Note what is **not** wrong in the original log: the `policy` and `robot` rows
+differ because one is the raw normalised model output and the other is post-
 unnormalisation, which is the whole point of printing both. `grip L +0.984 →
 +0.016` is the gripper inversion working, so that run had `--invert-gripper` on.
+
+Everything in this round was measured on the GPU and the cameras only. **No arms
+were energised, and the 27.7 Hz figure itself is still the only in-situ
+measurement** — the `pre 27` in that log is ~11 ms above the 15.9 measured here,
+and that gap is the one thing still unaccounted for. It is most likely
+contention with the follower serial reads, and the fixed `--trace` on a real
+rollout is what would settle it.
 
 ### The sim run: the policy behaves the same way with every hardware excuse removed
 

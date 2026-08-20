@@ -13,8 +13,16 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from dk1lab import trace as trace_module
 from dk1lab.layout import ACTION_KEYS, DOF, GRIPPER_INDICES
-from dk1lab.trace import ChunkRecord, RolloutTrace, _first_row, model_input_images
+from dk1lab.trace import (
+    ChunkRecord,
+    RolloutTrace,
+    SyncWindow,
+    TraceSummary,
+    _first_row,
+    model_input_images,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -268,13 +276,232 @@ def test_under_sync_the_queue_readings_are_absent_rather_than_zero():
     assert any("model call" in line for line in summary.lines())
 
 
-def test_a_sync_postprocessor_call_is_itself_a_record():
-    """With no queue to hang a record on, the postprocessor is where one is cut."""
-    trace, _ctx, engine, _q, _pre, _post = build()
-    trace.rtc = False
-    engine._postprocessor(chunk(0.4))
-    assert len(trace.chunks) == 1
-    assert trace.chunks[0].raw == pytest.approx((0.4,) * DOF)
+# --------------------------------------------------------------------------- #
+# Sync inference: a record is a window between inference calls, not a tick
+# --------------------------------------------------------------------------- #
+
+
+class FakeSyncEngine:
+    """``SyncInferenceEngine`` in miniature: pre -> select_action -> post, per tick.
+
+    Faithful in the one respect the trace depends on: ``select_action`` runs the
+    model only when its own queue is empty, so ``predict_action_chunk`` fires on
+    one tick in ``chunk_steps``. Everything is looked up through the namespaces
+    at call time, so the trace's wrappers are the things that actually run.
+    """
+
+    def __init__(self, ctx, *, chunk_steps=30, tick_ms=1.0, model_ms=8.0):
+        self.ctx = ctx
+        self.chunk_steps = chunk_steps
+        self.tick_ms = tick_ms
+        self.model_ms = model_ms
+        self.clock = SimpleNamespace(now=0.0)
+        self._queue = 0
+        self._preprocessor = ctx.policy.preprocessor
+        self._postprocessor = ctx.policy.postprocessor
+
+    def get_action(self, frame):
+        self._preprocessor({"observation.state": 0})
+        if self._queue == 0:
+            self.ctx.policy.policy.predict_action_chunk()
+            self._queue = self.chunk_steps
+        self._queue -= 1
+        self._postprocessor(chunk(0.4, steps=1))
+        return "an action"
+
+
+def build_sync(*, chunk_steps=30, tick_ms=1.0, model_ms=8.0, fps=30.0):
+    """A trace attached to a sync engine, plus a monotonic fake clock to drive it.
+
+    Real ``perf_counter`` would make the assertions timing-dependent, so the
+    clock is driven by hand: every tick advances it by ``tick_ms``, and the tick
+    that infers advances it by ``model_ms`` more.
+    """
+    pre = FakePipeline()
+    post = FakePipeline(lambda value: value * -1.0 + 1.0)
+    clock = SimpleNamespace(now=0.0)
+
+    def predict_action_chunk(*_a, **_k):
+        # The whole cost of a chunk, paid on the tick that finds its queue empty.
+        clock.now += model_ms / 1000.0
+        return chunk(0.5)
+
+    policy = SimpleNamespace(predict_action_chunk=predict_action_chunk)
+    ctx = SimpleNamespace(
+        policy=SimpleNamespace(
+            policy=policy, preprocessor=pre, postprocessor=post, inference=None
+        )
+    )
+    engine = FakeSyncEngine(ctx, chunk_steps=chunk_steps, tick_ms=tick_ms, model_ms=model_ms)
+    engine.clock = clock
+    ctx.policy.inference = engine
+    trace = RolloutTrace(fps=fps)
+    trace.attach(ctx)
+    # No attach_queue: sync has no queue, so ``trace.rtc`` stays False.
+    return trace, engine
+
+
+def drive(trace, engine, ticks):
+    """Run ``ticks`` control ticks against a monotonic fake clock.
+
+    The clock is a stand-in for ``perf_counter`` so the assertions are about
+    arithmetic rather than about how fast the test machine happens to be.
+    """
+    clock = engine.clock
+    real = trace_module.time
+    trace_module.time = SimpleNamespace(perf_counter=lambda: clock.now)
+    try:
+        for _ in range(ticks):
+            engine.get_action(None)
+            clock.now += engine.tick_ms / 1000.0
+    finally:
+        trace_module.time = real
+
+
+def test_sync_cuts_one_record_per_inference_not_per_tick():
+    """The bug this replaced: 4390 "chunks" in a 180 s run, one per tick."""
+    trace, engine = build_sync(chunk_steps=30)
+    drive(trace, engine, 90)
+    # Three inferences happened; the third window is still open until close().
+    assert len(trace.chunks) == 2
+    trace.close()
+    assert len(trace.chunks) == 3
+    assert [c.sync.ticks for c in trace.chunks] == [30, 30, 30]
+
+
+def test_the_sync_window_measures_wall_clock_rather_than_rtcs_missing_delay():
+    """``total_ms`` used to be ``real_delay * tick``, and sync has no real_delay."""
+    trace, engine = build_sync(chunk_steps=10, tick_ms=2.0, model_ms=50.0)
+    drive(trace, engine, 20)
+    record = trace.chunks[0]
+    # 10 ticks of 2 ms, one of which also paid a 50 ms model call.
+    assert record.total_ms == pytest.approx(70.0, abs=1e-6)
+    assert record.model_ms == pytest.approx(50.0, abs=1e-6)
+    assert record.sync.infer_ms == pytest.approx(50.0, abs=0.5)
+
+
+def test_the_time_outside_the_engine_is_never_negative():
+    """``other -160`` was the old sync line's headline symptom."""
+    trace, engine = build_sync(chunk_steps=10, tick_ms=2.0, model_ms=50.0)
+    drive(trace, engine, 20)
+    for record in trace.chunks:
+        assert record.unaccounted_ms >= 0.0
+        assert "other" not in record.line()
+
+
+def test_the_per_tick_costs_exclude_the_tick_that_ran_the_model():
+    """29 ticks in 30 are cached ticks, and they are the ones that must fit."""
+    trace, engine = build_sync(chunk_steps=10, tick_ms=2.0, model_ms=50.0)
+    drive(trace, engine, 20)
+    window = trace.chunks[0].sync
+    assert window.period_ms == pytest.approx(2.0, abs=1e-6)
+    assert window.cached_hz == pytest.approx(500.0, rel=1e-3)
+    # The whole window, pause included, is much slower than its cached ticks.
+    assert window.hz == pytest.approx(1000.0 * 10 / 70.0, rel=1e-3)
+
+
+def test_sync_records_carry_no_queue_reading_and_cannot_be_starved():
+    trace, engine = build_sync(chunk_steps=10)
+    drive(trace, engine, 20)
+    record = trace.chunks[0]
+    assert record.starved == 0
+    assert "queue" not in record.line()
+    assert record.total_ticks == 0
+
+
+def test_the_sync_summary_names_the_budget_and_what_is_spending_it():
+    trace, engine = build_sync(chunk_steps=30, tick_ms=36.1, model_ms=270.0, fps=30.0)
+    drive(trace, engine, 60)
+    summary = trace.summary()
+    text = "\n".join(summary.lines())
+    assert "target 30 Hz" in text
+    assert "33.3 ms budget" in text
+    assert "rest of the loop" in text
+    assert any("THE LOOP IS SLOW" in v for v in summary.verdicts())
+
+
+def test_a_loop_that_holds_its_rate_is_not_complained_about():
+    trace, engine = build_sync(chunk_steps=30, tick_ms=33.0, model_ms=270.0, fps=30.0)
+    drive(trace, engine, 60)
+    assert not any("THE LOOP IS SLOW" in v for v in trace.summary().verdicts())
+
+
+def test_the_preprocessor_is_named_when_it_covers_the_overrun():
+    """The suspect: it re-runs on all three views every tick, cached or not."""
+    summary = TraceSummary(
+        chunks=4,
+        ticks_asked=120,
+        ticks_served=120,
+        model_ms=270.0,
+        pre_ms=11.0,
+        post_ms=0.3,
+        total_ms=0.0,
+        total_ticks=0,
+        consumed=0,
+        queue_after=0,
+        gripper_span=(-1.0, 1.0),
+        rtc=False,
+        fps=30.0,
+        sync=SyncWindow(
+            ticks=30,
+            wall_ms=1083.0,
+            engine_total_ms=600.0,
+            infer_ms=281.0,
+            period_ms=36.1,
+            period_p95_ms=38.0,
+            engine_ms=11.4,
+            pre_ms=11.0,
+            post_ms=0.3,
+            select_ms=0.1,
+            outside_ms=24.7,
+        ),
+    )
+    verdicts = "\n".join(summary.verdicts())
+    assert "THE LOOP IS SLOW" in verdicts
+    assert "PREPROCESSOR ALONE COVERS THE OVERRUN" in verdicts
+
+
+def test_when_the_loop_not_the_engine_is_the_cost_it_says_so():
+    summary = TraceSummary(
+        chunks=4,
+        ticks_asked=120,
+        ticks_served=120,
+        model_ms=270.0,
+        pre_ms=2.0,
+        post_ms=0.3,
+        total_ms=0.0,
+        total_ticks=0,
+        consumed=0,
+        queue_after=0,
+        gripper_span=(-1.0, 1.0),
+        rtc=False,
+        fps=30.0,
+        sync=SyncWindow(
+            ticks=30,
+            wall_ms=1500.0,
+            engine_total_ms=400.0,
+            infer_ms=281.0,
+            period_ms=45.0,
+            period_p95_ms=50.0,
+            engine_ms=2.5,
+            pre_ms=2.0,
+            post_ms=0.3,
+            select_ms=0.2,
+            outside_ms=42.5,
+        ),
+    )
+    verdicts = "\n".join(summary.verdicts())
+    assert "COST IS OUTSIDE THE INFERENCE ENGINE" in verdicts
+    assert "PREPROCESSOR ALONE" not in verdicts
+
+
+def test_closing_a_trace_twice_adds_nothing():
+    trace, engine = build_sync(chunk_steps=10)
+    drive(trace, engine, 20)
+    trace.close()
+    before = len(trace.chunks)
+    trace.close()
+    assert len(trace.chunks) == before
 
 
 # --------------------------------------------------------------------------- #

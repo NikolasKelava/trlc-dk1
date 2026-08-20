@@ -32,6 +32,31 @@ background thread losing the CPU to the control loop — a completely different
 fix. Measuring only the path you are not going to run is what caused the
 previous mis-diagnosis; this measures all of them, on the arms.
 
+**Under ``--sync`` none of that shape applies, and pretending it did produced
+nonsense.** There is no background thread, no queue and no RTC latency estimate;
+``SyncInferenceEngine`` runs ``preprocessor -> select_action -> postprocessor``
+inline on *every tick*, and ``select_action`` serves from MolmoAct2's cached
+30-step chunk on 29 ticks out of 30. Cutting a record at the postprocessor
+therefore cut one per tick, called it a chunk, handed it RTC's ``real_delay`` of
+zero as a total, and printed ``0 ms = 0 ticks ... other -160``: a span measured
+across something that is not a chunk boundary, and a remainder of three timers
+minus a total of nothing.
+
+So sync is traced on its own terms. The unit is the window between two real
+inference calls — detectable because ``predict_action_chunk`` runs only when the
+policy's own queue is empty — and what it records is the thing that matters at
+27.7 Hz: where each **tick** goes.
+
+===================  =========================================================
+``wall_ms``          measured wall clock across the window, not inferred
+``ticks``            ticks in it — 30 for MolmoAct2: one inference, 29 cached
+``model_ms``         the one real forward pass, at the head of the window
+``pre_ms``           the preprocessor, per *cached* tick — it re-runs every tick
+``post_ms``          the postprocessor, per cached tick
+``select_ms``        ``select_action`` popping a cached row, per cached tick
+``outside_ms``       tick period minus the engine call: cameras, serial, limiter
+===================  =========================================================
+
 It also answers the second open question of Phase 3 — *does the policy ever
 actually move the gripper* — by recording the model's **own** output, before the
 postprocessor unnormalises it and before the gripper inversion flips it. What
@@ -66,6 +91,76 @@ STARVED_FRACTION = 0.9
 
 
 @dataclass(frozen=True)
+class TickCosts:
+    """One control tick under ``--sync``, timed from inside the inference engine.
+
+    ``period_ms`` is measured to the *next* tick's start, so it is unknown until
+    that tick arrives and is filled in then. It is the only number here that
+    includes what the control loop does outside the engine — reading three
+    cameras, reading twelve motors, the limiter, the dataset write — which is
+    exactly the part a "Record loop is running slower" warning is about and the
+    part no timer inside the engine can see.
+    """
+
+    start: float
+    engine_ms: float
+    pre_ms: float
+    post_ms: float
+    #: Nonzero only on the tick where ``predict_action_chunk`` actually ran.
+    model_ms: float = 0.0
+    period_ms: float = 0.0
+
+    @property
+    def inferred(self) -> bool:
+        return self.model_ms > 0.0
+
+    @property
+    def select_ms(self) -> float:
+        """The engine call minus the two pipelines: ``select_action`` itself."""
+        return max(0.0, self.engine_ms - self.pre_ms - self.post_ms - self.model_ms)
+
+    @property
+    def outside_ms(self) -> float:
+        """Tick period minus the engine call — everything else in the loop."""
+        return max(0.0, self.period_ms - self.engine_ms)
+
+
+@dataclass(frozen=True)
+class SyncWindow:
+    """The ticks between two inference calls: one chunk's worth of execution.
+
+    Medians are over the **cached** ticks only. The inference tick is a different
+    animal — it carries the whole forward pass and is reported separately as
+    ``infer_ms`` — and averaging it in would hide the per-tick cost that the
+    other 29 ticks are actually paying.
+    """
+
+    ticks: int
+    wall_ms: float
+    #: Sum of every ``get_action`` call in the window, inference included.
+    engine_total_ms: float
+    #: The engine call on the inference tick: the visible pause under sync.
+    infer_ms: float
+    period_ms: float
+    period_p95_ms: float
+    engine_ms: float
+    pre_ms: float
+    post_ms: float
+    select_ms: float
+    outside_ms: float
+
+    @property
+    def hz(self) -> float:
+        """The rate the window actually ran at, pause included."""
+        return 1000.0 * self.ticks / self.wall_ms if self.wall_ms else 0.0
+
+    @property
+    def cached_hz(self) -> float:
+        """The rate the cached ticks ran at, i.e. with the pause taken out."""
+        return 1000.0 / self.period_ms if self.period_ms else 0.0
+
+
+@dataclass(frozen=True)
 class ChunkRecord:
     """One action chunk: what it cost, what it said, and what RTC did with it.
 
@@ -92,9 +187,21 @@ class ChunkRecord:
     raw: tuple[float, ...]
     robot: tuple[float, ...]
 
+    #: Present only under ``--sync``, where none of ``total_ticks``, ``consumed``
+    #: and ``queue_after`` exist and the window between two inference calls is
+    #: what a record spans instead.
+    sync: SyncWindow | None = None
+
     @property
     def total_ms(self) -> float:
-        """RTC's latency for this chunk in milliseconds, as it measured it."""
+        """How long this chunk took, in milliseconds.
+
+        Under RTC that is RTC's own latency measurement, which is the number it
+        trimmed the chunk by. Under sync nobody measures it, so the trace does:
+        wall clock from one inference call to the next.
+        """
+        if self.sync is not None:
+            return self.sync.wall_ms
         return self.total_ticks * self._tick_ms
 
     #: Set by :class:`RolloutTrace` from the run's fps so ``total_ms`` can exist.
@@ -108,7 +215,15 @@ class ChunkRecord:
         the RTC thread does per iteration. A large remainder means the thread was
         not running — descheduled, or waiting on the GIL behind the control
         loop's camera and serial work — and no amount of GPU tuning will fix it.
+
+        Under sync the three timers cover only the inference *engine*, and the
+        window deliberately contains 29 further ticks of loop work they were
+        never meant to explain. So the remainder there is wall clock minus every
+        engine call: the cameras, the motor reads, the limiter and the dataset
+        write, which is where the missing milliseconds per tick have to be.
         """
+        if self.sync is not None:
+            return self.sync.wall_ms - self.sync.engine_total_ms
         return self.total_ms - (self.model_ms + self.pre_ms + self.post_ms)
 
     @property
@@ -120,6 +235,8 @@ class ChunkRecord:
         which is what ``No command for 0.50 s`` in the motor-chain log is
         reporting, seen from the other side.
         """
+        if self.sync is not None:
+            return 0
         return max(0, self.total_ticks - self.consumed)
 
     def grippers(self, values: tuple[float, ...]) -> tuple[float, ...]:
@@ -127,7 +244,22 @@ class ChunkRecord:
         return tuple(values[i] for i in GRIPPER_INDICES if i < len(values))
 
     def line(self) -> str:
-        """One dense line per chunk, for a live console."""
+        """One dense line per chunk, for a live console.
+
+        Two shapes, because the two engines produce genuinely different readings
+        and a single format could only be right about one of them. Under RTC the
+        question is what the queue got; under sync there is no queue, and the
+        question is where a 33.3 ms tick went.
+        """
+        if self.sync is not None:
+            w = self.sync
+            return (
+                f"chunk {self.index:3d}  {w.wall_ms:6.0f} ms over {w.ticks:3d} ticks  "
+                f"= {w.hz:4.1f} Hz  (pause {w.infer_ms:.0f} ms, model {self.model_ms:.0f})\n"
+                f"  per cached tick  {w.period_ms:5.1f} ms = {w.cached_hz:4.1f} Hz  "
+                f"(pre {w.pre_ms:.1f} · select {w.select_ms:.1f} · post {w.post_ms:.1f} · "
+                f"loop {w.outside_ms:.1f})"
+            )
         return (
             f"chunk {self.index:3d}  {self.total_ms:5.0f} ms = {self.total_ticks:2d} ticks "
             f"(model {self.model_ms:.0f} · pre {self.pre_ms:.0f} · post {self.post_ms:.0f} · "
@@ -167,12 +299,24 @@ class TraceSummary:
     #: no queue, no trimming and no starvation, so half of this is not a reading
     #: that exists and is not printed.
     rtc: bool = True
+    #: The per-tick reading, medians of the per-chunk medians. Sync only.
+    sync: SyncWindow | None = None
+    #: The rate the loop was asked to run at, so the sync verdict can say by how
+    #: much it fell short rather than just quoting a number.
+    fps: float = 30.0
 
     @property
     def served_fraction(self) -> float:
         return self.ticks_served / self.ticks_asked if self.ticks_asked else 1.0
 
+    @property
+    def budget_ms(self) -> float:
+        """The tick period the loop was asked to hold."""
+        return 1000.0 / self.fps if self.fps else 1000.0 / 30.0
+
     def lines(self) -> list[str]:
+        if self.sync is not None:
+            return self._sync_lines()
         out = [
             f"chunks              {self.chunks}",
             f"median model call   {self.model_ms:.0f} ms",
@@ -192,17 +336,48 @@ class TraceSummary:
                 f"loop served         {self.ticks_served}/{self.ticks_asked} ticks "
                 f"({self.served_fraction * 100:.0f}%)",
             ]
-        out += [
+        out += [self._gripper_line()]
+        return out
+
+    def _gripper_line(self) -> str:
+        return (
             f"gripper range       policy commanded {self.gripper_span[0]:+.3f} .. "
             f"{self.gripper_span[1]:+.3f}"
+        )
+
+    def _sync_lines(self) -> list[str]:
+        """The sync reading: the tick budget, and what is spending it.
+
+        Everything here is per cached tick except the model call and the pause,
+        because 29 ticks in 30 are cached ticks and they are the ones that have
+        to fit in the budget.
+        """
+        w = self.sync
+        assert w is not None
+        return [
+            f"chunks              {self.chunks} of {w.ticks} ticks",
+            f"loop rate           {w.cached_hz:.1f} Hz between pauses, "
+            f"{w.hz:.1f} Hz including them (target {self.fps:.0f} Hz)",
+            f"median tick         {w.period_ms:.1f} ms of a {self.budget_ms:.1f} ms budget"
+            + (f", p95 {w.period_p95_ms:.1f} ms" if w.period_p95_ms else ""),
+            f"  inference engine  {w.engine_ms:.1f} ms",
+            f"    preprocessor    {w.pre_ms:.1f} ms   (re-runs every tick)",
+            f"    select_action   {w.select_ms:.1f} ms   (serves the cached chunk)",
+            f"    postprocessor   {w.post_ms:.1f} ms",
+            f"  rest of the loop  {w.outside_ms:.1f} ms   "
+            f"(cameras, motor reads, limiter, dataset)",
+            f"median model call   {self.model_ms:.0f} ms, once per chunk",
+            f"  chunk pause       {w.infer_ms:.0f} ms of held position, once per "
+            f"{w.ticks} ticks",
+            self._gripper_line(),
         ]
-        return out
 
     def verdicts(self) -> list[str]:
         """Plain readings of the numbers. Empty when nothing is wrong."""
         out: list[str] = []
         if self.chunks == 0:
             return ["no actions were produced at all — the policy never ran"]
+        out += self._sync_verdicts()
         if self.rtc and self.served_fraction < STARVED_FRACTION:
             out.append(
                 f"THE QUEUE RAN DRY: the loop had an action to send on only "
@@ -233,6 +408,41 @@ class TraceSummary:
                 f"the policy never moved a gripper: its own output spanned {span:.3f} across "
                 f"the whole run. Nothing here says the inversion is right or wrong — the "
                 f"channel simply never changed, so it is still untested."
+            )
+        return out
+
+    def _sync_verdicts(self) -> list[str]:
+        """Readings that only exist under sync. Empty when the loop held its rate.
+
+        The threshold is one whole millisecond of overrun rather than a
+        percentage: at 30 Hz the budget is 33.3 ms and jitter of a few tenths is
+        the normal state of a loop that is keeping up.
+        """
+        w = self.sync
+        if w is None or w.period_ms <= self.budget_ms + 1.0:
+            return []
+        over = w.period_ms - self.budget_ms
+        out = [
+            f"THE LOOP IS SLOW: {w.period_ms:.1f} ms per cached tick against a "
+            f"{self.budget_ms:.1f} ms budget — {over:.1f} ms over, i.e. {w.cached_hz:.1f} Hz "
+            f"instead of {self.fps:.0f}. The inference engine is {w.engine_ms:.1f} ms of that "
+            f"and the rest of the loop is {w.outside_ms:.1f} ms."
+        ]
+        if w.pre_ms >= over:
+            out.append(
+                f"THE PREPROCESSOR ALONE COVERS THE OVERRUN: {w.pre_ms:.1f} ms per tick, "
+                f"against {over:.1f} ms of overrun. It re-packs all three camera views every "
+                f"tick, while select_action serves a cached row on 29 ticks in 30, so that "
+                f"work is thrown away 29 times per chunk. Lowering [capture.policy], or "
+                f"serving postprocessed actions from a local FIFO instead of calling "
+                f"select_action per tick, both remove it."
+            )
+        elif w.outside_ms >= over:
+            out.append(
+                f"THE COST IS OUTSIDE THE INFERENCE ENGINE: {w.outside_ms:.1f} ms per tick of "
+                f"cameras, motor reads, the limiter and the dataset write, against "
+                f"{over:.1f} ms of overrun. Nothing about the policy or the capture "
+                f"resolution will fix this one."
             )
         return out
 
@@ -329,6 +539,8 @@ class RolloutTrace:
     _raw: tuple[float, ...] = ()
     _robot: tuple[float, ...] = ()
     _images: dict = field(default_factory=dict)
+    #: The sync ticks since the last real inference call. Empty under RTC.
+    _window: list[TickCosts] = field(default_factory=list)
 
     # -- attach ------------------------------------------------------------- #
 
@@ -364,9 +576,19 @@ class RolloutTrace:
         inner_get = engine.get_action
 
         def get_action(obs_frame: Any) -> Any:
+            # Under sync this call *is* the tick: the whole pipeline runs inside
+            # it. Reset the model timer first so it reads nonzero only when
+            # ``select_action`` found its queue empty and really inferred.
+            syncing = not self.rtc
+            if syncing:
+                self._model_ms = 0.0
+            start = time.perf_counter()
             action = inner_get(obs_frame)
+            engine_ms = (time.perf_counter() - start) * 1000.0
             self.ticks_asked += 1
             self.ticks_served += action is not None
+            if syncing:
+                self._record_tick(start, engine_ms)
             return action
 
         engine.get_action = get_action
@@ -418,16 +640,91 @@ class RolloutTrace:
         self._post_ms = ms
         self._raw = _first_row(value)
         self._robot = _first_row(result)
-        if not self.rtc:
-            # Sync inference: the postprocessor is the last thing that happens to
-            # an action, so it is where a record has to be cut. There is no queue
-            # to have trimmed it and no delay to have been measured.
-            self._record_chunk(0, 0, 0)
 
-    def _record_chunk(self, real_delay: int, consumed: int, queue_after: int) -> None:
+    # -- sync windowing ----------------------------------------------------- #
+
+    def _record_tick(self, start: float, engine_ms: float) -> None:
+        """Fold one sync tick into the open window, closing it on an inference.
+
+        The postprocessor used to be where a record was cut, and under sync it
+        runs on every tick — so a 180 s run reported 4390 "chunks", each with a
+        total of zero. A chunk boundary under sync is the tick that actually ran
+        the model, and nothing else is.
+        """
+        tick = TickCosts(
+            start=start,
+            engine_ms=engine_ms,
+            pre_ms=self._pre_ms,
+            post_ms=self._post_ms,
+            model_ms=self._model_ms,
+        )
+        if tick.inferred and self._window:
+            # This tick opens a new window, so it also closes the previous one:
+            # its start is where the previous window's wall clock stops.
+            self._close_window(start)
+        self._window.append(tick)
+
+    def _close_window(self, end: float) -> None:
+        """Turn the open window into a :class:`ChunkRecord` and start a new one."""
+        window, self._window = self._window, []
+        head = window[0]
+        # The period of the last tick runs to ``end`` — the next window's first
+        # tick — which is the one period no later tick can supply.
+        starts = [tick.start for tick in window[1:]] + [end]
+        timed = [
+            TickCosts(
+                start=tick.start,
+                engine_ms=tick.engine_ms,
+                pre_ms=tick.pre_ms,
+                post_ms=tick.post_ms,
+                model_ms=tick.model_ms,
+                period_ms=(nxt - tick.start) * 1000.0,
+            )
+            for tick, nxt in zip(window, starts, strict=True)
+        ]
+        cached = [tick for tick in timed if not tick.inferred] or timed
+        periods = sorted(tick.period_ms for tick in cached)
+        self._record_chunk(
+            0,
+            0,
+            0,
+            sync=SyncWindow(
+                ticks=len(timed),
+                wall_ms=(end - head.start) * 1000.0,
+                engine_total_ms=sum(tick.engine_ms for tick in timed),
+                infer_ms=head.engine_ms,
+                period_ms=statistics.median(periods),
+                period_p95_ms=periods[min(len(periods) - 1, int(0.95 * len(periods)))],
+                engine_ms=statistics.median([t.engine_ms for t in cached]),
+                pre_ms=statistics.median([t.pre_ms for t in cached]),
+                post_ms=statistics.median([t.post_ms for t in cached]),
+                select_ms=statistics.median([t.select_ms for t in cached]),
+                outside_ms=statistics.median([t.outside_ms for t in cached]),
+            ),
+            model_ms=head.model_ms,
+        )
+
+    def close(self) -> None:
+        """Close any window still open, so the last chunk is not silently lost.
+
+        Called at the end of a run. A no-op under RTC, and a no-op when the run
+        stopped exactly on a chunk boundary.
+        """
+        if self._window:
+            self._close_window(time.perf_counter())
+
+    def _record_chunk(
+        self,
+        real_delay: int,
+        consumed: int,
+        queue_after: int,
+        *,
+        sync: SyncWindow | None = None,
+        model_ms: float | None = None,
+    ) -> None:
         record = ChunkRecord(
             index=len(self.chunks),
-            model_ms=self._model_ms,
+            model_ms=self._model_ms if model_ms is None else model_ms,
             pre_ms=self._pre_ms,
             post_ms=self._post_ms,
             total_ticks=real_delay,
@@ -435,6 +732,7 @@ class RolloutTrace:
             queue_after=queue_after,
             raw=self._raw,
             robot=self._robot,
+            sync=sync,
             _tick_ms=1000.0 / self.fps if self.fps else 1000.0 / 30.0,
         )
         self.chunks.append(record)
@@ -477,9 +775,14 @@ class RolloutTrace:
             for key, value in zip(ACTION_KEYS, values, strict=False):
                 rr.log(f"{name}/{key}", rr.Scalars(float(value)))
 
-        rr.log("rtc/queue_after_merge", rr.Scalars(float(record.queue_after)))
-        rr.log("rtc/chunk_ms", rr.Scalars(float(record.total_ms)))
-        rr.log("rtc/starved_ticks", rr.Scalars(float(record.starved)))
+        if record.sync is not None:
+            rr.log("sync/loop_hz", rr.Scalars(record.sync.cached_hz))
+            rr.log("sync/tick_ms", rr.Scalars(record.sync.period_ms))
+            rr.log("sync/pause_ms", rr.Scalars(record.sync.infer_ms))
+        else:
+            rr.log("rtc/queue_after_merge", rr.Scalars(float(record.queue_after)))
+            rr.log("rtc/chunk_ms", rr.Scalars(float(record.total_ms)))
+            rr.log("rtc/starved_ticks", rr.Scalars(float(record.starved)))
 
     # -- reporting ---------------------------------------------------------- #
 
@@ -507,6 +810,31 @@ class RolloutTrace:
             queue_after=int(median([float(c.queue_after) for c in self.chunks])),
             gripper_span=(min(grippers), max(grippers)) if grippers else (0.0, 0.0),
             rtc=self.rtc,
+            sync=self._sync_summary(),
+            fps=self.fps or 30.0,
+        )
+
+    def _sync_summary(self) -> SyncWindow | None:
+        """Medians of the per-chunk medians, so one long hitch cannot set the story."""
+        windows = [c.sync for c in self.chunks if c.sync is not None]
+        if not windows:
+            return None
+
+        def med(pick: Any) -> float:
+            return statistics.median([pick(w) for w in windows])
+
+        return SyncWindow(
+            ticks=int(med(lambda w: float(w.ticks))),
+            wall_ms=med(lambda w: w.wall_ms),
+            engine_total_ms=med(lambda w: w.engine_total_ms),
+            infer_ms=med(lambda w: w.infer_ms),
+            period_ms=med(lambda w: w.period_ms),
+            period_p95_ms=med(lambda w: w.period_p95_ms),
+            engine_ms=med(lambda w: w.engine_ms),
+            pre_ms=med(lambda w: w.pre_ms),
+            post_ms=med(lambda w: w.post_ms),
+            select_ms=med(lambda w: w.select_ms),
+            outside_ms=med(lambda w: w.outside_ms),
         )
 
 
@@ -568,12 +896,3 @@ def model_input_images(batch: Any) -> dict[str, Any]:
         return images
     except Exception:  # noqa: BLE001 - a trace must never break a rollout
         return {}
-        if array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
-            array = array.transpose(1, 2, 0)
-        if array.dtype != np.uint8:
-            # Normalised floats live in [0, 1]; anything wider is already 0..255.
-            scale = 255.0 if float(array.max(initial=0.0)) <= 1.0 else 1.0
-            array = np.clip(array * scale, 0, 255).astype(np.uint8)
-        return array
-    except Exception:  # noqa: BLE001 - a trace must never break a rollout
-        return None

@@ -399,6 +399,9 @@ def _echo_trace_summary(trace) -> None:
     """The end-of-run reading of the trace. Printed after the arms have stopped."""
     if trace is None:
         return
+    # Under sync the last window is still open when the run ends; close it so the
+    # final chunk is counted rather than silently dropped.
+    trace.close()
     summary = trace.summary()
     typer.secho("\ninference and queue", bold=True)
     for line in summary.lines():
