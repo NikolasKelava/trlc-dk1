@@ -841,6 +841,59 @@ model's view track. `dk1lab/modelview.py`:
   `_ensure_blueprint` returns early when it is already set. A coupling to an
   upstream implementation detail, written down as one.
 
+### OPEN: the 27.7 Hz loop, and a trace that lies under `--sync`
+
+Reported after the retune, from a rollout log. **Not diagnosed. This is the next
+session's job.** Two separate things:
+
+```
+chunk 4390      0 ms =  0 ticks (model 132 · pre 27 · post 0 · other -160)  consumed  0  queue ->  0
+WARNING lerobot.rollout.strategies.base: Record loop is running slower (27.7 Hz) than the target FPS (30 Hz)
+```
+
+**A. The loop is 2.3 Hz short.** 27.7 Hz is 36.1 ms per tick against a 33.3 ms
+budget. The leading suspect is **this repo's own change**: `SyncInferenceEngine.
+get_action` (`rollout/inference/sync.py:114`) runs `preprocessor → select_action
+→ postprocessor` **every tick**. `select_action` serves from the cached 30-step
+chunk on 29 ticks out of 30, but the preprocessor does not — MolmoAct2's image
+packing re-runs on all three views every single tick. Measured here, GPU only:
+
+| `[capture.policy]` | preprocessor, per tick |
+| --- | --- |
+| 640×360 | **6.1 ms** |
+| 1280×720 (current) | **11.0 ms** |
+
+So raising the capture to 1280×720 on 2026-08-20 added ~4.9 ms to *every* tick,
+and the in-situ trace reports `pre 27` — higher again, presumably contention with
+the three camera decode threads. That is the right order of magnitude to explain
+the shortfall, and it is **not confirmed**: nobody has yet correlated the two by
+re-running the same rollout at 640×360.
+
+LeRobot knows about this. There is a comment block directly above the class
+naming the fix — drive the policy via `predict_action_chunk` and serve a local
+FIFO of postprocessed actions — and listing why upstream has not done it (SAC,
+ACT temporal ensembling and the Diffusion obs-history queues all depend on
+`select_action`'s side effects). MolmoAct2 has none of those dependencies.
+
+Three ways out, in increasing order of nerve: revert `[capture.policy]` to
+640×360 and accept the 378-row upsample; drop the loop to 25 Hz; or build the
+FIFO upstream sketched. Do not pick one before measuring which tick actually
+overruns — `--trace` already breaks the cost out, once B is fixed.
+
+**B. `--trace` reports nonsense under `--sync`, and B blocks A.** `chunk 4390` in
+a 180 s run is ~one "chunk" per *tick*, not one per 30. `_record_post` cuts a
+record at the postprocessor, and the sync engine runs the postprocessor every
+tick — so `total_ms` is measured across something that is not a chunk boundary
+(hence `0 ms = 0 ticks`) and `other = total − (model+pre+post)` goes **negative**
+(−160). `consumed` and `queue` are meaningless here by design. The `model 132` is
+real but is the *cached* `select_action` path on most ticks, not an inference.
+Fix the accounting before trusting any number in A.
+
+Note what is **not** wrong in that log: the `policy` and `robot` rows differ
+because one is the raw normalised model output and the other is post-
+unnormalisation, which is the whole point of printing both. `grip L +0.984 →
++0.016` is the gripper inversion working, so that run had `--invert-gripper` on.
+
 ### The sim run: the policy behaves the same way with every hardware excuse removed
 
 `sai-prasanna/molmoact2`'s `sim_eval` is a **pure HTTP client** — it posts three
