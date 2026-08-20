@@ -14,6 +14,7 @@ from typing import Annotated
 import typer
 
 from ..cameras import crop_summary
+from ..modelview import DEFAULT_EVERY
 from ..config import DEFAULT_CONFIG_PATH, load
 from ..teleop import DEFAULT_FPS, TELEOP_LIMITS, build, run
 from .safety import LEADER_HELP, MOTION_HELP, confirm_motion
@@ -38,7 +39,15 @@ which is worth doing before the first run on new hardware."""
 )
 
 
-def _report(follower, leader, *, fps: int, display: bool, duration_s: float | None) -> None:
+def _report(
+    follower,
+    leader,
+    *,
+    fps: int,
+    display: bool,
+    duration_s: float | None,
+    model_input: bool = False,
+) -> None:
     """Print what is about to run — shared by --dry-run and the real thing."""
     typer.secho("leader", bold=True)
     typer.echo(f"  left  {leader.config.left_arm_port}")
@@ -77,6 +86,11 @@ def _report(follower, leader, *, fps: int, display: bool, duration_s: float | No
     typer.secho("\nloop", bold=True)
     typer.echo(f"  target {fps} Hz" + (f", stopping after {duration_s}s" if duration_s else ""))
     typer.echo(f"  rerun visualisation {'on' if display else 'off'}")
+    if model_input:
+        typer.echo(
+            f"  model's-eye view    on, sampled 1 tick in {DEFAULT_EVERY}"
+            f" (~{fps / DEFAULT_EVERY:.0f} Hz) under policy_input/"
+        )
 
 
 def teleop(
@@ -86,6 +100,17 @@ def teleop(
     ] = True,
     display: Annotated[
         bool, typer.Option("--display", help="Stream observations to Rerun. Implies --cameras.")
+    ] = False,
+    display_policy_input: Annotated[
+        bool,
+        typer.Option(
+            "--display-policy-input",
+            help=(
+                "Also show what the POLICY would be handed — the 378x378 tensors from "
+                "the real checkpoint preprocessor — beside the camera view. "
+                "Implies --display. No model weights are loaded and no GPU is used."
+            ),
+        ),
     ] = False,
     fps: Annotated[int, typer.Option("--fps", help="Target loop rate, Hz.")] = DEFAULT_FPS,
     profile: Annotated[
@@ -122,6 +147,10 @@ def teleop(
         raise typer.BadParameter(f"control mode must be impedance or pos_vel, got {control_mode!r}")
     if fps <= 0:
         raise typer.BadParameter(f"--fps must be positive, got {fps}")
+    if display_policy_input:
+        # It logs into the same Rerun session and the loop only calls the
+        # observation processor when displaying, so on its own it would be inert.
+        display = True
     if display and not cameras:
         raise typer.BadParameter("--display needs cameras; drop --no-cameras.")
 
@@ -145,7 +174,14 @@ def teleop(
         control_mode=control_mode,
         limits=limits,
     )
-    _report(follower, leader, fps=fps, display=display, duration_s=duration_s)
+    _report(
+        follower,
+        leader,
+        fps=fps,
+        display=display,
+        duration_s=duration_s,
+        model_input=display_policy_input,
+    )
 
     if dry_run:
         typer.secho("\n--dry-run: nothing was connected and nothing moved.", fg=typer.colors.GREEN)
@@ -156,8 +192,34 @@ def teleop(
         assume_yes=assume_yes,
         notes=["Connecting a LEADER also torques its gripper open: fingers out of the triggers."],
     )
+    # Built before connecting: it reads a checkpoint off disk and that is a
+    # second or so of work with the arms already energised if it is left later.
+    model_view = None
+    if display_policy_input:
+        from ..modelview import ModelInputProbe, build_preprocessor
+
+        capture = settings.profile(profile)
+        typer.echo("loading the checkpoint's preprocessor (no model weights, no GPU) ...")
+        preprocessor, features = build_preprocessor(
+            str(settings.policy.checkpoint), width=capture.width, height=capture.height
+        )
+        model_view = ModelInputProbe(None, preprocessor, features)
+
     typer.secho("\nCtrl-C to stop. Stopping does not move the arms.\n", fg=typer.colors.GREEN)
-    run(leader, follower, fps=fps, display=display, duration_s=duration_s)
+    run(
+        leader,
+        follower,
+        fps=fps,
+        display=display,
+        duration_s=duration_s,
+        model_view=model_view,
+    )
+    if model_view is not None and model_view.failed:
+        typer.secho(
+            f"\nthe model-input view stopped after an error: {model_view.failed}",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
     typer.secho("\nteleop ended; both devices disconnected.", fg=typer.colors.GREEN)
 
 

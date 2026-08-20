@@ -26,6 +26,8 @@ What this module owns is everything around that loop:
 
 from __future__ import annotations
 
+from typing import Any
+
 from lerobot_robot_trlc_dk1.bi_leader import BiDK1Leader, BiDK1LeaderConfig
 
 from .cameras import camera_configs
@@ -158,6 +160,7 @@ def run(
     fps: int = DEFAULT_FPS,
     display: bool = False,
     duration_s: float | None = None,
+    model_view: Any | None = None,
 ) -> None:
     """Connect, run LeRobot's teleop loop, and disconnect. **Moves the arms.**
 
@@ -168,6 +171,10 @@ def run(
     Args:
         display: stream observations to Rerun. Needs cameras to be worth much.
         duration_s: stop after this long. ``None`` runs until interrupted.
+        model_view: an optional :class:`dk1lab.modelview.ModelInputProbe` to wrap
+            the observation processor with, adding the model's-eye view to the
+            same Rerun session. Implies ``display``: it logs to Rerun, and the
+            loop only calls the observation processor at all when displaying.
     """
     # Imported here, not at module scope: pulling in LeRobot's script module
     # drags in every first-party robot and teleoperator class, which is a slow
@@ -176,16 +183,28 @@ def run(
     from lerobot.scripts.lerobot_teleoperate import teleop_loop
     from lerobot.utils.visualization_utils import init_visualization, shutdown_visualization
 
+    from .modelview import pin_blueprint
+
     teleop_action_processor, robot_action_processor, robot_observation_processor = (
         make_default_processors()
     )
 
     if display:
         init_visualization("rerun", session_name="dk1-teleop")
+    if model_view is not None:
+        # Wrap, do not replace: the probe forwards to the processor LeRobot built
+        # and only adds a side effect. Pinning the layout has to happen after
+        # init_visualization, which clears the blueprint cache the pin fills.
+        model_view.inner = robot_observation_processor
+        robot_observation_processor = model_view
+        pin_blueprint()
 
     # Leader first: it is the passive half, and connecting it before the
     # followers are live means a hand already resting on a leader arm cannot
     # command anything yet.
+    if model_view is not None:
+        model_view.start()
+
     leader.connect()
     follower.connect()
     try:
@@ -206,6 +225,10 @@ def run(
         # the arms, and there is no return-to-home here by design: sweeping the
         # arms home is the last thing you want when you stopped because
         # something was wrong.
+        # The worker first: it logs to Rerun, so it has to be quiet before the
+        # recording stream is shut down.
+        if model_view is not None:
+            model_view.stop()
         if display:
             shutdown_visualization("rerun")
         follower.disconnect()

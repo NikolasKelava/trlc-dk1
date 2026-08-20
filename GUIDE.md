@@ -263,7 +263,8 @@ it separately with `dk1 policy home` (section 6).
 
 ```bash
 uv run dk1 teleop --no-cameras          # arms only; cheaper loop
-uv run dk1 teleop --display             # stream to Rerun
+uv run dk1 teleop --display             # stream the cameras to Rerun
+uv run dk1 teleop --display-policy-input   # ...and what the POLICY would be handed
 uv run dk1 teleop --fps 30              # slower loop
 uv run dk1 teleop --max-joint-rate 0.6  # impose a cap for this run
 uv run dk1 teleop --duration 20         # stop by itself after 20 s
@@ -279,6 +280,25 @@ turning it off makes the loop faster as well as smoother.
 Impose one for a single run with `--max-joint-rate 0.8`, or permanently by editing
 `[limits.teleop]` in `dk1.toml`. Policy rollout is a different activity and keeps
 its own, much tighter, limit.
+
+**Watching the cameras.** `--display` opens Rerun and streams all three views
+live, at `[capture.teleop]` resolution and with the wrist crop already applied —
+so what you see is what this cell produces for a recording or a rollout.
+
+**`--display-policy-input`** adds a second row: the **378x378 tensors the policy
+would actually be handed**, produced by running the checkpoint's real
+preprocessor on each observation. That is a different picture from the top row —
+between them sit a rename, a fixed key order, a channel-layout change and a
+resize to a square — and this is the only way to see it without starting a
+rollout. Move a wrist by hand and watch the bottom row track: if the orientation,
+framing or ordering is wrong anywhere in the policy pipeline, it shows up here.
+
+It implies `--display`. It loads **no model weights and uses no GPU** — only the
+saved preprocessor and the HF image processor, about 0.6 s off disk. And it costs
+the control loop nothing: the work runs on a background thread and one tick in 12
+is sampled, so the worst tick measured is 5 ms against a 16.7 ms budget at 60 Hz.
+If a frame arrives while the thread is busy it is dropped rather than queued —
+a stale picture is worth less than a loop that keeps time.
 
 **Camera names are not an option.** They are always `top` / `left` / `right`,
 because that is what the MolmoAct2 checkpoint requires and therefore what

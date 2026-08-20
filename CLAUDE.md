@@ -41,10 +41,11 @@ dk1lab/                 everything this fork adds; the only Python we own
   teleop.py             the one teleoperation implementation
   policy.py             MolmoAct2 deployment: smoke / dryrun / rollout
   trace.py              per-chunk latency, queue depth, and the policy's OWN action
+  modelview.py          the model's-eye view, live, during teleoperation
   serve.py              the /act HTTP endpoint sim_eval drives — no robot
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
-tests/                  387 tests, none need hardware
+tests/                  483 tests, none need hardware
 GUIDE.md                operator docs
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
@@ -814,6 +815,28 @@ orientation: arms energised, nothing sent, and Rerun carries both the robot-side
 view under `--display` and the model's own 378×378 under `policy_input/`.
 Verified here against the live cameras: upright, correctly ordered, correctly
 stretched.
+
+**`dk1 teleop --display-policy-input` does the same thing while you drive**,
+which is the better place for it: you can move a wrist by hand and watch the
+model's view track. `dk1lab/modelview.py`:
+
+- It builds the checkpoint's **preprocessor only** — `make_pre_post_processors`
+  reads `policy_preprocessor.json` and the HF image processor and never touches
+  the 10 GiB of weights. 0.6 s on the CPU, no GPU.
+- It **attaches by wrapping**, like `dk1lab/trace.py`: `ModelInputProbe` proxies
+  the observation processor `teleop_loop` already calls, returns its result
+  untouched, and logs as a side effect. The loop stays upstream's.
+- The work runs on a **background thread**. One pass costs ~11 ms and the 60 Hz
+  budget is 16.7, so inline sampling would drop ticks; measured with the thread,
+  the worst tick is 5.0 ms and the median 1.6 ms. One tick in 12 is sampled and
+  anything arriving while the worker is busy is **dropped, not queued**.
+- It **pins the Rerun layout**, and that is not optional. `log_rerun_data` builds
+  a blueprint from the first observation it sees and caches it on itself; that
+  blueprint is an explicit grid, so `policy_input/*` — which never passes through
+  it — would get no view and be invisible until the operator built one by hand.
+  Filling the cache before the loop starts is what stops that, because
+  `_ensure_blueprint` returns early when it is already set. A coupling to an
+  upstream implementation detail, written down as one.
 
 ### The sim run: the policy behaves the same way with every hardware excuse removed
 
