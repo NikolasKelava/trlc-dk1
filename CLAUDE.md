@@ -211,17 +211,22 @@ Checkpoint: `lerobot/MolmoAct2-BimanualYAM-LeRobot` (LeRobot format);
 - **Camera geometry from the colleague's sim**: 640×360 (16:9), top cam on the
   base at `p=[0.15, 0, 0.8]` pitched ~60° down (D435i, 69.4° HFOV), wrist cams on
   `link6-7` at `p=[0.076, 0, 0.094]` (D405, 87° HFOV), arms at y = ±0.24 m both
-  facing +X (not mirrored). Our Innomaker U30CAM-4K have neither FOV — a
-  divergence we cannot fix in software.
+  facing +X (not mirrored). Our Innomaker U30CAM-4K have neither FOV. The old
+  line here said this was "a divergence we cannot fix in software" and that is
+  **wrong in one direction**: a camera whose FOV is too *wide* can be cropped
+  down to the trained one, and only a too-narrow one is unfixable. That crop is
+  the agreed next step — see *The third rollout*.
 
 ## Evidence status — keep this line sharp
 
-Nothing about MolmoAct2 on the real DK1 has been **evaluated**. No dataset
-recorded, no fine-tune completed, no rollout scored. The policy has now driven
-these arms twice and moved toward the target both times, which is not nothing —
-but it is an impression, not a result, and the second run was still stalling for
-most of every second. That line stays sharp: a policy that reaches is not a
-policy that works.
+Nothing about MolmoAct2 on the real DK1 has been **scored**. No dataset
+recorded, no fine-tune completed, no success rate measured on the arms. The
+policy has now driven these arms three times. The third run — after the limit
+and engine changes below — moves **smoothly, without stalling**, visually
+tracks the dice and reaches for it, and **misaligns the gripper with the dice**.
+That is a real, specific, diagnosable failure rather than an impression, and it
+is a long way from where the first two runs were. But it is still not a scored
+result: a policy that reaches is not a policy that works.
 
 **In simulation, on 2026-08-20, our checkpoint scored 3/3.** That reverses the
 0/10 recorded here a day earlier, and the thing that changed was the episode
@@ -331,7 +336,7 @@ ports is open any more.
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
-| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms twice**; judder fixed, the stall is diagnosed but not fixed |
+| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms three times**; judder and stall both fixed, it tracks and reaches, gripper misaligns |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **run: 3/3 with a 120 s budget; 0/10 was a too-short episode** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
@@ -395,10 +400,12 @@ false. `--home` is the one opt-in: it runs `dk1lab.home` rather than LeRobot's
 teardown sweep. The pose has been captured on the arms; **the sweep itself has
 still not run on them** — its logic is tested only against fakes.
 
-All four have been run, `run` twice. The first was juddering and stalling; the
-judder was found and fixed. The second judders much less, still stalls, and
-reacts less to the scene — diagnosed to a 900 ms in-situ chunk latency, not yet
-fixed. See *The first rollout* and *The second rollout*, below.
+All four have been run, `run` three times. The first juddered and stalled; the
+judder was found and fixed. The second juddered much less, still stalled, and
+reacted less to the scene — diagnosed to a 900 ms in-situ chunk latency. The
+third, after the limit raise and the switch to `--sync`, is **smooth and does
+not stall**: it tracks the dice and reaches for it, but misaligns the gripper.
+See *The first rollout*, *The second rollout* and *The third rollout*, below.
 
 Two things in the bf16 checkpoint's `config.json` are wrong for us and are
 overridden at load: `"device": "cpu"` and a stale absolute `pretrained_path`.
@@ -578,15 +585,53 @@ queue's `merge` is wrapped on the instance. `attach` runs after `build_context`
 so `prewarm`'s cold call is not counted as a chunk; `attach_queue` runs after
 `strategy.setup`, because the RTC queue does not exist until `engine.start()`.
 
-What remains for this phase: re-run the rollout with the fixes, hand on the
-e-stop, and report what happens plainly — including "it does nothing useful".
-The home pose is captured (see below); what is still unwatched is the *sweep*.
-Run `dk1 policy home` on its own, from a pose the arms are not already in,
-before putting `--home` on a rollout — that is both arms moving along a path no
-hardware has seen yet.
+What remains for this phase: **the camera field of view**. The motion faults
+are closed and the failure is now spatial — see *The third rollout*. Measure the
+three cameras' actual HFOV, then crop toward the 69.4° (top) / 87° (wrist) the
+checkpoint was trained on. After that, a scored run: labelled attempts with a
+success count, which is the input to the Phase 4 decision.
+
+Still unwatched, and unchanged by any of this: the home *sweep*. The pose is
+captured, but run `dk1 policy home` on its own, from a pose the arms are not
+already in, before putting `--home` on a rollout — that is both arms moving
+along a path no hardware has seen yet. And the gripper inversion has never been
+seen to open and close correctly on the arms.
 
 **Phase 4** — record → LoRA from the same checkpoint → deploy → scored, labelled
 eval attempts.
+
+### The third rollout: smooth, tracking, and misaligned
+
+Run on the arms 2026-08-20, after raising `[limits.policy]` to
+`max_joint_rate = 1.0` / `max_lag = 0.4` and defaulting `dk1 policy run` to
+`--sync`. Reported by Nikolas, task "pick up the dice":
+
+- **Motion is very smooth.** The judder is gone and stayed gone.
+- **It does not really stall any more.** The `--sync` change did what the trace
+  predicted it would: with `n_action_steps = 30` the engine executes the whole
+  chunk instead of letting RTC discard 27 of every 30 rows.
+- **It tracks the dice and moves toward it.** Visual servoing works — the policy
+  is grounded on the object and drives the arms at it.
+- **It misaligns the gripper with the dice.** This is now the failure.
+
+So the timing faults are closed and the remaining problem is **spatial**, which
+is a different class of bug and points somewhere specific: the cameras. The
+checkpoint was trained on a top view at 69.4° HFOV and wrist views at 87°
+(D435i / D405 in the colleague's sim). Our Innomaker U30CAM-4K match neither.
+A policy that has learned "the gripper is aligned when the object appears *here*,
+at *this* size" will be systematically off if the lens maps the world onto the
+sensor differently than in training — which is exactly a consistent misalignment
+on top of correct tracking.
+
+**The next step is therefore to crop the camera images to the trained field of
+view**, not to touch the policy. Cropping only works in the direction of a
+too-wide lens; measuring the actual HFOV of the three cameras is the first task,
+because if ours are narrower than 69.4° / 87° no crop can recover it and the
+answer becomes fine-tuning (Phase 4) or different optics.
+
+Two things still not established by this run, and worth stating: nothing was
+**scored** (no success/failure count over labelled attempts), and the gripper
+inversion was still never *watched* to open and close correctly on the arms.
 
 ### The sim run: the policy behaves the same way with every hardware excuse removed
 
