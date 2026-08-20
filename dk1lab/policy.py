@@ -81,14 +81,29 @@ logger = logging.getLogger(__name__)
 
 #: The speed limit rollout runs under when ``dk1.toml`` says nothing.
 #:
-#: **Capped**, unlike teleoperation. 0.3 rad/s is about 17 deg/s: slow enough to
-#: watch a mistake develop and reach the e-stop. The gripper is not slowed to
-#: match — a gripper that takes three seconds to close fails every grasp, and it
-#: is not the hazard here.
+#: **Capped**, unlike teleoperation, but no longer timid. Both numbers were
+#: raised on 2026-08-20 from measurement rather than from caution:
+#:
+#: ``max_joint_rate`` 0.3 -> 1.0 rad/s. A recorded 120 s sim episode of this
+#: checkpoint demands a median of 0.036 rad/s but a p95 of 0.31 and peaks of
+#: 4.56 — bursty, not fast. Replayed through :class:`~dk1lab.limiter.SlewLimiter`,
+#: a 0.3 cap leaves the worst joint 0.98 rad (56 deg) behind the policy's intent
+#: on 26% of ticks; 1.0 cuts that to 0.40 rad on 3.3%; 2.0 is transparent.
+#:
+#: ``max_lag`` 0.1 -> 0.4 rad. This is a **torque** limit wearing a position
+#: clamp's costume: impedance torque is ``arm_kp * (q_des - q)`` with
+#: ``arm_kp = [100, 100, 100, 20, 20, 10]``, so a 0.1 rad lead cap held the PD
+#: torque to 10 Nm on j1-j3 (motor limit 28) and 1 Nm on j6 (limit 10). Since
+#: the limiter stores the *clamped* value as the new previous command, a joint
+#: that cannot break stiction inside 0.1 rad stalls there silently forever —
+#: the very deadlock :mod:`dk1lab.limiter` was designed to avoid.
+#:
+#: The gripper is not slowed to match — a gripper that takes three seconds to
+#: close fails every grasp, and it is not the hazard here.
 POLICY_LIMITS = LimitProfile(
-    max_joint_rate=0.3,
+    max_joint_rate=1.0,
     max_gripper_rate=1.0,
-    max_lag=0.1,
+    max_lag=0.4,
     max_dt=0.1,
 )
 

@@ -132,8 +132,9 @@ So home is "zero pose, grippers open", not an arbitrary resting position.
   reached by `dk1 policy run --home` and `dk1 policy home`. LeRobot's built-in
   return-to-home is wrong here on three counts and is not used: it targets the
   connect-time pose; it interpolates for a fixed 3 s and disconnects whether or
-  not the arms arrived (behind the 0.3 rad/s cap, anything over ~0.9 rad cannot
-  finish); and it fires from `teardown` on every exit path including a crash.
+  not the arms arrived (behind the speed cap — anything over ~3 rad at the
+  current 1.0 rad/s, and it was ~0.9 rad when the cap was 0.3 — cannot finish);
+  and it fires from `teardown` on every exit path including a crash.
   Ours ramps from the previous command at the cap the run drove under, tests
   arrival against the *measurement*, derives its timeout from the distance, runs
   on a clean end only (duration limit or Ctrl-C — `policy.ended_cleanly`), and
@@ -222,10 +223,17 @@ but it is an impression, not a result, and the second run was still stalling for
 most of every second. That line stays sharp: a policy that reaches is not a
 policy that works.
 
-It now also scores **0/10 in the colleague's own simulator**, on the checkpoint's
-own embodiment, with perfect tracking and none of this cell's timing or
-gripper-sign problems — see *The sim run*, below. That is the strongest evidence
-yet, and it points at the policy rather than at us.
+**In simulation, on 2026-08-20, our checkpoint scored 3/3.** That reverses the
+0/10 recorded here a day earlier, and the thing that changed was the episode
+budget, not the policy: 3600 steps (120 s) instead of 800 (27 s). The policy
+barely acts for the first ~30 s and successful episodes average 54 s, so every
+earlier run was scored before it had a chance to finish. Sai's reference HF
+server, same task and budget, scored about 50%. See *The sim run*, below.
+
+So the policy works zero-shot on its own embodiment, and our LeRobot bf16
+packaging is not merely correct but ahead of the reference path. What remains
+unevaluated is this **cell** — no rollout on the arms has been scored, and the
+two that ran were both cut short by timing faults.
 
 The zero-shot case rests on the colleague's sim work
 (`sai-prasanna/molmoact2`, branch **`sim-eval-dk1`**, single commit `797b179`).
@@ -276,8 +284,11 @@ sent):
   `left_joint_4` at 0.065 rad (3.7°); everything else under 0.02 rad. Nothing
   would lurch.
 - **The chunk's own speed is ~0.2 rad/s** — 0.0065 rad per step at 30 Hz, read
-  off one 30-step chunk unrolling against a frozen robot. That sits just under
-  the 0.3 rad/s cap, so the limiter is a bound rather than a brake.
+  off one 30-step chunk unrolling against a frozen robot. Read at the time as
+  "the limiter is a bound rather than a brake", and that reading was **wrong**:
+  one chunk from a resting start is the calmest part of a run. Measured over a
+  whole 120 s episode the demand is bursty — median 0.036 rad/s but p95 0.31 and
+  peaks of 4.56. See *What the caps were doing*.
 - **The gripper command is consistent with the inversion.** The model output
   ≈0.99 ("open" in YAM) and the arms were told ≈0.008 ("open" on the DK1).
   Uninverted, the first tick would have commanded 0.99 = fully closed. Still not
@@ -321,7 +332,7 @@ ports is open any more.
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
 | **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms twice**; judder fixed, the stall is diagnosed but not fixed |
-| **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **run: 0/10, and it is not the plumbing** |
+| **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **run: 3/3 with a 120 s budget; 0/10 was a too-short episode** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
 **Phase 1** — done. Built `dk1 find cameras` (preview a still per candidate with
@@ -378,7 +389,8 @@ default) and `--display-policy-input`. `--invert-gripper` is now off by default.
 `dk1lab/policy.py` is the single implementation; `dk1lab/checkpoint.py` is the
 JSON-only reader behind `check`. Settings are decided in code, not left to a
 command line: gripper inversion on, image keys pinned, `inference_action_mode
-= continuous`, bf16 on cuda, RTC by default, `return_to_initial_position` forced
+= continuous`, bf16 on cuda, **sync by default** (RTC starved the queue on the
+arms; see *The stall*), `return_to_initial_position` forced
 false. `--home` is the one opt-in: it runs `dk1lab.home` rather than LeRobot's
 teardown sweep. The pose has been captured on the arms; **the sweep itself has
 still not run on them** — its logic is tested only against fakes.
@@ -394,9 +406,10 @@ overridden at load: `"device": "cpu"` and a stale absolute `pretrained_path`.
 tag is `yam_dual_molmoact2`, the vectors are 14-D, and the saved preprocessor
 pins top/left/right. That is a file check, not a result.
 
-The speed cap lives in `[limits.policy]`: **0.3 rad/s**, about 17 deg/s. Timid on
-purpose; it is the first number to raise once the policy has been watched, and it
-must not be turned off for a rollout the way teleop's is.
+The speed cap lives in `[limits.policy]`: **1.0 rad/s** (~57 deg/s) and
+**`max_lag` 0.4 rad**, raised from 0.3 / 0.1 on 2026-08-20 from measurement —
+see *What the caps were doing*, below. It must still not be turned off for a
+rollout the way teleop's is.
 
 The checkpoint path lives in `[policy]` in `dk1.toml` rather than in Python, for
 the same reason the ports do. `~` is expanded.
@@ -593,58 +606,139 @@ not mention.
 Two structural differences from a rollout, both deliberate and both *in our
 favour* for this experiment:
 
-- **No RTC.** `sim_eval` blocks on each response, so there is no deadline, no
-  latency to compensate, no queue to starve and no seam to blend. Every timing
-  fault found on the arms is absent by construction.
+- **No RTC.** `sim_eval` blocks on each response and executes the whole 30-step
+  chunk, so there is no deadline, no latency to compensate, no queue to starve
+  and no seam to blend. Read as a control for the arms' timing faults at first;
+  it turned out to be the *arrangement that works*, and `dk1 policy run` now
+  defaults to the same thing (`--sync`). See *The stall*.
 - **No gripper inversion.** The wire protocol *is* the YAM convention —
   `sim_eval`'s own `yam_state_adapter` sends `grip in [0,1] (1=open)` and
   `yam_action_adapter` maps `1.0` back to ManiSkill's `-1.0` = open. That is a
   **third** independent statement of the convention, and it means the sim tests
   the policy with the DK1's gripper sign out of the picture entirely.
 
-`BimanualYAMPutEverythingInBox-v1`, "put everything into the box", 10 episodes,
-800 steps: **success 0/10**. Also 0/3 at `--n-action-steps 10` and 0/3 at `5`,
-so it is not the 1-second open-loop chunk the repo defaults to.
+`BimanualYAMPutEverythingInBox-v1`, "put everything into the box".
 
-It is not the plumbing, and these are the numbers that say so (one 400-step
-episode, recorded state and action):
+**The first day's answer was 0/10, and it was wrong — the episodes were too
+short.** 800 steps is 27 s at 30 Hz. The policy barely acts for the first ~30 s,
+so every one of those episodes was scored before the policy had started. Also
+0/3 at `--n-action-steps` 10 and 5, which ruled out the open-loop chunk length
+and made the too-short-episode explanation look less likely than it was.
+
+**With 3600 steps (120 s), 2026-08-20:**
+
+| server | checkpoint | result |
+| --- | --- | --- |
+| `dk1 policy serve` | our LeRobot bf16 copy | **3/3** |
+| `examples/yam/host_server_yam.py` | `allenai/MolmoAct2-BimanualYAM`, HF | ~50% |
+
+Successful episodes averaged **1627 steps = 54 s**. So the policy does the task
+zero-shot on its own embodiment, and our packaging is not subtly wrong — it beat
+the reference path on the same task, budget and seed. That closes the one thing
+the previous round left open. Episode outcome is stochastic (flow-matching
+sampler, and the server holds its own RNG), so treat 3/3 vs ~50% as "ours is at
+least as good", not as a measured margin: a later single 3600-step episode at
+seed 42 recorded here did *not* succeed.
+
+Supporting numbers from a recorded 120 s episode (state and action logged every
+tick, correct 16-D `qpos` mapping — the sim interleaves left/right, `qpos[2k]`
+is left joint k+1 and `qpos[2k+1]` is right):
 
 | | |
 | --- | --- |
-| tracking, median \|commanded − measured\| per arm joint | **0.001 – 0.009 rad** |
-| right-arm travel, total per joint | up to **3.4 rad** |
-| left-arm travel, total per joint | 0.16 – 0.72 rad |
-| gripper state seen by the policy | **0.000 → 1.000, both hands** |
-| gripper commanded | left −1.00 → +0.83, right −1.00 → +0.45 |
+| tracking, median \|commanded − measured\| | **0.0018 rad** (p95 0.025) |
+| travel per arm joint, total | 5.2 – 17.9 rad |
+| demanded joint rate | median **0.036** rad/s, p95 **0.31**, max **4.56** |
+| gripper commanded | left −1.00 → +0.94, right −1.00 → +0.70 |
 
-The first row is the important one: the simulator executes what the policy asks
-to within a milliradian. Nothing is being lost between the model and the robot.
-The policy reaches with the right arm and **opens and closes both grippers** —
-so "the policy never actuates a gripper" is now dead as a hypothesis in sim, as
-it already is on hardware. It simply does not do the task.
+The simulator executes what the policy asks to within a couple of milliradians,
+and the policy opens and closes both grippers. The camera views were checked by
+eye and are well-formed.
 
-The camera views were checked by eye and are well-formed: an overhead view with
-the box, the lego and the tennis ball, and two wrist views.
-
-**What this does and does not establish.** On its own embodiment, in its own
-simulator, with its own gripper convention, perfect tracking, no latency and no
-queue, zero-shot MolmoAct2 scores 0/10 on the task the repo ships. That is the
-same *class* of behaviour seen on the arms — moves, reaches, does not accomplish
-— and it makes "the DK1 cell is what is breaking it" much harder to sustain.
-
-The one thing not yet ruled out is **this server versus the reference one**:
-`examples/yam/host_server_yam.py` loads `allenai/MolmoAct2-BimanualYAM` in HF
-format through `transformers`' `predict_action`, which is a different code path
-from our LeRobot bf16 copy. Running both and comparing is the last step that
-would close this, and it costs a ~20 GB download. Until then, "the policy is
-weak zero-shot here" and "our LeRobot packaging is subtly wrong" are not fully
-separated — though the perfect tracking and the sane action ranges argue hard
-for the first.
+**The gripper convention now has a fourth, behavioural confirmation.** The sim
+succeeds while mapping the policy's `1.0` to *open*. So the checkpoint really
+does speak YAM (1=open) and the DK1 really is 0=open — which means
+`--invert-gripper` is very likely **required** on hardware, and the current
+default of off is very likely wrong. Still not watched on the arms; still a flag.
 
 The colleague's `sim-eval-dk1` branch turns out to carry a **full DK1 in sim** —
 `bimanual_dk1.urdf`, the meshes, `robots/bimanual_dk1.py`, a DK1 task and DK1
 adapters — so running our own embodiment in sim is a checkout away, not a build.
 That is the agreed next step after YAM.
+
+### What the caps were doing, and the numbers that raised them
+
+Measured 2026-08-20 by recording a 120 s sim episode of this checkpoint and
+replaying its commanded joint targets through the **real** `SlewLimiter`.
+
+The policy's motion is **bursty, not fast**: median demand 0.036 rad/s, p95 0.31,
+peak 4.56. So the old 0.3 rad/s cap did not slow everything evenly — it truncated
+exactly the reach and transit moves and left the slow parts alone. 30% of ticks
+had at least one joint demanding more than the cap.
+
+Replayed through the limiter (best case: a perfectly tracking arm, so `max_lag`
+never binds — real hardware is worse):
+
+| cap | worst joint ends up behind the policy's intent | ticks >0.1 rad behind |
+| --- | --- | --- |
+| 0.3 rad/s (old) | **0.98 rad = 56°** | 25.6% |
+| **1.0 rad/s (now)** | 0.40 rad = 23° | 3.3% |
+| 2.0 rad/s | 0.10 rad | 0% |
+
+**`max_lag` was the worse of the two, and it is not a position clamp — it is a
+torque clamp.** Impedance torque is `arm_kp * (q_des − q)` with
+`arm_kp = [100, 100, 100, 20, 20, 10]`, so `max_lag = 0.1` held the PD torque to
+10 Nm on j1–j3 (motor limit 28), 2 Nm on j4/j5 (limit 10) and **1 Nm on j6**
+(limit 10) — a tenth of the wrist's authority, on the joints the policy drives
+fastest. And because `limiter.limit` writes the *clamped* value back into
+`_prev_cmd`, the command can never build more lead: a joint that cannot break
+stiction within 0.1 rad stalls there silently and permanently. That is precisely
+the deadlock `dk1lab/limiter.py`'s own docstring argues against when it explains
+why the ramp anchors to the previous command rather than to the measurement.
+Now **0.4 rad**. `joint_torque_limits` downstream is the thing that should be
+bounding torque, and it still is.
+
+Note the earlier "±1.8 rad excursion ÷ 0.3 rad/s = six seconds" argument was
+wrong in kind: ±1.8 rad was a *position range*, not a per-tick demand. Total
+travel on the busiest joint (17.9 rad over 120 s) averages 0.15 rad/s, under even
+the old cap. The cap's damage was to the peaks, not to the average.
+
+### The stall: what LeRobot does with a chunk, and why `--sync` is now the default
+
+Traced through LeRobot 0.6.1. `interpolation_multiplier` is 1, so there is no
+interpolation — one chunk row per tick:
+
+```
+RTC thread:   predict_action_chunk -> 30x14 -> postprocessor
+              -> ActionQueue.merge: blend with the previous tail,
+                 DISCARD real_delay rows from the front
+control loop: engine.get_action() -> one 14-D row -> ActionInterpolator
+              -> robot_action_processor
+              -> SafeBiDK1Follower.send_action   <- the limiter
+              -> command_joint_pos -> 250 Hz impedance server
+```
+
+**LeRobot does not clip actions anywhere.** The processor pipeline has no clamp
+on the action path; absolute joint angles pass through untouched. Everything that
+changes the numbers is RTC's blend, our limiter, or upstream's position/torque
+clamps. And when the queue is empty, `rollout/strategies/core.py:297` returns
+`None` and **nothing is sent at all** — the motor chain holds its last target and
+warns after `command_timeout_s = 0.5`. That is the stall, exactly.
+
+The fix is not a tuning constant. `n_action_steps` is 30 on this checkpoint and
+`select_action` serves from a 30-deep queue, so the **sync** engine executes the
+whole chunk and then blocks for one model call — which is byte-for-byte the
+arrangement `sim_eval` uses, and `sim_eval` scores 3/3. RTC, at the measured
+900 ms in-situ latency, discarded 27 of every 30 actions and delivered 100 ms of
+motion per second. Sync pays one visible pause per chunk and delivers all 30.
+
+`dk1 policy run` therefore defaults to `--sync`. `--rtc` is still there and is
+the right answer once in-situ inference is well under `chunk / fps` = 1 s; the
+620 ms of unexplained in-situ latency is still unexplained, and `dk1lab/trace.py`
+is still the instrument for it. Sync makes it non-blocking rather than solved.
+
+`--duration` now defaults to **180 s**, because the policy is slow: ~30 s before
+it does much, 54 s for a successful sim episode. A 30 s rollout cannot succeed.
 
 ## Environment
 

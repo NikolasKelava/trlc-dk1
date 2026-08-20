@@ -194,8 +194,10 @@ def test_dry_run_never_reaches_the_rollout(runner, config_file, checkpoint_dir, 
 def test_dry_run_shows_the_speed_cap_that_would_apply(
     runner, config_file, checkpoint_dir, no_motion
 ):
+    # The fixture config carries no [limits.policy], so this is POLICY_LIMITS —
+    # raised to 1.0 rad/s on 2026-08-20 from the measured chunk demand.
     output = dry_run(runner, config_file, checkpoint_dir).output
-    assert "0.3 rad/s" in output
+    assert "1.0 rad/s" in output
 
 
 def test_dry_run_shows_when_the_cap_has_been_removed(
@@ -234,10 +236,24 @@ def test_home_says_which_pose_it_would_use_when_the_file_names_none(
     assert "captured at connect" in output
 
 
-def test_rtc_is_the_default_for_a_seven_billion_parameter_model(
+def test_sync_is_the_default_because_rtc_starved_the_queue_on_the_arms(
     runner, config_file, checkpoint_dir, no_motion
 ):
-    assert "inference     rtc" in dry_run(runner, config_file, checkpoint_dir).output
+    """RTC discarded 27 of every 30 actions in situ; sync cannot discard any.
+
+    ``n_action_steps`` is 30 on this checkpoint, so the sync engine executes the
+    whole chunk and then blocks for one call — the same arrangement ``sim_eval``
+    uses, which scored 100% in ManiSkill.
+    """
+    output = dry_run(runner, config_file, checkpoint_dir).output
+    assert "inference SYNC" in output
+    assert "execution horizon" not in output
+
+
+def test_rtc_is_still_reachable_and_reports_its_blend(
+    runner, config_file, checkpoint_dir, no_motion
+):
+    assert "inference     rtc" in dry_run(runner, config_file, checkpoint_dir, "--rtc").output
 
 
 def test_an_invalid_control_mode_is_refused_before_anything_is_built(

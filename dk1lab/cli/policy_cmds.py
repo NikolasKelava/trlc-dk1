@@ -80,9 +80,11 @@ def _echo_rtc(cfg) -> None:
 
     horizon = getattr(getattr(cfg, "inference", None), "rtc", None)
     if horizon is None:
-        typer.secho(
-            "  inference SYNC — the model runs inline every 30th tick and stalls the loop",
-            fg=typer.colors.YELLOW,
+        typer.echo(
+            "  inference SYNC — the whole 30-step chunk is executed, then the loop\n"
+            "                   blocks for one inference. This is the arrangement that\n"
+            "                   scored 100% in the simulator; --rtc is the one that\n"
+            "                   starved the queue on the arms."
         )
         return
     horizon = horizon.execution_horizon
@@ -521,6 +523,21 @@ arms arrive, not after a fixed time. A second Ctrl-C stops it where they are.
 Set the pose with `dk1 policy home --capture`; without one, --home falls back
 to the pose the arms were in when the run connected.
 
+Inference runs SYNCHRONOUSLY by default: the full 30-step chunk is executed,
+then the loop blocks for one model call. That is a deliberate change from
+--rtc, made on 2026-08-20. RTC's own diagnostics on the second rollout showed a
+900 ms chunk latency, which made it discard 27 of every 30 actions and deliver
+100 ms of motion per second — the stall. Sync cannot discard anything: it pays
+one visible pause per chunk and executes all 30. It is also exactly the
+arrangement `sim_eval` uses, which scored 100% on this checkpoint in ManiSkill.
+--rtc is still there, and is the right answer once inference is well under
+chunk/fps = 1 s in situ.
+
+--duration defaults to 180 s. The policy is SLOW: in simulation it barely acts
+for the first ~30 s and successful episodes averaged 54 s. A 30 s rollout does
+not give it enough time to do anything, which is worth knowing before reading a
+short run as a failure.
+
 Do `dk1 policy check`, then `smoke`, then `dryrun` first. Keep a hand on the
 e-stop."""
     + MOTION_HELP
@@ -534,15 +551,18 @@ def run(
     checkpoint: CheckpointOpt = None,
     duration_s: Annotated[
         float, typer.Option("--duration", help="Stop after this many seconds. 0 = until stopped.")
-    ] = 30.0,
+    ] = 180.0,
     fps: Annotated[int, typer.Option("--fps", help="Control rate, Hz.")] = DEFAULT_FPS,
     interpolation: Annotated[
         int, typer.Option("--interpolation", help="Commands per policy action.")
     ] = 1,
     rtc: Annotated[
         bool,
-        typer.Option("--rtc/--sync", help="Run inference in a background thread (recommended)."),
-    ] = True,
+        typer.Option(
+            "--rtc/--sync",
+            help="RTC runs inference in a background thread. Default is --sync; see HELP_RUN.",
+        ),
+    ] = False,
     execution_horizon: Annotated[
         int, typer.Option("--execution-horizon", help="RTC: actions executed per chunk.")
     ] = DEFAULT_EXECUTION_HORIZON,

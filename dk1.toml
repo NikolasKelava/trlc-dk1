@@ -150,18 +150,44 @@ max_gripper_rate = 1.0
 max_lag = 0.15
 max_dt = 0.1
 
-# Policy rollout is the case the limiter was written for: a policy nobody has
-# ever seen drive these arms, commanding absolute joint targets at 30 Hz. The
-# cap here is deliberately timid — 0.3 rad/s is about 17 deg/s, slow enough to
-# watch a mistake happen and reach the e-stop. It is the first number to raise
-# once the policy has been seen to behave, not something to leave at `false`.
+# Policy rollout is the case the limiter was written for: a policy commanding
+# absolute joint targets at 30 Hz. Both numbers below were raised on 2026-08-20
+# after measuring what the policy actually asks for — see MEASURED, below.
+#
+# max_joint_rate 1.0 rad/s (~57 deg/s), up from 0.3.
+#   The policy's motion is BURSTY, not fast on average: over a recorded 120 s
+#   sim episode the median demand is 0.036 rad/s, but p95 is 0.31 and the peak
+#   is 4.56 rad/s. So a 0.3 cap does not slow everything evenly — it truncates
+#   exactly the reach and transit moves, which are the ones that matter.
+#   Pushing that recorded episode through the real SlewLimiter:
+#       cap 0.3 -> worst joint ends up 0.98 rad (56 deg) behind the policy's
+#                  intent; 26% of ticks have a joint >0.1 rad behind
+#       cap 1.0 -> worst 0.40 rad (23 deg);  3.3% of ticks
+#       cap 2.0 -> worst 0.10 rad;           0% — effectively transparent
+#   1.0 is the knee: most of the distortion gone, still slow enough to watch.
+#
+# max_lag 0.4 rad, up from 0.1.
+#   THIS IS A TORQUE LIMIT, not a position clamp, and that is why 0.1 was too
+#   tight. In impedance mode torque = arm_kp * (q_des - q), with arm_kp =
+#   [100,100,100,20,20,10] (trlc_dk1_control/config.py). Clamping the lead to
+#   0.1 rad therefore capped the PD torque at 10 Nm on j1-j3 (motor limit 28),
+#   2 Nm on j4/j5 (limit 10) and 1 Nm on j6 (limit 10) — a tenth of what the
+#   wrist can do, on the joints the policy drives fastest. Worse, limiter.py
+#   writes the CLAMPED value back into _prev_cmd, so the command can never
+#   build more lead: if 0.1 rad of error will not break stiction, the joint
+#   stalls there silently and forever. That is the same deadlock limiter.py's
+#   own docstring argues against when it explains why the ramp anchors to the
+#   previous command rather than the measurement.
+#   0.4 rad restores ~4 Nm at the wrist and ~40 Nm of authority at the
+#   shoulder (still clipped to joint_torque_limits downstream, which is the
+#   limit that should be doing this job).
 #
 # The gripper is NOT slowed to match: a gripper that closes over three seconds
 # fails every grasp, and a slow gripper is not the hazard here.
 [limits.policy]
-max_joint_rate = 0.3
+max_joint_rate = 1.0
 max_gripper_rate = 1.0
-max_lag = 0.1
+max_lag = 0.4
 max_dt = 0.1
 
 # --- Policy checkpoint -------------------------------------------------------
