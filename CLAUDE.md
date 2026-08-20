@@ -20,6 +20,36 @@ want to keep pulling its updates.
 - **Do not run anything that moves the arms without asking.** See Safety.
 - **Do not jump phases.** Finish the current one; Nikolas gates each transition.
 
+## How to explain things to Nikolas
+
+When reporting what happened — a bug, a diagnosis, a change — write it so it
+lands without the reader holding this whole document in their head. The shape
+that works:
+
+1. **What you saw**, in the plain terms of the symptom.
+2. **What caused it**, in ordinary language, one mechanism at a time.
+3. **What you did about it.**
+
+Rules for it, all learned from a report that was right and too long:
+
+- **Short.** Cut anything that does not change the reader's understanding or
+  their decision.
+- **Report conclusions, not the investigation.** A hypothesis you tested and
+  discarded is worth one sentence, not a section. "It turned out that preparing
+  a 720p picture rather than a 360p one barely costs anything while the policy
+  is running" is the whole of what a reader needs; the paired-A/B methodology
+  and the two benchmarking traps belong in this file, not in the explanation.
+- **Name components by what they do**, not by their class name. "The step that
+  resizes the camera pictures for the model", not `MolmoAct2PackInputsProcessorStep`.
+- **Numbers only where they carry the argument.** One number that decides
+  something beats six that describe it.
+- Say plainly what was *not* established, and whether the arms were involved.
+
+This is about the explanation, not the record. `CLAUDE.md` keeps the full
+detail — methodology, discarded hypotheses, exact figures — because the next
+session needs it. The explanation to Nikolas is a different document with a
+different job.
+
 ## Repository layout
 
 ```
@@ -42,10 +72,11 @@ dk1lab/                 everything this fork adds; the only Python we own
   policy.py             MolmoAct2 deployment: smoke / dryrun / rollout
   trace.py              per-chunk latency, queue depth, and the policy's OWN action
   modelview.py          the model's-eye view, live, during teleoperation
+  fifo.py               ChunkFIFOInferenceEngine — one model call per chunk
   serve.py              the /act HTTP endpoint sim_eval drives — no robot
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
-tests/                  483 tests, none need hardware
+tests/                  508 tests, none need hardware
 GUIDE.md                operator docs
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
@@ -357,7 +388,7 @@ ports is open any more.
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
-| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms four times**; judder and stall fixed, wrist FOV crop improved alignment and the gripper now waits for position. Crop retune + 720p capture **built, not yet run**. The 27.7 Hz loop is **diagnosed, not fixed** |
+| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms four times**; judder and stall fixed, wrist FOV crop improved alignment and the gripper now waits for position. Crop retune, 720p capture and the chunk FIFO **built, not yet run** |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **run: 3/3 with a 120 s budget; 0/10 was a too-short episode** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
@@ -411,6 +442,9 @@ a fifth (`home`) added afterwards that has not:
 
 Two flags added after the second rollout, both read-only: `--trace` (on by
 default) and `--display-policy-input`. `--invert-gripper` is now off by default.
+`--fifo` (on by default, `run` and `dryrun`) is **not** read-only in the same
+sense — it changes which engine drives the arms — but it is action-identical;
+see *The 27.7 Hz loop*.
 
 `dk1lab/policy.py` is the single implementation; `dk1lab/checkpoint.py` is the
 JSON-only reader behind `check`. Settings are decided in code, not left to a
@@ -608,7 +642,7 @@ queue's `merge` is wrapped on the instance. `attach` runs after `build_context`
 so `prewarm`'s cold call is not counted as a chunk; `attach_queue` runs after
 `strategy.setup`, because the RTC queue does not exist until `engine.start()`.
 
-What remains for this phase: **a scored run with the crop on**. The motion
+What remains for this phase: **a scored run with the crop and the FIFO on**. The motion
 faults are closed, the failure is spatial, and the wrist crop that addresses it
 is built and configured but **has never driven a rollout** — see *The camera
 crop*. Run it, then score it: labelled attempts with a success count, which is
@@ -845,10 +879,11 @@ model's view track. `dk1lab/modelview.py`:
   `_ensure_blueprint` returns early when it is already set. A coupling to an
   upstream implementation detail, written down as one.
 
-### The 27.7 Hz loop: the capture raise is innocent, the per-tick engine is not
+### The 27.7 Hz loop: the capture raise is innocent, the per-tick engine was not
 
-Two problems were open here. Both are now closed as *diagnoses*; the fix for the
-second is chosen but not built, and nothing in this round has been on the arms.
+Two problems were open here. Both are now closed: the trace is fixed, and the
+loop's cost is diagnosed **and** fixed in `dk1lab/fifo.py`. Nothing in this round
+has been on the arms.
 
 #### B (fixed): `--trace` no longer lies under `--sync`
 
@@ -957,41 +992,82 @@ from the 29 cached ticks and the tick is ~14.5 ms — 30 Hz with room to spare.
 Revert the capture instead and it is ~35.2 ms, still 28.4 Hz. Only one of those
 two is a fix.
 
-#### The fix, chosen and not built
+#### The fix: `dk1lab/fifo.py`, built and measured, not yet on the arms
 
-Build the FIFO that LeRobot's own comment block above `SyncInferenceEngine`
-sketches: drive the policy with `predict_action_chunk`, postprocess the whole
-chunk at once, and serve postprocessed rows from a local deque. Subclass in
-`dk1lab/`, like `SafeBiDK1Follower` and `CroppedOpenCVCamera` — do not patch
-upstream.
+`ChunkFIFOInferenceEngine` is what LeRobot's own comment block above
+`SyncInferenceEngine` sketches: run the model once, postprocess the whole chunk
+at once, queue the rows, hand out one per tick. It is a drop-in for the sync
+engine — same `InferenceEngine` lifecycle, same `get_action` contract — and
+deliberately **not a subclass**, because the only method it would inherit is the
+one it replaces.
 
-Upstream lists three reasons it has not done this, and **none of them apply
-here**: SAC raises from `predict_action_chunk`, ACT's temporal ensembler lives
-inside `select_action`, and the Diffusion family fills its observation-history
-queues as a side effect of `select_action`. MolmoAct2 has none of the three —
-its `select_action` *is* a `predict_action_chunk` call plus a deque. The
-postprocessor is four stateless per-element steps (clamp, unnormalise, frame
-transform, device move), so postprocessing 30 rows at once is equivalent to
-postprocessing them one at a time; RTC already does exactly that. And upstream's
-fourth caveat, relative-action drift, is an argument *for* the FIFO and moot
-here anyway — this checkpoint is absolute joint pose.
+**What it is worth**, measured on the real checkpoint and the real cameras,
+paced at 30 Hz, no robot, paired in one process with the order alternated:
 
-Expected: ~22 ms off 29 ticks in 30, the loop back over 30 Hz, and the visible
-per-chunk pause unchanged at ~190 ms. Dropping the loop to 25 Hz is the fallback
-if that turns out to be wrong; it is worse, because the checkpoint's chunk is
-30 steps at 30 Hz and a slower loop stretches every motion.
+| | engine cost on a cached tick | the model tick |
+| --- | --- | --- |
+| `SyncInferenceEngine` | 23.2 ms | ~186 ms |
+| `ChunkFIFOInferenceEngine` | **0.02 ms** | ~193 ms |
 
-Note what is **not** wrong in the original log: the `policy` and `robot` rows
-differ because one is the raw normalised model output and the other is post-
-unnormalisation, which is the whole point of printing both. `grip L +0.984 →
-+0.016` is the gripper inversion working, so that run had `--invert-gripper` on.
+0.02 ms is a `deque.popleft()`. That takes **23.2 ms out of 29 ticks in every
+30**; the in-situ tick of 36.1 ms becomes ~13 ms against a 33.3 ms budget, so
+the loop stops being the binding constraint rather than merely clearing the bar.
+The once-per-chunk pause is unchanged and is meant to be: it is inherent to
+synchronous inference and is what `--rtc` exists to remove.
 
-Everything in this round was measured on the GPU and the cameras only. **No arms
-were energised, and the 27.7 Hz figure itself is still the only in-situ
-measurement** — the `pre 27` in that log is ~11 ms above the 15.9 measured here,
-and that gap is the one thing still unaccounted for. It is most likely
-contention with the follower serial reads, and the fixed `--trace` on a real
-rollout is what would settle it.
+**The actions are bit-identical.** Thirty rows from each engine, same frozen
+observation, same seed, the real bf16 checkpoint: max absolute difference
+`0.000e+00` on all 14 channels. That is the equivalence claim tested directly
+rather than argued.
+
+Why the equivalence holds, and what it rests on:
+
+- `select_action` slices the same `predict_action_chunk` output to
+  `n_action_steps` and pops it in order; this does the same slice, same order.
+- All four postprocessor steps — clamp, unnormalise, action-frame transform,
+  device move — are stateless and elementwise, so postprocessing a chunk equals
+  postprocessing its rows. RTC already does exactly this on the same pipeline.
+- The observations dropped were dropped anyway: on a cached tick `select_action`
+  never reads the batch.
+- It requires **absolute** actions. A relative-action policy re-anchors to the
+  current state every call, so a precomputed chunk would drift — upstream's own
+  fourth caveat. `dk1lab/fifo.py` **checks** for a relative step in the pipeline
+  and raises rather than assuming; ours is absolute joint pose.
+- Upstream's other three blockers are SAC (raises from `predict_action_chunk`),
+  ACT (ensembler inside `select_action`) and the Diffusion family (obs-history
+  queues filled as a side effect). MolmoAct2 has none of them.
+
+A bonus, since `select_action` is no longer on the per-tick path: `self.eval()`
+now runs once in `start()` instead of walking 1737 submodules every tick.
+
+Worth noting as corroboration: **`dk1lab/serve.py` has always worked this way** —
+it calls `predict_action_chunk`, postprocesses the chunk whole and returns it,
+because that is what the `/act` protocol is. That is the server that scored 3/3
+in ManiSkill. So the arrangement the FIFO brings to the rollout is the one our
+only successful evaluation of this checkpoint already ran under.
+
+**Wiring.** `policy.use_chunk_fifo(ctx)` replaces `ctx.policy.inference` between
+`build_context` and `strategy.setup` — `BaseStrategy._init_engine` keeps
+whatever it finds there, so that attribute is the whole of the seam and nothing
+upstream is touched. It runs **after** `build_context` so `prewarm` has already
+built the CUDA graph, and **before** the trace attaches so the trace wraps the
+engine that will actually be driven. The pipelines are carried across by
+reference, so a gripper inversion already applied to them still applies.
+
+`--fifo` is **on by default** for `dk1 policy run` and `dk1 policy dryrun`, and
+is a silent no-op under `--rtc`, which already serves chunks whole. `--no-fifo`
+exists to measure the difference on the same rollout, not for ordinary use.
+
+**What is still unverified:** it has never driven the arms. The equivalence is
+established on this machine against the real weights, and the tick saving is
+measured on the real cameras, but the number that matters — whether the in-situ
+loop actually holds 30 Hz — needs a rollout. That is the same rollout that would
+close the last open question in this section: the in-situ `pre 27 ms` against
+15.9 measured here, ~11 ms most likely lost to contention with the follower
+serial reads. Fold both into the next run; the fixed `--trace` reports them.
+
+The machine's CPU governor stays on `powersave` by request. It was ruled out as
+a cause here.
 
 ### The sim run: the policy behaves the same way with every hardware excuse removed
 

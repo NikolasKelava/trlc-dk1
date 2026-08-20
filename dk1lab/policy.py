@@ -444,6 +444,39 @@ def build_context(
     return ctx, inversion
 
 
+def use_chunk_fifo(ctx: Any, *, enabled: bool = True) -> Any | None:
+    """Swap the sync engine for :mod:`dk1lab.fifo`'s. Returns it, or ``None``.
+
+    ``BaseStrategy._init_engine`` reads ``ctx.policy.inference`` and keeps
+    whatever it finds, so replacing that attribute before ``strategy.setup`` is
+    the whole of the wiring — no strategy subclass, nothing upstream touched.
+
+    A no-op, quietly, under RTC: that engine already runs the model once per
+    chunk in a background thread and postprocesses the chunk whole, so there is
+    nothing here to save. Also a no-op when ``enabled`` is false, which is how
+    the two paths get compared on the same rollout.
+
+    Call it **after** :func:`build_context` — so ``prewarm`` has already run
+    against the engine that built the CUDA graph — and **before** attaching a
+    trace, so the trace wraps the engine that will actually be driven.
+    """
+    from lerobot.rollout.inference.sync import SyncInferenceEngine
+
+    from .fifo import build as build_fifo
+
+    engine = ctx.policy.inference
+    if not enabled:
+        logger.info("chunk FIFO disabled; the pipeline will run on every tick")
+        return None
+    if not isinstance(engine, SyncInferenceEngine):
+        logger.debug("not a sync engine (%s); nothing to replace", type(engine).__name__)
+        return None
+    replacement = build_fifo(engine)
+    ctx.policy.inference = replacement
+    logger.info("chunk FIFO engine installed in place of %s", type(engine).__name__)
+    return replacement
+
+
 # --------------------------------------------------------------------------- #
 # Making RTC behave: the two startup steps that were missing
 # --------------------------------------------------------------------------- #
@@ -854,6 +887,7 @@ def dryrun(
     on_step: Any = None,
     invert_gripper: bool = False,
     trace: Any = None,
+    fifo: bool = True,
 ) -> list[DryRunStep]:
     """Run the whole deployment path with the arms attached, and send nothing.
 
@@ -875,6 +909,8 @@ def dryrun(
             one the postprocessor produced, and — with ``display`` set on it —
             the images as the model receives them. Nothing is ever sent, so it is
             also the safe place to check both.
+        fifo: serve the chunk from :mod:`dk1lab.fifo`, as ``run`` does. On by
+            default so a dry run exercises the path the rollout will take.
     """
     import torch
     from lerobot.rollout.strategies import BaseStrategy
@@ -882,6 +918,7 @@ def dryrun(
     from lerobot.utils.feature_utils import build_dataset_frame
 
     ctx, _ = build_context(cfg, invert_gripper=invert_gripper)
+    use_chunk_fifo(ctx, enabled=fifo)
     strategy = BaseStrategy(cfg.strategy)
     collected: list[DryRunStep] = []
     if trace is not None:
@@ -1036,6 +1073,7 @@ def run(
     home: Any | None = None,
     invert_gripper: bool = False,
     trace: Any = None,
+    fifo: bool = True,
 ) -> HomeReport | None:
     """Drive the followers with the policy. **Moves the arms.**
 
@@ -1054,6 +1092,11 @@ def run(
         trace: an optional :class:`~dk1lab.trace.RolloutTrace`, attached around
             the engine so the run records per-chunk latency, queue depth and the
             policy's own actions. It never changes what is sent.
+        fifo: serve the chunk from :mod:`dk1lab.fifo` instead of rebuilding the
+            whole input pipeline every tick. On by default under ``--sync``,
+            where it is worth ~22 ms of a 33.3 ms control period; ignored under
+            RTC, which already serves chunks whole. Off is for measuring the
+            difference, not for ordinary use.
 
     Returns:
         The :class:`~dk1lab.home.HomeReport`, or ``None`` if homing was not asked
@@ -1071,8 +1114,10 @@ def run(
         init_visualization("rerun", session_name="dk1-policy")
 
     ctx, _ = build_context(cfg, shutdown_event, invert_gripper=invert_gripper)
+    use_chunk_fifo(ctx, enabled=fifo)
     strategy = BaseStrategy(cfg.strategy)
-    # After build_context, so prewarm's cold call is not counted as a chunk.
+    # After build_context, so prewarm's cold call is not counted as a chunk, and
+    # after the FIFO swap, so the trace wraps the engine that will actually run.
     if trace is not None:
         trace.attach(ctx)
     report: HomeReport | None = None

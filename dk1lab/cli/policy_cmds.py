@@ -54,6 +54,18 @@ TraceOpt = Annotated[
         help="Print the policy's own action per chunk, plus where the time went.",
     ),
 ]
+FifoOpt = Annotated[
+    bool,
+    typer.Option(
+        "--fifo/--no-fifo",
+        help=(
+            "Serve the whole action chunk from a queue instead of rebuilding the "
+            "input pipeline on every tick. ON by default under --sync, where it "
+            "is worth ~22 ms of a 33.3 ms control period; ignored under --rtc. "
+            "--no-fifo is for measuring the difference."
+        ),
+    ),
+]
 WatchInputOpt = Annotated[
     bool,
     typer.Option(
@@ -441,6 +453,7 @@ def dryrun(
     device: DeviceOpt = "cuda",
     invert_gripper: InvertOpt = False,
     display_policy_input: WatchInputOpt = False,
+    fifo: FifoOpt = True,
     build_only: Annotated[
         bool, typer.Option("--build-only", help="Build and print everything; connect nothing.")
     ] = False,
@@ -501,7 +514,12 @@ def dryrun(
         init_visualization("rerun", session_name="dk1-policy-input")
     try:
         collected = run_dryrun(
-            cfg, steps=steps, on_step=show, invert_gripper=invert_gripper, trace=trace
+            cfg,
+            steps=steps,
+            on_step=show,
+            invert_gripper=invert_gripper,
+            trace=trace,
+            fifo=fifo,
         )
     finally:
         if display_policy_input:
@@ -591,6 +609,7 @@ def run(
     ] = False,
     display_policy_input: WatchInputOpt = False,
     trace: TraceOpt = True,
+    fifo: FifoOpt = True,
     device: DeviceOpt = "cuda",
     invert_gripper: InvertOpt = False,
     home: Annotated[
@@ -680,6 +699,7 @@ def run(
         home=home_pose,
         invert_gripper=invert_gripper,
         trace=tracer,
+        fifo=fifo,
     )
     typer.secho("\nrollout ended; the robot is disconnected.", fg=typer.colors.GREEN)
     _echo_trace_summary(tracer)
