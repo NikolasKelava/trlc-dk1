@@ -8,7 +8,7 @@ because the failure mode is silent, symmetric, and lands on the hardware.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pytest
 
@@ -378,11 +378,27 @@ def test_a_start_pose_that_does_not_cover_the_robot_is_refused():
         home_target(FakeContext(FakeHardware(initial_position=partial)), None)
 
 
-def test_the_home_sweep_inherits_the_speed_cap_the_policy_ran_under(config, checkpoint):
+def test_the_home_sweep_does_not_take_the_policy_cap_as_a_speed(config, checkpoint):
+    """The cap bounds a policy nobody trusts; it is not a speed to aim for.
+
+    Reading it as one is why raising [limits.policy] from 0.3 to 1.0 rad/s sped
+    the shutdown sweep up as a side effect.
+    """
+    from dk1lab.home import DEFAULT_HOME_RATE
     from dk1lab.policy import _home_rate
 
     cfg = rollout_config(config, checkpoint=checkpoint, task="t", limits=POLICY_LIMITS)
-    assert _home_rate(cfg) == POLICY_LIMITS.max_joint_rate
+    assert POLICY_LIMITS.max_joint_rate > DEFAULT_HOME_RATE
+    assert _home_rate(cfg) == DEFAULT_HOME_RATE
+
+
+def test_a_cap_tighter_than_the_home_rate_still_wins(config, checkpoint):
+    """Commanding faster than the limiter allows only means the limiter clamps it."""
+    from dk1lab.policy import _home_rate
+
+    limits = replace(POLICY_LIMITS, max_joint_rate=0.1)
+    cfg = rollout_config(config, checkpoint=checkpoint, task="t", limits=limits)
+    assert _home_rate(cfg) == 0.1
 
 
 def test_an_uncapped_run_does_not_hand_its_lack_of_a_cap_to_the_home_sweep(config, checkpoint):

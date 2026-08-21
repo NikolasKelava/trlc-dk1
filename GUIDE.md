@@ -346,8 +346,9 @@ not just `config.json`, because those are what actually run.
 **`smoke`** loads the policy on the GPU and runs inference on a synthetic frame.
 Nothing is connected and no `/dev` node is opened, so it is safe with the cell
 powered down. Measured here: **171 ms per model call**, 11.1 GiB peak, ~950 ms
-for the first call. That is 5.1 control periods at 30 Hz, so the rollout needs
-`--rtc` — which is the default.
+for the first call. That is about five control periods at 30 Hz, so a chunk can
+never be computed inside one tick — which is what the async chunk FIFO below is
+for.
 
 It reports two latencies because there are two. A policy call usually answers
 from the 30-step chunk it already computed (~12 ms); only one call in thirty runs
@@ -364,9 +365,55 @@ tick, where every joint is and where the policy wants it. Two things to look for
 It **energises the arms** (connecting always does) but never calls
 `send_action`. `--build-only` prints everything and connects to nothing.
 
-**`run`** is the rollout. It is capped by `[limits.policy]` — 0.3 rad/s, about
-17 deg/s — and stopping disconnects without moving anything. Keep a hand on the
+**`run`** is the rollout. It is capped by `[limits.policy]` — 1.0 rad/s, about
+57 deg/s — and stopping disconnects without moving anything. Keep a hand on the
 e-stop. `--dry-run` prints the whole configuration without connecting.
+
+### How the chunk reaches the arms
+
+The policy does not produce one action per tick. It produces a **30-row plan**,
+one second of motion at 30 Hz, and something has to decide when to compute the
+next one and what to do with it. That decision is what makes the arms look
+smooth or make them stop and go, and it has three settings:
+
+```fish
+dk1 policy run --task "..."                      # async chunk FIFO — the default
+dk1 policy run --task "..." --blocking-fifo      # the old behaviour, for comparison
+dk1 policy run --task "..." --no-fifo            # LeRobot's own per-tick engine
+dk1 policy run --task "..." --rtc                # LeRobot's real-time chunking
+```
+
+**The default computes the next chunk on a worker thread while the current one
+is still being served**, so the control loop never waits for the model. When the
+chunk lands, the rows describing time that has already passed are dropped and the
+rest replace the queue, cross-faded over four rows so the seam is a ramp rather
+than a step. Measured on this machine against the real checkpoint, paced at
+30 Hz with no robot attached:
+
+| | loop rate | ticks that ran a model call |
+| --- | --- | --- |
+| `--blocking-fifo` | 25.8 Hz | 17 in 20 s, worst 201 ms |
+| async (default) | **29.7 Hz** | **1** — the cold start |
+
+`--blocking-fifo` is what ran on the arms before 2026-08-21: the loop stopped
+for one model call per chunk, so the arms froze for about a third of a second
+once a second. That is what `Record loop is running slower (3.4 Hz)` in the log
+was reporting — one tick that contained an inference, once per chunk.
+
+Two knobs, both reported by `--trace` so a run tells you where to put them:
+
+* **`--replan-at`** (default 15) — the queue depth at which the next chunk is
+  started. It must exceed the inference latency in ticks (about 10 here) or the
+  queue can run dry. Higher is fresher *and* safer, at the cost of running the
+  GPU harder.
+* **`--blend`** (default 4) — rows over which a new chunk is faded into the old
+  one. `0` splices hard. Keep it well under the replan interval; blending most of
+  what gets executed drags each new plan onto the old one, and the policy stops
+  reacting.
+
+`--no-fifo` is LeRobot's stock engine, which rebuilds the whole input pipeline on
+every tick and throws it away on 29 ticks in 30 — about 22 ms of a 33 ms budget.
+It is there to measure the difference, not to use.
 
 ### Watching a rollout from the inside
 
@@ -384,11 +431,17 @@ so it stays readable — and an end-of-run summary. Per chunk it gives the whole
 cost breakdown, which is the thing LeRobot never logs:
 
 ```
-chunk  12   900 ms = 27 ticks (model 271 · pre 8 · post 3 · other 618)
-            consumed 10  queue -> 3  STARVED 17 ticks
+chunk  12  plan  196 ms old =  6 rows (pre 39 · model 158 · post 0)  queue  9 -> 24, blended 4
+  over  15 ticks at  33.4 ms = 29.9 Hz  (engine 0.0 · robot 4.2 · wait 29.2)
   policy  +0.012 -0.310 ... grip L +0.991 R +0.988
   robot   +0.012 -0.310 ... grip L +0.991 R +0.988
 ```
+
+The first line is the **chunk**: how old the plan was when the arms started
+executing it, what it cost to compute, how many rows were in hand when it landed
+and how many after. The second is the **tick**: the measured period, and where it
+went. `wait` is `precise_sleep` — the headroom — and separating it from `robot`
+is what tells a loop with 29 ms to spare from one that is 29 ms over budget.
 
 `policy` is the model's **own** output, before the postprocessor unnormalises it
 and before any gripper inversion; `robot` is the same row after both. They are
@@ -396,10 +449,34 @@ printed separately because a question about the policy cannot be answered with a
 vector LeRobot rewrote.
 
 The summary turns the numbers into a reading and says so in plain words: whether
-the queue ran dry, whether inference is too slow for RTC to have anything left
-after trimming, whether the missing milliseconds are in the model or in the
-background thread not running at all, and whether the policy ever moved a
-gripper. `--no-trace` turns the per-chunk printing off; the summary stays.
+the queue ever ran dry, whether a model call landed on the control loop, whether
+a chunk arrived past its own last row, whether the loop held its rate, and
+whether the policy ever moved a gripper. `--no-trace` turns the per-chunk
+printing off; the summary stays.
+
+If you saw a line reading `per cached tick 34.1 ms ... pre 32.4 · post 46.2`
+before 2026-08-21, those two numbers were per **chunk**, not per tick — the
+trace remembered the last pipeline timing it had seen and stamped it onto every
+tick. 79 ms of pipeline inside a 34 ms tick is not a thing that can happen.
+
+**`--display`** streams the cameras and the robot state, as it always has, and
+now also draws **three lines per joint on one axis**:
+
+* `policy/<joint>` — the model's own plan for this tick, in radians, *before*
+  the chunk cross-fade and *before* the speed limiter;
+* `command/<joint>` — what the follower actually sent, after both;
+* `observation.<joint>` — where the joint got to.
+
+The layout is one panel per joint, seven across, so the top row is the left arm
+and the bottom the right. That is what makes rough motion attributable without
+another run: if `policy` is rough and `command` follows it, the plans are rough;
+if `policy` is smooth and `command` steps or lags, it is ours — the blend or the
+speed cap; if `command` is smooth and `observation` is not, it is the arm.
+
+Note the two console rows are **not** in the same units. `policy` is the model's
+raw output in normalised space, nominally [-1, +1]; `robot` is the same row after
+the unnormaliser, so radians. `+0.977` and `+2.208` are one number written twice.
+The Rerun panels put both in radians, which is the comparison you want.
 
 **`--display-policy-input`** opens Rerun and logs, under `policy_input/`, the
 images **as the model receives them**: the 378×378 tensors unpacked straight out
@@ -444,13 +521,26 @@ at zero, so "home" on this cell means the zero pose with the grippers open. The
 *sweep* to it has not been watched yet — do `dk1 policy home` on its own, from a
 pose the arms are not already in, before you put `--home` on a rollout.
 
-The sweep ramps from the last command at `[limits.policy].max_joint_rate`,
-watches the measured positions, and stops when every arm joint is within
-0.03 rad of home. Grippers are commanded but excluded from the arrival test,
-because a gripper holding something is supposed to stall. If the arms do not
-arrive — something blocking, a cap too low for the distance — it says so and
-disconnects anyway, and **disconnecting disables every motor**, so support
-anything holding itself up.
+The sweep ramps from the last command, watches the measured positions, and stops
+when every arm joint is within 0.03 rad of home. Grippers are commanded but
+excluded from the arrival test, because a gripper holding something is supposed
+to stall. If the arms do not arrive — something blocking, a cap too low for the
+distance — it says so and disconnects anyway, and **disconnecting disables every
+motor**, so support anything holding itself up.
+
+**It is slow, and eased at both ends.** The peak is 0.3 rad/s — *not*
+`[limits.policy].max_joint_rate`, which is 1.0: that cap is an upper bound on
+what a policy nobody trusts may do, and homing used to inherit it as a speed,
+which is why it felt fast. A tighter cap still wins, since commanding faster
+than the limiter allows only means the limiter clamps it. On top of that the
+speed is scaled by a smoothstep — up over the first 0.75 s, and down again over
+the last 0.25 rad — so the arms neither snap into motion nor stop dead on the
+target. A sweep too short for both simply never reaches full speed. The profile
+never quite reaches zero, or it would only approach home asymptotically and time
+out short of it.
+
+`dk1 policy home --max-joint-rate 0.6` overrides the peak for one sweep; naming
+a speed explicitly is honoured as given.
 
 This deliberately replaces LeRobot's `return_to_initial_position`, which fires
 from teardown on every exit path including a crash, sweeps for a fixed 3 s
@@ -544,10 +634,10 @@ settles a contradiction the earlier project left behind — an untracked
 `robot-ports.txt` there claimed `follower.left = /dev/ttyACM2`, but `ttyACM2` is a
 leader adapter, so the tracked `ports.toml` was the correct one.
 
-**Not verified.** Everything about MolmoAct2 on this robot. No dataset has been
-recorded, no fine-tune completed, and no policy has ever driven these arms. The
-evidence that zero-shot is worth trying is a colleague's simulation work, which
-is promising but carries no measured success rates.
+**Not verified.** Everything about MolmoAct2 on this robot that would count as a
+result. No dataset has been recorded, no fine-tune completed, and no rollout has
+been **scored** — no success count over labelled attempts. The policy has driven
+these arms, and it reaches for the object; that is an impression, not a rate.
 
 The arm sides were confirmed directly, so nothing about the device config is
 open. Teleoperation through this fork has now driven the arms, which is what the
@@ -564,18 +654,29 @@ the policy agrees with the start pose to within 0.065 rad, its intended speed is
 about 0.2 rad/s, and `0 = open` on the grippers is confirmed — they read 0.0000
 standing open, and connecting does not close them.
 
-`dk1 policy run` has driven the arms twice. The first run juddered and stalled;
-the judder was RTC's prefix blend collapsing to zero width and is fixed. The
-second run judders much less but still stalls, and reacts less to the object
-moving. Its logs name the cause: RTC measures each chunk at ~27 ticks (900 ms)
-of wall time, three times the 271 ms measured on the bench, and then discards
-that many actions from a 30-step chunk — leaving three. `--trace` was built to
-find out where those 900 ms go. That is what the next run is for.
+`dk1 policy run` has driven the arms four times. The judder is gone (RTC's
+prefix blend was collapsing to zero width), the queue no longer starves, and the
+wrist field-of-view crop improved the alignment — the fourth run reaches for the
+object and waits for a good position before closing the gripper.
 
-Nothing on the hardware has been scored. In simulation it now has been:
-**0/10** on `BimanualYAMPutEverythingInBox-v1`, on the checkpoint's own
-embodiment, with the simulator tracking its commands to within a milliradian.
-It moves and it works both grippers; it does not do the task.
+The fifth thing found, and fixed on 2026-08-21, is the freeze: the loop waited
+for one model call per chunk, so the arms held still for about a third of a
+second once a second. That is the `Record loop is running slower (3.4 Hz)`
+warning, and the async chunk FIFO removes it. **The sixth run confirmed it on
+the arms**: 29.9 Hz over 335 chunks, zero starved ticks, the only over-budget
+tick the cold start, and the home sweep completing in 8.5 s with the worst joint
+0.028 rad off.
+
+That closes this fork's side of the problem. The roughness that remains was
+watched in `--display`'s per-joint panels — the policy's plan against the
+command against the measurement — and it is in **the policy's own output**, not
+in anything between the model and the motor.
+
+Nothing on the hardware has been scored. In simulation it has:
+**3/3** on `BimanualYAMPutEverythingInBox-v1` with a 120 s episode budget, on the
+checkpoint's own embodiment, against about 50% for the reference HF server. The
+0/10 recorded here earlier was scored with 27 s episodes, and the policy barely
+acts for the first 30 s.
 
 The home pose has been captured on the hardware — that path energises the arms
 and reads them, nothing more. The home *sweep*, which drives both arms, has run

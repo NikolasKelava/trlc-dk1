@@ -11,6 +11,7 @@ around the conditions under which that equivalence holds.
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,7 +20,7 @@ import torch
 from lerobot.rollout.inference.sync import SyncInferenceEngine
 from lerobot.utils.feature_utils import build_dataset_frame
 
-from dk1lab.fifo import ChunkFIFOInferenceEngine, build
+from dk1lab.fifo import AsyncChunkFIFOInferenceEngine, ChunkFIFOInferenceEngine, build
 from dk1lab.layout import ACTION_KEYS, CAMERA_NAMES, DOF, STATE_KEYS
 from dk1lab.policy import ROBOT_TYPE, dataset_features
 
@@ -106,8 +107,13 @@ def frames(count: int = 4):
     return features, out
 
 
-def engines(chunk: int = CHUNK, *, rtc: bool = False):
-    """A sync engine and a FIFO engine over equivalent, separate fake policies."""
+def engines(chunk: int = CHUNK, *, rtc: bool = False, asynchronous: bool = False, **kwargs):
+    """A sync engine and a FIFO engine over equivalent, separate fake policies.
+
+    Blocking by default: the equivalence claim below is that engine's contract.
+    The async one deliberately does *not* serve the same rows — it re-plans four
+    to five times more often — and is exercised in its own section.
+    """
     features, obs = frames()
     made = []
     for _ in range(2):
@@ -124,7 +130,7 @@ def engines(chunk: int = CHUNK, *, rtc: bool = False):
                 robot_type=ROBOT_TYPE,
             )
         )
-    return made[0], build(made[1]), obs
+    return made[0], build(made[1], asynchronous=asynchronous, **kwargs), obs
 
 
 # --------------------------------------------------------------------------- #
@@ -274,3 +280,213 @@ def test_it_answers_the_whole_inference_engine_lifecycle():
     fifo.pause()
     fifo.resume()
     fifo.stop()
+
+
+# --------------------------------------------------------------------------- #
+# The async engine: the loop never waits for the model
+# --------------------------------------------------------------------------- #
+#
+# The claim here is *not* that the rows match the blocking engine's — they must
+# not, since the whole point is re-planning four to five times more often. It is
+# that the queue never runs dry, that a chunk which arrives late has its stale
+# rows dropped rather than executed, and that the seam is a ramp.
+
+
+class SlowPolicy(FakePolicy):
+    """A policy whose ``predict_action_chunk`` takes real wall-clock time.
+
+    The async engine's whole behaviour is timing, so a fake that returns
+    instantly would exercise none of it. ``rows`` are constant per chunk so a
+    splice is visible as a step in the served value.
+    """
+
+    def __init__(self, chunk: int = CHUNK, *, seconds: float = 0.05):
+        super().__init__(chunk)
+        self.seconds = seconds
+
+    def _next_chunk(self) -> torch.Tensor:
+        # Every row of chunk *n* is the constant ``n``: a splice then shows up as
+        # a step from one integer to the next, and a cross-fade as the ramp
+        # between them.
+        return torch.full((1, self.chunk, DOF), float(self.predictions))
+
+    def predict_action_chunk(self, batch, **kwargs):
+        time.sleep(self.seconds)
+        return super().predict_action_chunk(batch, **kwargs)
+
+
+def async_engine(*, seconds: float = 0.05, fps: float = 100.0, **kwargs):
+    """An async FIFO over a policy that takes ``seconds`` per chunk.
+
+    ``fps`` of 100 keeps a test tick at 10 ms, so a 50 ms model call is five
+    ticks and the whole exercise runs in well under a second.
+    """
+    features, obs = frames()
+    engine = SyncInferenceEngine(
+        policy=SlowPolicy(seconds=seconds),
+        preprocessor=FakePipeline(),
+        postprocessor=FakePipeline(),
+        dataset_features=features,
+        ordered_action_keys=list(ACTION_KEYS),
+        task="pick up the dice",
+        device="cpu",
+        robot_type=ROBOT_TYPE,
+    )
+    return build(engine, asynchronous=True, fps=fps, **kwargs), obs
+
+
+def drive(engine, obs, ticks: int, *, period: float = 0.01):
+    """Run ``ticks`` control ticks at ``period``, as the rollout loop would."""
+    served = []
+    for tick in range(ticks):
+        start = time.perf_counter()
+        served.append(engine.get_action(obs[tick % len(obs)]))
+        remaining = period - (time.perf_counter() - start)
+        if remaining > 0:
+            time.sleep(remaining)
+    return served
+
+
+def test_the_loop_never_waits_for_the_model_after_the_first_chunk():
+    """The visible pause is what this engine exists to remove."""
+    engine, obs = async_engine(seconds=0.05)
+    engine.start()
+    try:
+        engine.get_action(obs[0])  # the cold start, which does block
+        costs = []
+        for tick in range(60):
+            start = time.perf_counter()
+            engine.get_action(obs[tick % len(obs)])
+            costs.append(time.perf_counter() - start)
+            time.sleep(0.01)
+        # Nothing like a 50 ms model call ever lands on the control thread.
+        assert max(costs) < 0.02, f"worst tick {max(costs) * 1000:.1f} ms"
+    finally:
+        engine.stop()
+
+
+def test_the_queue_is_refilled_before_it_empties():
+    engine, obs = async_engine(seconds=0.05, replan_at=15)
+    engine.start()
+    try:
+        engine.get_action(obs[0])
+        depths = []
+        for tick in range(90):
+            engine.get_action(obs[tick % len(obs)])
+            depths.append(engine.queued)
+            time.sleep(0.01)
+        assert min(depths) > 0, f"the queue ran dry: {depths}"
+        assert engine._policy.predictions > 2, "no replanning happened at all"
+    finally:
+        engine.stop()
+
+
+def test_rows_that_describe_time_already_spent_are_dropped():
+    """A plan is parameterised by time; the arms cannot execute its past."""
+    reports = []
+    engine, obs = async_engine(seconds=0.05, replan_at=20)
+    engine.on_chunk = reports.append
+    engine.start()
+    try:
+        drive(engine, obs, 80)
+    finally:
+        engine.stop()
+    spliced = [r for r in reports if r.index > 0]
+    assert spliced, "nothing was spliced"
+    # 50 ms of latency at 100 Hz is five ticks, so about five rows go.
+    assert all(3 <= r.dropped <= 9 for r in spliced), [r.dropped for r in spliced]
+    assert all(r.served == CHUNK - r.dropped for r in spliced)
+
+
+def test_the_seam_between_two_chunks_is_a_ramp_not_a_step():
+    """Consecutive chunks are independent samples; the join has to be smoothed."""
+    engine, obs = async_engine(seconds=0.05, replan_at=20, blend=4)
+    engine.start()
+    try:
+        served = drive(engine, obs, 80)
+    finally:
+        engine.stop()
+    values = [float(row[0]) for row in served if row is not None]
+    # Every chunk is a different integer, so an unblended splice is a jump of a
+    # whole 1.0. With a four-row ramp no single step may exceed 1/(blend+1).
+    steps = [abs(b - a) for a, b in zip(values, values[1:], strict=False)]
+    assert max(steps) <= 1.0 / 5 + 1e-6, f"worst step {max(steps):.3f}"
+    assert max(values) >= 2.0, "no splice happened, so nothing was smoothed"
+
+
+def test_without_a_blend_the_seam_is_a_hard_step():
+    """The contrast that makes the previous test mean something."""
+    engine, obs = async_engine(seconds=0.05, replan_at=20, blend=0)
+    engine.start()
+    try:
+        served = drive(engine, obs, 80)
+    finally:
+        engine.stop()
+    values = [float(row[0]) for row in served if row is not None]
+    steps = [abs(b - a) for a, b in zip(values, values[1:], strict=False)]
+    assert max(steps) >= 0.9
+
+
+def test_a_chunk_that_arrives_past_its_own_last_row_keeps_the_old_plan():
+    """Stale motion beats none. This is the 900 ms RTC failure, reported."""
+    reports = []
+    # 0.6 s per chunk against a 30-row chunk at 100 Hz = 0.3 s of motion.
+    engine, obs = async_engine(seconds=0.6, replan_at=29, fps=100.0)
+    engine.on_chunk = reports.append
+    engine.start()
+    try:
+        drive(engine, obs, 120)
+    finally:
+        engine.stop()
+    late = [r for r in reports if r.served == 0]
+    assert late, [(r.dropped, r.served) for r in reports]
+    assert all(r.dropped == CHUNK for r in late)
+
+
+def test_the_worker_stops_and_the_engine_survives_being_stopped_twice():
+    engine, obs = async_engine()
+    engine.start()
+    engine.get_action(obs[0])
+    engine.stop()
+    engine.stop()
+    assert engine._worker is None
+
+
+def test_a_reset_discards_a_chunk_computed_for_the_episode_that_ended():
+    engine, obs = async_engine(seconds=0.05, replan_at=29)
+    engine.start()
+    try:
+        engine.get_action(obs[0])
+        drive(engine, obs, 3)          # a chunk is in flight by now
+        engine.reset()
+        assert engine.queued == 0
+        time.sleep(0.15)               # long enough for that chunk to land
+        engine.get_action(obs[0])
+        # It was discarded rather than spliced, so this had to compute a new one.
+        assert engine.queued == CHUNK - 1
+    finally:
+        engine.stop()
+
+
+def test_a_persistent_worker_failure_is_raised_on_the_control_thread():
+    """Silence would look exactly like a policy that has decided to hold still."""
+    engine, obs = async_engine(seconds=0.0, replan_at=29)
+    engine.start()
+    try:
+        engine.get_action(obs[0])
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("the GPU fell over")
+
+        engine._policy.predict_action_chunk = explode
+        with pytest.raises(RuntimeError, match="failed .* times in a row"):
+            drive(engine, obs, 200)
+    finally:
+        engine.stop()
+
+
+def test_replan_at_and_blend_are_validated_rather_than_trusted():
+    with pytest.raises(ValueError, match="replan_at"):
+        async_engine(replan_at=0)
+    with pytest.raises(ValueError, match="blend"):
+        async_engine(blend=-1)

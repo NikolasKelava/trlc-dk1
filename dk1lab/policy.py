@@ -56,11 +56,12 @@ from typing import Any
 
 from .checkpoint import resolve
 from .config import DK1Config, LimitProfile
+from .fifo import DEFAULT_BLEND_STEPS, DEFAULT_REPLAN_AT
 from .home import (
-    DEFAULT_HOME_RATE,
     HomeError,
     HomeReport,
     go_home,
+    home_rate,
     interrupt_aborts,
 )
 from .home import validate_target as validate_home_target
@@ -444,7 +445,15 @@ def build_context(
     return ctx, inversion
 
 
-def use_chunk_fifo(ctx: Any, *, enabled: bool = True) -> Any | None:
+def use_chunk_fifo(
+    ctx: Any,
+    *,
+    enabled: bool = True,
+    asynchronous: bool = True,
+    replan_at: int = DEFAULT_REPLAN_AT,
+    blend: int = DEFAULT_BLEND_STEPS,
+    fps: float = DEFAULT_FPS,
+) -> Any | None:
     """Swap the sync engine for :mod:`dk1lab.fifo`'s. Returns it, or ``None``.
 
     ``BaseStrategy._init_engine`` reads ``ctx.policy.inference`` and keeps
@@ -454,11 +463,20 @@ def use_chunk_fifo(ctx: Any, *, enabled: bool = True) -> Any | None:
     A no-op, quietly, under RTC: that engine already runs the model once per
     chunk in a background thread and postprocesses the chunk whole, so there is
     nothing here to save. Also a no-op when ``enabled`` is false, which is how
-    the two paths get compared on the same rollout.
+    the paths get compared on the same rollout.
 
     Call it **after** :func:`build_context` — so ``prewarm`` has already run
     against the engine that built the CUDA graph — and **before** attaching a
     trace, so the trace wraps the engine that will actually be driven.
+
+    Args:
+        asynchronous: compute each chunk on a worker thread while the previous
+            one is still being served, so the control loop never waits for the
+            model. ``False`` is the blocking engine, which pauses the arms for
+            one model call per chunk — kept for comparison, not for use.
+        replan_at: queue depth, in rows, at which the next chunk is started.
+        blend: rows over which a new chunk is cross-faded into the old one.
+        fps: the control rate, which is what turns a latency into a row count.
     """
     from lerobot.rollout.inference.sync import SyncInferenceEngine
 
@@ -471,9 +489,11 @@ def use_chunk_fifo(ctx: Any, *, enabled: bool = True) -> Any | None:
     if not isinstance(engine, SyncInferenceEngine):
         logger.debug("not a sync engine (%s); nothing to replace", type(engine).__name__)
         return None
-    replacement = build_fifo(engine)
+    replacement = build_fifo(
+        engine, asynchronous=asynchronous, replan_at=replan_at, blend=blend, fps=fps
+    )
     ctx.policy.inference = replacement
-    logger.info("chunk FIFO engine installed in place of %s", type(engine).__name__)
+    logger.info("%s installed in place of %s", type(replacement).__name__, type(engine).__name__)
     return replacement
 
 
@@ -888,6 +908,9 @@ def dryrun(
     invert_gripper: bool = False,
     trace: Any = None,
     fifo: bool = True,
+    asynchronous: bool = True,
+    replan_at: int = DEFAULT_REPLAN_AT,
+    blend: int = DEFAULT_BLEND_STEPS,
 ) -> list[DryRunStep]:
     """Run the whole deployment path with the arms attached, and send nothing.
 
@@ -911,6 +934,10 @@ def dryrun(
             also the safe place to check both.
         fifo: serve the chunk from :mod:`dk1lab.fifo`, as ``run`` does. On by
             default so a dry run exercises the path the rollout will take.
+        asynchronous, replan_at, blend: see :func:`use_chunk_fifo`. A dry run
+            steps at its own pace rather than at ``fps``, so the async engine's
+            timing here is not a rollout's; what it does exercise is the worker
+            thread, the splice and the report.
     """
     import torch
     from lerobot.rollout.strategies import BaseStrategy
@@ -918,7 +945,14 @@ def dryrun(
     from lerobot.utils.feature_utils import build_dataset_frame
 
     ctx, _ = build_context(cfg, invert_gripper=invert_gripper)
-    use_chunk_fifo(ctx, enabled=fifo)
+    use_chunk_fifo(
+        ctx,
+        enabled=fifo,
+        asynchronous=asynchronous,
+        replan_at=replan_at,
+        blend=blend,
+        fps=cfg.fps,
+    )
     strategy = BaseStrategy(cfg.strategy)
     collected: list[DryRunStep] = []
     if trace is not None:
@@ -1054,16 +1088,17 @@ def ended_cleanly(error: BaseException | None) -> bool:
 
 
 def _home_rate(cfg: Any) -> float:
-    """The sweep speed: the same cap this run drove the policy under.
+    """The sweep speed: :data:`~dk1lab.home.DEFAULT_HOME_RATE`, or the run's cap
+    if that is tighter.
 
-    A home sweep is commanded motion with nobody's hand on a leader arm, so it
-    has no business being faster than the policy was allowed to be. When the run
-    was uncapped (``--no-limit``) there is no number to inherit and
-    :data:`~dk1lab.home.DEFAULT_HOME_RATE` applies — uncapping the policy is a
-    deliberate act, letting an automatic shutdown sweep inherit it is not.
+    The cap is an upper bound on what a policy nobody trusts may do; it is not a
+    speed to aim for. Reading it as one is what made the 2026-08-20 raise from
+    0.3 to 1.0 rad/s speed the shutdown sweep up as a side effect. When the run
+    was uncapped (``--no-limit``) there is no number at all — and uncapping the
+    policy is a deliberate act, letting an automatic shutdown sweep inherit it is
+    not. :func:`~dk1lab.home.home_rate` handles both.
     """
-    rate = getattr(cfg.robot, "max_joint_rate", None)
-    return float(rate) if rate else DEFAULT_HOME_RATE
+    return home_rate(getattr(cfg.robot, "max_joint_rate", None))
 
 
 def run(
@@ -1074,6 +1109,9 @@ def run(
     invert_gripper: bool = False,
     trace: Any = None,
     fifo: bool = True,
+    asynchronous: bool = True,
+    replan_at: int = DEFAULT_REPLAN_AT,
+    blend: int = DEFAULT_BLEND_STEPS,
 ) -> HomeReport | None:
     """Drive the followers with the policy. **Moves the arms.**
 
@@ -1082,6 +1120,12 @@ def run(
     leaves.
 
     Args:
+        display: stream to Rerun. The cameras and the robot state as always
+            (LeRobot's ``log_rerun_data``), plus one panel per joint carrying
+            the policy's own plan, the command the arms were actually given and
+            the position they reached — see :mod:`dk1lab.actionview`. That
+            triple is what makes rough motion attributable: the gap between the
+            first two is ours, the gap between the last two is the hardware.
         home: when given, sweep the arms to this pose once the loop has ended —
             on the duration limit *and* on Ctrl-C, but never after an exception,
             because a run that ended in a fault is not one to command more motion
@@ -1097,6 +1141,12 @@ def run(
             where it is worth ~22 ms of a 33.3 ms control period; ignored under
             RTC, which already serves chunks whole. Off is for measuring the
             difference, not for ordinary use.
+        asynchronous: compute each chunk on a worker thread while the previous
+            one is still being served. On by default, and the thing that removes
+            the ~310 ms freeze the arms took once per chunk. ``False`` is the
+            blocking engine — the one that pauses — kept for comparison.
+        replan_at: queue depth, in rows, at which the next chunk is started.
+        blend: rows over which a new chunk is cross-faded into the old one.
 
     Returns:
         The :class:`~dk1lab.home.HomeReport`, or ``None`` if homing was not asked
@@ -1106,20 +1156,38 @@ def run(
     from lerobot.utils.process import ProcessSignalHandler
     from lerobot.utils.visualization_utils import init_visualization, shutdown_visualization
 
+    from .actionview import ActionView, pin_blueprint
+
     handler = ProcessSignalHandler(use_threads=True, display_pid=False)
     shutdown_event = handler.shutdown_event
 
     watching = display or (trace is not None and trace.display)
     if watching:
         init_visualization("rerun", session_name="dk1-policy")
+        # Before the loop, and therefore before the first log_rerun_data call:
+        # it caches a blueprint off its first observation, and whichever layout
+        # gets there first is the one the operator sees.
+        pin_blueprint(model_input=trace is not None and trace.display)
 
     ctx, _ = build_context(cfg, shutdown_event, invert_gripper=invert_gripper)
-    use_chunk_fifo(ctx, enabled=fifo)
+    use_chunk_fifo(
+        ctx,
+        enabled=fifo,
+        asynchronous=asynchronous,
+        replan_at=replan_at,
+        blend=blend,
+        fps=cfg.fps,
+    )
     strategy = BaseStrategy(cfg.strategy)
     # After build_context, so prewarm's cold call is not counted as a chunk, and
     # after the FIFO swap, so the trace wraps the engine that will actually run.
     if trace is not None:
         trace.attach(ctx)
+    # After the trace, so its timing wrappers are inside this one and the cost of
+    # logging is not charged to the robot or the engine.
+    view = ActionView() if display else None
+    if view is not None:
+        view.attach(ctx)
     report: HomeReport | None = None
     ended: BaseException | None = None
     try:
@@ -1150,6 +1218,8 @@ def run(
             except Exception:
                 # Never let homing keep the arms connected and energised.
                 logger.exception("home sweep failed; disconnecting anyway")
+        if view is not None:
+            view.detach()
         strategy.teardown(ctx)
         if watching:
             shutdown_visualization("rerun")

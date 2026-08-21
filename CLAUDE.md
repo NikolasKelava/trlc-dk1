@@ -77,6 +77,7 @@ dk1lab/                 everything this fork adds; the only Python we own
   policy.py             MolmoAct2 deployment: smoke / dryrun / rollout
   trace.py              per-chunk latency, queue depth, and the policy's OWN action
   modelview.py          the model's-eye view, live, during teleoperation
+  actionview.py         policy plan vs robot command vs measured, per joint, live
   fifo.py               ChunkFIFOInferenceEngine — one model call per chunk
   serve.py              the /act HTTP endpoint sim_eval drives — no robot
   cli/                  Typer app; `dk1` entry point
@@ -182,11 +183,12 @@ So home is "zero pose, grippers open", not an arbitrary resting position.
   not the arms arrived (behind the speed cap — anything over ~3 rad at the
   current 1.0 rad/s, and it was ~0.9 rad when the cap was 0.3 — cannot finish);
   and it fires from `teardown` on every exit path including a crash.
-  Ours ramps from the previous command at the cap the run drove under, tests
-  arrival against the *measurement*, derives its timeout from the distance, runs
-  on a clean end only (duration limit or Ctrl-C — `policy.ended_cleanly`), and
-  takes SIGINT for the length of the sweep so a second Ctrl-C stops it where the
-  arms are instead of `sys.exit(1)` mid-command.
+  Ours ramps from the previous command, tests arrival against the *measurement*,
+  derives its timeout from the distance, runs on a clean end only (duration limit
+  or Ctrl-C — `policy.ended_cleanly`), and takes SIGINT for the length of the
+  sweep so a second Ctrl-C stops it where the arms are instead of `sys.exit(1)`
+  mid-command.
+  **Its speed is its own, and it is eased.** See *The home sweep speed*, below.
 - **The speed limit lives in the follower**, and in `dk1.toml`. `SafeBiDK1Follower`
   (`--robot.type=bi_dk1_follower_safe`) limits in *both* control modes; the
   numbers come from `[limits.<activity>]`, where `false` spells "no cap".
@@ -270,18 +272,38 @@ Checkpoint: `lerobot/MolmoAct2-BimanualYAM-LeRobot` (LeRobot format);
 ## Evidence status — keep this line sharp
 
 Nothing about MolmoAct2 on the real DK1 has been **scored**. No dataset
-recorded, no fine-tune completed, no success rate measured on the arms. The
+recorded, no fine-tune completed, no success rate measured on the arms. What
+*is* now settled is that the fault is no longer ours: see *The sixth run*, in
+the evidence list below. The
 wrist crop **has** now run on the arms — the fourth rollout — and alignment is
 better and the gripper waits for a good position before closing. The retune on
 top of it (inset 6, view lifted 20, capture raised to 1280×720) has **not**:
 that is checked against the live cameras, the real preprocessor and the test
 suite, and that is all. The
-policy has now driven these arms three times. The third run — after the limit
+policy has now driven these arms five times. The third run — after the limit
 and engine changes below — moves **smoothly, without stalling**, visually
 tracks the dice and reaches for it, and **misaligns the gripper with the dice**.
 That is a real, specific, diagnosable failure rather than an impression, and it
 is a long way from where the first two runs were. But it is still not a scored
 result: a policy that reaches is not a policy that works.
+
+The fifth run, with the crop retune and the chunk FIFO, found the remaining
+motion fault: the arms **freeze for ~310 ms once a second**, because the loop
+waits for one model call per chunk. See *The freeze* and *The fix*.
+
+**The sixth run closed it, and closed this fork's side of the problem.** With
+the async chunk FIFO the loop held **29.9 Hz over 335 chunks with zero starved
+ticks**, the only blocking tick was the cold start, and the home sweep ran on
+the arms for the first time (8.5 s, worst joint 0.028 rad off). Nikolas then
+watched `--display`'s per-joint panels — the policy's own plan against the
+command against the measurement — and read the verdict off them directly: **the
+roughness is in the policy's output**, which does not produce a clean
+trajectory, not in anything between the model and the motor.
+
+That is the end of the line of work that started with the first rollout's
+judder. Every fault since has been ours; this one is not. **What is still not
+established is a score** — no success count over labelled attempts — and the
+right arm was reported not to pick anything up, which nothing here explains.
 
 **In simulation, on 2026-08-20, our checkpoint scored 3/3.** That reverses the
 0/10 recorded here a day earlier, and the thing that changed was the episode
@@ -393,7 +415,7 @@ ports is open any more.
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
-| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms four times**; judder and stall fixed, wrist FOV crop improved alignment and the gripper now waits for position. Crop retune, 720p capture and the chunk FIFO **built, not yet run** |
+| **3** | Zero-shot MolmoAct2 evaluation — the first real goal | **run on the arms six times.** Every timing and motion fault this fork could cause is now closed on the hardware: judder, stall, freeze, and the trace that lied about all three. What is left is the **policy's own output**, and it is not smooth. Not yet **scored** |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **run: 3/3 with a 120 s budget; 0/10 was a too-short episode** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
 
@@ -447,9 +469,10 @@ a fifth (`home`) added afterwards that has not:
 
 Two flags added after the second rollout, both read-only: `--trace` (on by
 default) and `--display-policy-input`. `--invert-gripper` is now off by default.
-`--fifo` (on by default, `run` and `dryrun`) is **not** read-only in the same
-sense — it changes which engine drives the arms — but it is action-identical;
-see *The 27.7 Hz loop*.
+`--fifo` (on by default, `run` and `dryrun`) changes which engine drives the arms
+but is action-identical; see *The 27.7 Hz loop*. `--async-fifo` (also on by
+default) is **not** action-identical and is not meant to be — it re-plans four to
+five times more often; see *The fix*. `--replan-at` and `--blend` tune it.
 
 `dk1lab/policy.py` is the single implementation; `dk1lab/checkpoint.py` is the
 JSON-only reader behind `check`. Settings are decided in code, not left to a
@@ -647,17 +670,20 @@ queue's `merge` is wrapped on the instance. `attach` runs after `build_context`
 so `prewarm`'s cold call is not counted as a chunk; `attach_queue` runs after
 `strategy.setup`, because the RTC queue does not exist until `engine.start()`.
 
-What remains for this phase: **a scored run with the crop and the FIFO on**. The motion
-faults are closed, the failure is spatial, and the wrist crop that addresses it
-is built and configured but **has never driven a rollout** — see *The camera
-crop*. Run it, then score it: labelled attempts with a success count, which is
-the input to the Phase 4 decision.
+What remains for this phase: **a score**. Every motion fault this fork could
+cause is closed on the hardware — the async FIFO ran, the loop holds 29.9 Hz
+with no starved ticks, and the roughness that is left was watched in
+`--display`'s per-joint panels and is the policy's own output. So the next run
+is not a debugging run: it is labelled attempts with a success count, which is
+the input to the Phase 4 decision. Two specific things to look at while scoring:
+**the right arm was reported not to pick anything up**, and the policy's own
+plan is not a smooth trajectory.
 
-Still unwatched, and unchanged by any of this: the home *sweep*. The pose is
-captured, but run `dk1 policy home` on its own, from a pose the arms are not
-already in, before putting `--home` on a rollout — that is both arms moving
-along a path no hardware has seen yet. And the gripper inversion has never been
-seen to open and close correctly on the arms.
+The home *sweep* has now run on the arms too — 8.5 s, 250 commands, worst joint
+0.028 rad off — with the eased profile another session added. The gripper
+inversion still has not been watched opening and closing correctly, though the
+trace now shows the policy commanding the channel across +0.033 .. +1.000, so it
+is at least being used.
 
 **Phase 4** — record → LoRA from the same checkpoint → deploy → scored, labelled
 eval attempts.
@@ -1063,16 +1089,264 @@ reference, so a gripper inversion already applied to them still applies.
 is a silent no-op under `--rtc`, which already serves chunks whole. `--no-fifo`
 exists to measure the difference on the same rollout, not for ordinary use.
 
-**What is still unverified:** it has never driven the arms. The equivalence is
-established on this machine against the real weights, and the tick saving is
-measured on the real cameras, but the number that matters — whether the in-situ
-loop actually holds 30 Hz — needs a rollout. That is the same rollout that would
-close the last open question in this section: the in-situ `pre 27 ms` against
-15.9 measured here, ~11 ms most likely lost to contention with the follower
-serial reads. Fold both into the next run; the fixed `--trace` reports them.
+**It ran on the arms, and it did what it promised and no more.** The engine cost
+per tick went to `select 0.0`. What it did *not* touch is the pause, and that is
+the next section.
 
 The machine's CPU governor stays on `powersave` by request. It was ruled out as
 a cause here.
+
+### The freeze: the loop waits for one model call per chunk, and that is the whole warning
+
+Reported from the arms 2026-08-21, with the FIFO on. One trace line and one
+LeRobot warning:
+
+```
+chunk 144    1297 ms over  30 ticks  = 23.1 Hz  (pause 313 ms, model 220)
+  per cached tick   34.1 ms = 29.4 Hz  (pre 32.4 · select 0.0 · post 46.2 · loop 34.0)
+WARNING lerobot.rollout.strategies.base: Record loop is running slower (3.4 Hz)
+```
+
+**The warning is one tick.** `BaseStrategy.run` measures a single loop iteration
+and warns when it exceeds `1/fps`; `1/dt = 3.4 Hz` is a **294 ms tick**, and the
+only tick that costs that is the one that ran the model. It fires **once per
+chunk**, about once a second, and it is not task-dependent, not the crop and not
+the capture resolution. It is also not new — the same warning is in the first
+rollout's log, at commit `2fab41c`, before the crop existed.
+
+Confirmed by reproduction rather than by argument: a fake engine that sleeps
+220 ms once per 30 ticks and 0 ms otherwise, in an **empty loop with no robot at
+all**, prints
+
+```
+chunk   0    1268 ms over  30 ticks  = 23.7 Hz  (pause 299 ms, model 220)
+  per cached tick   33.4 ms = 29.9 Hz  (pre 32.6 · select 0.0 · post 46.4 · loop 33.4)
+```
+
+which is the arms' line to within the robot's own per-tick work. Everything in
+it follows from the pause.
+
+**Two of those numbers were the trace lying, and that is now fixed.**
+`pre 32.4 · post 46.2` are per *chunk* — the FIFO runs the pipelines once per
+chunk, and `RolloutTrace` was keeping the last value it saw and stamping it onto
+every tick. 79 ms of pipeline inside a 34 ms tick is impossible on its face.
+`loop 34.0` was also not work: it was `period − engine`, which counts
+`precise_sleep`. The empty fake loop reports `loop 33.4`. So the cached ticks
+were **never** the problem — Nikolas confirmed the run's warnings only ever
+quote 3–4.5 Hz, never ~29, which settles it: work per tick was under budget.
+
+**What the pause does to the arms**, all three from the one fact:
+
+- a freeze of ~310 ms, once a second — the stop-and-go;
+- the chunk **plays back 23% slow**, 30 rows meant for 1000 ms spread over 1297;
+- the policy **re-plans only every 1.3 s**, and each new chunk is anchored on the
+  *measured* pose, which lags the commanded one (speed limit plus impedance
+  compliance). The longer the gap, the more lag has accumulated, and the bigger
+  the correction when the plan lands — with nothing blending the seam. That is
+  the rough, fast trajectory change.
+
+Note `post 46 ms`: the postprocessor's last step is `device_processor` to cpu, so
+that number was the **CUDA sync**, not CPU work. Model and post are one number,
+~266 ms of GPU. There is no waste to reclaim there.
+
+### The fix: `AsyncChunkFIFOInferenceEngine`, built and measured, not yet on the arms
+
+Compute the next chunk on a worker thread while the current one is still being
+served. `dk1lab/fifo.py` gains a second engine; nothing upstream is touched and
+the blocking one stays, behind `--blocking-fifo`, so the two can be compared.
+
+Per tick the control loop publishes its observation, serves one row, and — when
+the queue falls to `replan_at` — wakes the worker. When a chunk lands it is
+**spliced**: `ceil(latency / period)` rows describe time already spent and are
+dropped, the rest replace the queue, cross-faded over `blend` rows.
+
+**Measured on this machine, real bf16 weights, real preprocessor, paced at
+30 Hz, synthetic frames, no robot:**
+
+| | loop rate | ticks that ran a model call | starved ticks |
+| --- | --- | --- | --- |
+| `--blocking-fifo` | 25.8 Hz | 17 in 20 s, worst 201 ms | 0 |
+| **async (default)** | **29.7 Hz** | **1** (the cold start) | **0** |
+
+and per chunk, async: `plan 196 ms old = 6 rows dropped, queue 9 -> 24,
+blended 4`, one chunk every 15 ticks. So the plan the arms execute is ~200 ms
+old instead of the blocking engine's 1300 ms, and the queue never came close to
+dry — 9 rows (300 ms) still in hand every time a chunk landed.
+
+Design decisions worth keeping:
+
+- **Drop by wall clock, not by rows consumed.** A chunk is a plan parameterised
+  by time, and time is what passed. `ceil` rather than `round` so the first row
+  served is never one the arms have already gone past.
+- **`replan_at` defaults to 15**, half a chunk. At a 310 ms in-situ latency that
+  leaves ~190 ms of margin and lands a plan every ~510 ms. Higher is fresher
+  *and* safer (queue at splice is `replan_at − latency_ticks`), at the cost of
+  GPU duty and of blending a larger fraction of what gets executed. The ceiling
+  is `30 − latency_ticks` ≈ 21, past which it runs back to back like RTC.
+- **`blend` defaults to 4** rows, 133 ms. It is RTC's prefix weighting done on
+  the postprocessed actions instead of inside the flow model — much simpler, and
+  it does not require inference to fit inside `chunk / fps`. It must stay well
+  under the replan interval or it becomes the `--execution-horizon 30` failure
+  mode by another door.
+- **Starvation holds the last row** rather than returning `None`. The arms do
+  the same thing either way (the motor chain holds the last target), but this
+  keeps it counted and reported instead of only showing up as the chain's
+  `No command for 0.50 s`.
+- **A persistent worker failure is re-raised on the control thread** after 5
+  consecutive errors. Silence would look exactly like a policy that has decided
+  to hold still.
+- **A reset cold-starts again**, and a generation counter discards a chunk
+  computed before it. `reset()` takes `_compute_lock`, so it waits for an
+  in-flight model call rather than resetting the policy underneath one.
+- **The chunk that arrives past its own last row keeps the previous plan** and
+  says so. That is the 900 ms RTC failure, reported rather than executed.
+
+**This is deliberately not action-identical.** The blocking FIFO was a pure speed
+change and was bit-identical to the sync engine; this re-plans four to five times
+more often, drops rows and blends. That is the point.
+
+**Wiring.** `policy.use_chunk_fifo(ctx, asynchronous=, replan_at=, blend=, fps=)`
+replaces `ctx.policy.inference` between `build_context` and `strategy.setup` —
+`BaseStrategy._init_engine` keeps whatever it finds there, so that attribute is
+the whole of the seam. It runs **after** `build_context` so `prewarm` has already
+built the CUDA graph, and **before** the trace attaches. Pipelines are carried
+across by reference, so a gripper inversion already applied still applies.
+
+**It ran on the arms 2026-08-21, and the defaults were sized right.** The
+summary over 335 chunks:
+
+```
+loop rate     29.9 Hz (target 30)     median tick 33.4 ms, p95 36.0, worst 196.4 (cold start)
+  engine      0.01 ms    robot read+send 0.4 ms    idle 33.0 ms
+median chunk  212 ms (pre 41 · model 169 · post 0)
+  plan age    212 ms on arrival = 7 rows dropped
+  queue       8 rows in hand at the splice, 23 after, 4 blended
+  starved     0 ticks
+gripper       policy commanded +0.033 .. +1.000
+```
+
+Three things to keep from that. **In-situ latency is 212 ms, not the ~310 ms the
+blocking run implied** — that figure included the pipelines being charged to the
+wrong place. **`robot read+send` is 0.4 ms**, so the control loop was never the
+constraint and the old `loop 34.0` really was almost all `precise_sleep`, as the
+rebuilt trace claimed. And the **policy commands the gripper across almost its
+whole range**, which is the first direct evidence on this cell that it uses the
+channel at all.
+
+`replan_at = 15` left 8 rows (270 ms) in hand at every splice. There is room to
+raise it if fresher plans are ever wanted; nothing yet says they are.
+
+### Watching the chain: `--display` now draws three lines per joint
+
+Built 2026-08-21 after the async FIFO ran and the motion was still rough. The
+console's two rows are **in different units**, and reading them as a pair is the
+obvious mistake — `policy +0.977` and `robot +2.208` are one number written
+twice. `policy` is the flow head's output in the checkpoint's normalised space,
+nominally [-1, +1]; `robot` is the same row after `clamp_action`, the quantile
+unnormaliser and the gripper transform. Both rows are now labelled with their
+units. And after a splice the `robot` row is the **cross-faded** one, so it is
+only a matched pair up to the blend.
+
+`dk1lab/actionview.py` is the clean comparison. `dk1 policy run --display` logs,
+per tick and on one axis per joint:
+
+| | |
+| --- | --- |
+| `policy/<key>` | the model's own row for this tick, in robot units, **before** the cross-fade and the limiter |
+| `command/<key>` | what `send_action` returned — after both. `SafeBiDK1Follower` returns the *limited* action, which is why that is the number logged |
+| `observation.<key>` | where the joint really is, from LeRobot as always |
+
+Which makes rough motion attributable without another rollout: `policy` rough
+and `command` following it is the plans; `policy` smooth and `command` stepping
+or lagging is ours (blend or limiter); `command` smooth and `observation` rough
+is the arm. `AsyncChunkFIFOInferenceEngine` keeps a second, **unblended** queue
+(`_plan`) purely so the first of those three exists.
+
+**It pins the Rerun layout**, for the same reason `dk1lab/modelview.py` does and
+with the same coupling written down: `log_rerun_data` caches a blueprint off its
+first observation, and anything not in it is invisible. The layout is one
+`TimeSeriesView` per joint, seven across, so the top row is the left arm and the
+bottom the right — LeRobot's default puts all fourteen observations in one panel
+and all fourteen actions in another, at different scales, which is why the
+comparison has never been made. `--display-policy-input` composes: its 378x378
+panels are added to the same blueprint rather than replacing it.
+
+Costs **0.26 ms per tick** (median, real Rerun, 28 `rr.log` calls, measured
+here), against a 33.3 ms budget.
+
+### The trace, rebuilt for the FIFO
+
+Three changes, all from the two numbers that were wrong above:
+
+- **The FIFO reports its own chunks.** `dk1lab.fifo.ChunkReport` is measured
+  inside the engine — on the thread that pays for it, which under the async
+  engine is not the control loop — and carries what only the engine knows: plan
+  age on arrival, rows dropped, queue depth before and after the splice, rows
+  blended, ticks starved. `RolloutTrace.attach` hooks `engine.on_chunk` (detected
+  by `hasattr`, not `isinstance`) and pairs each report with the **ticks** that
+  ran while it was computing.
+- **Robot work is timed separately from sleep.** `attach` wraps
+  `robot_wrapper.get_observation` and `send_action`, so a tick reads
+  `robot 4.2 · wait 29.2` instead of one `loop 33.4` that means nothing. A loop
+  with 29 ms of headroom and one 29 ms over budget used to print the same line.
+- **The worst tick is reported, and counted.** A blocking model call is one tick
+  in thirty: it moves neither the median nor the p95, so quoting only those
+  reports a stop-and-go loop as a smooth one. `blocking_ticks` counts ticks whose
+  *engine call* exceeded the budget — one is the async cold start and is fine,
+  more than one is the freeze — so the verdict fires on the right thing.
+
+The plain-sync path (`--no-fifo`) also had the stale-timer bug and now clears
+`_pre_ms` / `_post_ms` per tick alongside `_model_ms`.
+
+### The home sweep speed: 0.3 rad/s, eased at both ends
+
+Reported from the arms 2026-08-21: the sweep follows a smooth trajectory but is
+**too fast**. Two separate things were wrong, and both are fixed in
+`dk1lab/home.py`. **Neither has run on the arms.**
+
+**It was running at the policy's speed cap, which is not a speed.** `sweep_to_home`
+and `policy._home_rate` both read `[limits.policy].max_joint_rate` and used it as
+the sweep rate. That cap is an *upper bound* on what a policy nobody trusts may
+do; reading an upper bound as an instruction meant the 2026-08-20 raise from 0.3
+to 1.0 rad/s tripled the speed of homing as a side effect, without anyone
+deciding to. `home.home_rate(cap)` now returns `min(DEFAULT_HOME_RATE, cap)` —
+0.3 rad/s, or the cap when the cap is tighter, because commanding faster than
+the limiter allows only means the limiter clamps it and then the two ramps
+disagree about what was commanded. `false` (no cap at all) gives 0.3, not
+"any speed you like".
+
+**It was one constant rate, so it started and stopped with a step change in
+velocity.** `home.ease_scale` scales the per-tick step by the smaller of two
+smoothsteps: one in *time* since the start (`DEFAULT_EASE_IN_S` = 0.75 s), one in
+*distance still to go* (`DEFAULT_EASE_OUT_RAD` = 0.25 rad). Taking the minimum is
+what lets a sweep shorter than both simply never reach full speed instead of the
+two ramps fighting.
+
+Three details worth keeping:
+
+- **The ease-out reads the distance left in *command* space**, not against the
+  measurement. The ramp is driven from the previous command, so that is the
+  quantity that actually reaches zero; the measurement lags it and would hold the
+  profile at its floor for the whole settling time.
+- **The profile never reaches zero** — `DEFAULT_EASE_FLOOR` = 0.2 of full rate.
+  A profile that did would never leave the start and would only approach home
+  asymptotically, timing out just short of the tolerance.
+- **The timeout accounts for the easing** (`home.ease_overhead`, generously
+  rounded up), or it would cut off sweeps that were going to arrive.
+
+Net effect, simulated against the same fake arms the tests use: a 2 rad sweep
+went 2.0 s at 1.0 rad/s flat out, and now takes 7.5 s — **3.7x slower**, peaking
+at 0.3 rad/s, starting and ending at ~0.06 rad/s with no step change anywhere in
+the profile. Short sweeps are slower still relative to before (a 0.2 rad move is
+7x) because they never leave the eased region.
+
+The gripper is deliberately **not** eased or slowed: it is at its home value
+already in the ordinary case, and a slow gripper is not the hazard.
+
+`dk1 policy home --max-joint-rate 0.6` still names a peak explicitly and is
+honoured as given — `sweep_to_home` gained a `rate` argument for it. That flag's
+help used to say "sweep speed" while setting the limiter, which after this change
+would have been a lie in the one direction an operator would notice.
 
 ### The sim run: the policy behaves the same way with every hardware excuse removed
 

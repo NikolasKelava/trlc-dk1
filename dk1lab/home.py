@@ -28,7 +28,16 @@ Design
 The sweep is the same shape as the limiter's: **ramp from the previous command,
 not from the measurement**, so stiction cannot deadlock the setpoint, and so the
 limiter downstream has nothing left to clamp. Arrival is judged on the *measured*
-arm joints. The grippers are commanded to their home value but excluded from the
+arm joints.
+
+**The speed is eased at both ends** rather than being one constant rate. A
+constant-rate ramp is a step change in velocity at the start and another at the
+end — the arms snap into motion and stop dead on the target, which is what made
+homing feel fast even before it was. :func:`ease_scale` scales the step by a
+smoothstep in time at the start and a smoothstep in *distance to go* at the end,
+and takes whichever is smaller, so a sweep too short for both simply never
+reaches full speed. The peak rate itself comes from :func:`home_rate` and is no
+longer inherited from the policy's speed cap. The grippers are commanded to their home value but excluded from the
 arrival test — a gripper is supposed to stall against whatever it is holding, and
 waiting for one to reach a number is how a home sweep hangs until its timeout.
 
@@ -52,13 +61,33 @@ from .layout import ACTION_KEYS, is_gripper
 
 logger = logging.getLogger(__name__)
 
-#: Joint speed of the home sweep, rad/s, when the caller names none. Matches
-#: ``[limits.policy]``: homing is commanded motion with nobody's hand on a leader
-#: arm, so it moves no faster than the policy was allowed to.
+#: Peak joint speed of the home sweep, rad/s. **This is a target, not a cap** —
+#: :func:`home_rate` takes the smaller of it and whatever ``[limits.policy]``
+#: allows, so raising the policy cap never speeds the sweep up.
+#:
+#: It used to *be* the policy cap, which meant the 2026-08-20 raise from 0.3 to
+#: 1.0 rad/s silently tripled the speed of homing as well. Homing is commanded
+#: motion with nobody's hand on a leader arm and nothing to react to; the cap
+#: exists so a policy cannot lunge, and inheriting it as a *speed* was reading an
+#: upper bound as an instruction.
 DEFAULT_HOME_RATE: float = 0.3
 
-#: Gripper speed during the sweep, normalised units/s.
+#: Gripper speed during the sweep, normalised units/s. Neither slowed nor eased:
+#: the gripper is already at its home value in the ordinary case, and a slow
+#: gripper is not the hazard here.
 DEFAULT_HOME_GRIPPER_RATE: float = 1.0
+
+#: Seconds the sweep spends winding up from a standstill to the full rate.
+DEFAULT_EASE_IN_S: float = 0.75
+
+#: How far out from home, in rad, the sweep starts slowing down again.
+DEFAULT_EASE_OUT_RAD: float = 0.25
+
+#: The slowest the eased sweep ever goes, as a fraction of the full rate. Nonzero
+#: on purpose: a profile that reaches zero at either end never leaves the start
+#: and never arrives at the end, it only approaches one asymptotically until the
+#: timeout fires.
+DEFAULT_EASE_FLOOR: float = 0.2
 
 #: How close each arm joint must be to its home value to count as arrived, rad.
 #: ~1.7 deg. Tighter than this and stiction alone can hold a joint just outside
@@ -170,6 +199,91 @@ def farthest(
     return key, float(measured[key]) - float(target[key])
 
 
+def home_rate(cap: float | None) -> float:
+    """The speed to sweep at, given whatever speed limit is in force.
+
+    :data:`DEFAULT_HOME_RATE` unless the limiter is set tighter, in which case
+    the limiter wins — commanding faster than the limiter allows only means the
+    limiter clamps it, and then the ramp here and the ramp there disagree about
+    what was commanded.
+
+    ``cap`` may be ``None`` or ``False``, which is how ``dk1.toml`` spells "no
+    limiting at all". That is a deliberate act for the activity it was set on;
+    it is not permission for a shutdown sweep to move at any speed it likes.
+    """
+    if not cap:
+        return DEFAULT_HOME_RATE
+    return min(DEFAULT_HOME_RATE, float(cap))
+
+
+def smoothstep(x: float) -> float:
+    """The classic ``3x^2 - 2x^3``, clamped to ``[0, 1]``.
+
+    Zero slope at both ends, which is the whole point: the speed profile built
+    from it has no corner where the arms would jerk.
+    """
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    return x * x * (3.0 - 2.0 * x)
+
+
+def ease_scale(
+    *,
+    elapsed: float,
+    remaining: float,
+    ease_in_s: float = DEFAULT_EASE_IN_S,
+    ease_out_rad: float = DEFAULT_EASE_OUT_RAD,
+    floor: float = DEFAULT_EASE_FLOOR,
+) -> float:
+    """Fraction of the full joint rate to move at, this tick.
+
+    Two independent ramps, and the tighter of the two wins: one in *time* from
+    the start of the sweep, one in *distance* from the target. Taking the minimum
+    means a sweep shorter than both simply never reaches full speed, instead of
+    the ease-in and the ease-out fighting over it.
+
+    Args:
+        elapsed: seconds since the sweep started.
+        remaining: how far the joint with furthest to go still has to travel, rad.
+            Measured in **command** space, not against the measurement: the ramp
+            is driven from the previous command, so that is the quantity that
+            actually reaches zero. The measurement lags it and would keep the
+            profile pinned at the floor for the whole settling time.
+        floor: the smallest fraction returned. Keeps every tick making progress,
+            which is what bounds the sweep's duration and lets the timeout
+            estimate stay honest.
+
+    Returns:
+        A value in ``[floor, 1.0]``.
+    """
+    scale = 1.0
+    if ease_in_s > 0.0:
+        scale = min(scale, smoothstep(elapsed / ease_in_s))
+    if ease_out_rad > 0.0:
+        scale = min(scale, smoothstep(abs(remaining) / ease_out_rad))
+    return floor + (1.0 - floor) * scale
+
+
+def ease_overhead(
+    rate: float,
+    *,
+    ease_in_s: float = DEFAULT_EASE_IN_S,
+    ease_out_rad: float = DEFAULT_EASE_OUT_RAD,
+) -> float:
+    """Seconds the easing adds to a constant-rate sweep, generously rounded up.
+
+    Half of ``ease_in_s`` is lost winding up; the ease-out tail costs a bit over
+    twice what its distance would cost at full rate. Both are over-estimated
+    here on purpose — this feeds a timeout, and a timeout that fires early on a
+    sweep that was going to arrive is the failure mode worth avoiding.
+    """
+    if rate <= 0.0:
+        return 0.0
+    return 0.5 * ease_in_s + 3.0 * ease_out_rad / rate
+
+
 def estimate_duration(
     measured: Mapping[str, float], target: Mapping[str, float], rate: float
 ) -> float:
@@ -187,6 +301,9 @@ def go_home(
     gripper_rate: float = DEFAULT_HOME_GRIPPER_RATE,
     fps: float = DEFAULT_HOME_FPS,
     tolerance: float = DEFAULT_TOLERANCE,
+    ease_in_s: float = DEFAULT_EASE_IN_S,
+    ease_out_rad: float = DEFAULT_EASE_OUT_RAD,
+    ease_floor: float = DEFAULT_EASE_FLOOR,
     timeout_s: float | None = None,
     should_abort: Callable[[], bool] | None = None,
     clock: Callable[[], float] = time.monotonic,
@@ -200,10 +317,18 @@ def go_home(
         send: what to command. Whatever rate limiting sits behind this is applied
             on top; the ramp here is sized to stay under it, not to fight it.
         target: the home pose, all 14 keys.
-        rate: arm joint speed, rad/s.
-        gripper_rate: gripper speed, normalised units/s.
+        rate: arm joint *peak* speed, rad/s. The easing means the sweep only
+            reaches it in the middle; see ``ease_in_s``.
+        gripper_rate: gripper speed, normalised units/s. Not eased.
         fps: command rate.
         tolerance: per-joint arrival threshold, rad.
+        ease_in_s: seconds spent winding up to ``rate`` from a standstill, so
+            the sweep does not start with a step change in velocity.
+        ease_out_rad: distance from home at which the sweep starts slowing
+            down again, so it settles onto the target instead of arriving at
+            full speed and stopping dead. Set either to 0 for the old
+            constant-rate ramp.
+        ease_floor: the slowest the easing goes, as a fraction of ``rate``.
         timeout_s: give up after this long. ``None`` derives it from the distance
             actually to travel, so a short sweep does not sit waiting and a long
             one is not cut off halfway — which is exactly what LeRobot's fixed
@@ -226,17 +351,20 @@ def go_home(
 
     measured = dict(measure())
     if timeout_s is None:
-        timeout_s = min(
-            estimate_duration(measured, goal, rate) * TIMEOUT_SLACK + TIMEOUT_MARGIN_S,
-            MAX_TIMEOUT_S,
+        travel_s = estimate_duration(measured, goal, rate) + ease_overhead(
+            rate, ease_in_s=ease_in_s, ease_out_rad=ease_out_rad
         )
+        timeout_s = min(travel_s * TIMEOUT_SLACK + TIMEOUT_MARGIN_S, MAX_TIMEOUT_S)
 
     key, error = farthest(measured, goal)
     logger.info(
-        "home sweep: %.3f rad to travel on %s, %.2f rad/s, timeout %.1fs",
+        "home sweep: %.3f rad to travel on %s, peak %.2f rad/s "
+        "(ease in %.2fs, ease out %.2f rad), timeout %.1fs",
         abs(error),
         key,
         rate,
+        ease_in_s,
+        ease_out_rad,
         timeout_s,
     )
 
@@ -254,7 +382,20 @@ def go_home(
         if elapsed >= timeout_s:
             break
 
-        command = step_toward(command, goal, joint_step=joint_step, gripper_step=gripper_step)
+        # The ease-out reads the distance left in COMMAND space, not against the
+        # measurement: the ramp is driven from the previous command, so that is
+        # what actually reaches zero. The measured error settles afterwards.
+        _, to_go = farthest(command, goal)
+        scale = ease_scale(
+            elapsed=elapsed,
+            remaining=to_go,
+            ease_in_s=ease_in_s,
+            ease_out_rad=ease_out_rad,
+            floor=ease_floor,
+        )
+        command = step_toward(
+            command, goal, joint_step=joint_step * scale, gripper_step=gripper_step
+        )
         send(command)
         steps += 1
         sleep(period)
@@ -302,6 +443,7 @@ def sweep_to_home(
     *,
     target: Mapping[str, float],
     limits: Any = None,
+    rate: float | None = None,
     control_mode: str = "impedance",
     fps: float = DEFAULT_HOME_FPS,
     tolerance: float = DEFAULT_TOLERANCE,
@@ -312,12 +454,16 @@ def sweep_to_home(
     rollout, for putting the cell back in order without loading a 7B model. No
     cameras are opened: nothing here looks at them.
 
+    ``rate`` is the peak speed, reached in the middle of the sweep and eased away
+    from at both ends. Passing it is an explicit operator choice and is honoured
+    as given; leaving it ``None`` derives it with :func:`home_rate`.
+
     Ctrl-C during the sweep stops it where the arms are and disconnects — which
     disables the motors, so support anything holding itself up.
     """
     from .teleop import build_follower
 
-    rate = getattr(limits, "max_joint_rate", None) or DEFAULT_HOME_RATE
+    rate = float(rate) if rate else home_rate(getattr(limits, "max_joint_rate", None))
     follower = build_follower(config, cameras=False, control_mode=control_mode, limits=limits)
     follower.connect()
     try:

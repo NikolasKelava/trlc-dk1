@@ -22,6 +22,7 @@ from .. import checkpoint as ckpt
 from ..cameras import crop_summary
 from ..config import DEFAULT_CONFIG_PATH, load
 from ..layout import ACTION_KEYS, GRIPPER_INDICES, IMAGE_KEYS
+from ..fifo import DEFAULT_BLEND_STEPS, DEFAULT_REPLAN_AT
 from ..policy import DEFAULT_EXECUTION_HORIZON, DEFAULT_FPS, HOME_AT_START_POSE, POLICY_LIMITS
 from .safety import ENERGISE_HELP, MOTION_HELP, confirm_motion
 
@@ -66,6 +67,39 @@ FifoOpt = Annotated[
         ),
     ),
 ]
+AsyncOpt = Annotated[
+    bool,
+    typer.Option(
+        "--async-fifo/--blocking-fifo",
+        help=(
+            "Compute each chunk on a worker thread while the previous one is still "
+            "being served, so the loop never waits for the model. ON by default. "
+            "--blocking-fifo is the old behaviour: the arms freeze for one model "
+            "call (~310 ms) per chunk. For comparison, not for use."
+        ),
+    ),
+]
+ReplanAtOpt = Annotated[
+    int,
+    typer.Option(
+        "--replan-at",
+        help=(
+            "Queue depth, in rows, at which the next chunk is started. Must exceed "
+            "the inference latency in ticks (~10) or the queue can run dry. Higher "
+            "is fresher and safer, at the cost of running the GPU harder."
+        ),
+    ),
+]
+BlendOpt = Annotated[
+    int,
+    typer.Option(
+        "--blend",
+        help=(
+            "Rows over which a new chunk is cross-faded into the one it replaces. "
+            "0 splices hard. Keep it well under the replan interval."
+        ),
+    ),
+]
 WatchInputOpt = Annotated[
     bool,
     typer.Option(
@@ -95,10 +129,11 @@ def _echo_rtc(cfg) -> None:
     horizon = getattr(getattr(cfg, "inference", None), "rtc", None)
     if horizon is None:
         typer.echo(
-            "  inference SYNC — the whole 30-step chunk is executed, then the loop\n"
-            "                   blocks for one inference. This is the arrangement that\n"
+            "  inference SYNC — the whole 30-step chunk is executed, with no prefix\n"
+            "                   blending and no trimming. This is the arrangement that\n"
             "                   scored 100% in the simulator; --rtc is the one that\n"
-            "                   starved the queue on the arms."
+            "                   starved the queue on the arms. How the chunk reaches\n"
+            "                   the arms is the next line."
         )
         return
     horizon = horizon.execution_horizon
@@ -309,7 +344,47 @@ def _limits(settings, max_joint_rate: float | None, no_limit: bool):
     return limits
 
 
-def _report(cfg, spec: str, *, steps: int | None = None, home=None, invert: bool = False) -> None:
+def _echo_fifo(cfg, *, fifo: bool, asynchronous: bool, replan_at: int, blend: int) -> None:
+    """How the chunk reaches the arms — the thing that decides whether they pause.
+
+    Only meaningful under sync inference; RTC serves chunks whole from its own
+    background thread and this engine is not installed at all.
+    """
+    if getattr(getattr(cfg, "inference", None), "rtc", None) is not None:
+        return
+    if not fifo:
+        typer.secho(
+            "  chunk FIFO OFF — the whole input pipeline re-runs every tick and is "
+            "thrown away on 29 of 30 (~22 ms of a 33 ms budget)",
+            fg=typer.colors.YELLOW,
+        )
+        return
+    if not asynchronous:
+        typer.secho(
+            "  chunk FIFO BLOCKING — the loop waits for each model call, so the arms "
+            "freeze for ~310 ms once per chunk (--blocking-fifo)",
+            fg=typer.colors.YELLOW,
+        )
+        return
+    typer.echo(
+        f"  chunk FIFO async — the model runs on a worker thread; the loop never\n"
+        f"                   waits for it. Next chunk starts at {replan_at} rows queued,\n"
+        f"                   {blend}-row cross-fade at the splice."
+    )
+
+
+def _report(
+    cfg,
+    spec: str,
+    *,
+    steps: int | None = None,
+    home=None,
+    invert: bool = False,
+    fifo: bool = True,
+    asynchronous: bool = True,
+    replan_at: int = DEFAULT_REPLAN_AT,
+    blend: int = DEFAULT_BLEND_STEPS,
+) -> None:
     """Print everything that was built, before anything is connected."""
     robot = cfg.robot
 
@@ -354,6 +429,7 @@ def _report(cfg, spec: str, *, steps: int | None = None, home=None, invert: bool
     typer.secho("\nloop", bold=True)
     typer.echo(f"  target {cfg.fps} Hz, interpolation x{cfg.interpolation_multiplier}")
     _echo_rtc(cfg)
+    _echo_fifo(cfg, fifo=fifo, asynchronous=asynchronous, replan_at=replan_at, blend=blend)
     if steps is not None:
         typer.echo(f"  {steps} inference steps, then stop")
     elif cfg.duration:
@@ -387,8 +463,10 @@ def _echo_home(home) -> None:
 def _make_trace(*, fps: float, enabled: bool, display_policy_input: bool):
     """A :class:`~dk1lab.trace.RolloutTrace`, or ``None`` if nothing was asked for.
 
-    The chunk line is printed from the RTC background thread, roughly once or
-    twice a second — not per tick — so it stays readable while the loop runs.
+    One line per chunk — not per tick — so it stays readable while the loop
+    runs. Printed from whichever thread the record was cut on: the RTC thread
+    under ``--rtc``, and the control loop under the chunk FIFO, which reports a
+    chunk at the tick it is spliced in.
     """
     if not (enabled or display_policy_input):
         return None
@@ -454,6 +532,9 @@ def dryrun(
     invert_gripper: InvertOpt = False,
     display_policy_input: WatchInputOpt = False,
     fifo: FifoOpt = True,
+    asynchronous: AsyncOpt = True,
+    replan_at: ReplanAtOpt = DEFAULT_REPLAN_AT,
+    blend: BlendOpt = DEFAULT_BLEND_STEPS,
     build_only: Annotated[
         bool, typer.Option("--build-only", help="Build and print everything; connect nothing.")
     ] = False,
@@ -476,7 +557,10 @@ def dryrun(
         return_home=False,
         invert_gripper=invert_gripper,
     )
-    _report(cfg, spec, steps=steps, invert=invert_gripper)
+    _report(
+        cfg, spec, steps=steps, invert=invert_gripper,
+        fifo=fifo, asynchronous=asynchronous, replan_at=replan_at, blend=blend,
+    )
     if display_policy_input:
         typer.secho(
             "\n  --display-policy-input: Rerun will show the 378x378 images the MODEL "
@@ -520,6 +604,9 @@ def dryrun(
             invert_gripper=invert_gripper,
             trace=trace,
             fifo=fifo,
+            asynchronous=asynchronous,
+            replan_at=replan_at,
+            blend=blend,
         )
     finally:
         if display_policy_input:
@@ -605,11 +692,22 @@ def run(
         typer.Option("--no-limit", help="Remove the speed cap. Read the warning it prints."),
     ] = False,
     display: Annotated[
-        bool, typer.Option("--display", help="Stream robot observations to Rerun.")
+        bool,
+        typer.Option(
+            "--display",
+            help=(
+                "Stream to Rerun: the cameras and the robot state as always, plus one "
+                "panel per joint overlaying the policy's own plan, the command the arms "
+                "were given, and where they got to."
+            ),
+        ),
     ] = False,
     display_policy_input: WatchInputOpt = False,
     trace: TraceOpt = True,
     fifo: FifoOpt = True,
+    asynchronous: AsyncOpt = True,
+    replan_at: ReplanAtOpt = DEFAULT_REPLAN_AT,
+    blend: BlendOpt = DEFAULT_BLEND_STEPS,
     device: DeviceOpt = "cuda",
     invert_gripper: InvertOpt = False,
     home: Annotated[
@@ -659,7 +757,10 @@ def run(
     home_pose = None
     if home:
         home_pose = settings.home if settings.home is not None else HOME_AT_START_POSE
-    _report(cfg, spec, home=home_pose, invert=invert_gripper)
+    _report(
+        cfg, spec, home=home_pose, invert=invert_gripper,
+        fifo=fifo, asynchronous=asynchronous, replan_at=replan_at, blend=blend,
+    )
 
     if dry_run:
         typer.secho("\n--dry-run: nothing was connected and nothing moved.", fg=typer.colors.GREEN)
@@ -700,6 +801,9 @@ def run(
         invert_gripper=invert_gripper,
         trace=tracer,
         fifo=fifo,
+        asynchronous=asynchronous,
+        replan_at=replan_at,
+        blend=blend,
     )
     typer.secho("\nrollout ended; the robot is disconnected.", fg=typer.colors.GREEN)
     _echo_trace_summary(tracer)
@@ -798,7 +902,7 @@ HELP_HOME = (
     """Drive both follower arms to the \\[home] pose in dk1.toml.
 
 This is the same sweep `dk1 policy run --home` does when a run ends, without
-loading the model: ramp at the \\[limits.policy] speed cap, stop when the arms
+loading the model: ease up to 0.3 rad/s and back down again, stop when the arms
 arrive rather than after a fixed time, and report where they got to. No
 cameras are opened. Ctrl-C stops the sweep where the arms are.
 
@@ -822,7 +926,11 @@ def home(
     ] = "impedance",
     max_joint_rate: Annotated[
         float | None,
-        typer.Option("--max-joint-rate", help="Sweep speed, rad/s. Overrides dk1.toml."),
+        typer.Option(
+            "--max-joint-rate",
+            help="Peak sweep speed, rad/s. The sweep eases in and out of it. "
+            "Default: the slower of 0.3 and the dk1.toml cap.",
+        ),
     ] = None,
     show: Annotated[
         bool, typer.Option("--show", help="Print the configured home pose and exit. No motion.")
@@ -832,7 +940,7 @@ def home(
     ] = False,
 ) -> None:
     from ..config import check_devices, write_home
-    from ..home import DEFAULT_HOME_RATE, capture_pose, sweep_to_home
+    from ..home import capture_pose, home_rate, sweep_to_home
 
     if control_mode not in ("impedance", "pos_vel"):
         raise typer.BadParameter(f"control mode must be impedance or pos_vel, got {control_mode!r}")
@@ -878,10 +986,12 @@ def home(
 
     check_devices(settings)
     limits = _limits(settings, max_joint_rate, no_limit=False)
-    rate = limits.max_joint_rate or DEFAULT_HOME_RATE
+    # An explicit --max-joint-rate is the operator naming a speed, so it is used
+    # as given; without one the sweep is slower than the policy cap on purpose.
+    rate = float(max_joint_rate) if max_joint_rate else home_rate(limits.max_joint_rate)
     _echo_home(settings.home)
     confirm_motion(
-        f"sweep BOTH follower arms to the home pose at {rate} rad/s",
+        f"sweep BOTH follower arms to the home pose, easing up to {rate} rad/s",
         assume_yes=assume_yes,
         notes=["Both arms move. Ctrl-C stops the sweep where they are."],
     )
@@ -889,6 +999,7 @@ def home(
         settings,
         target=settings.home.as_action_dict(),
         limits=limits,
+        rate=rate,
         control_mode=control_mode,
     )
     typer.secho(

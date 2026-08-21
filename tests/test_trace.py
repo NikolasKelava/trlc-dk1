@@ -15,8 +15,10 @@ import pytest
 
 from dk1lab import trace as trace_module
 from dk1lab.layout import ACTION_KEYS, DOF, GRIPPER_INDICES
+from dk1lab.fifo import ChunkReport
 from dk1lab.trace import (
     ChunkRecord,
+    FifoSummary,
     RolloutTrace,
     SyncWindow,
     TraceSummary,
@@ -416,7 +418,8 @@ def test_the_sync_summary_names_the_budget_and_what_is_spending_it():
     text = "\n".join(summary.lines())
     assert "target 30 Hz" in text
     assert "33.3 ms budget" in text
-    assert "rest of the loop" in text
+    assert "robot read+send" in text
+    assert "idle" in text
     assert any("THE LOOP IS SLOW" in v for v in summary.verdicts())
 
 
@@ -488,6 +491,7 @@ def test_when_the_loop_not_the_engine_is_the_cost_it_says_so():
             post_ms=0.3,
             select_ms=0.2,
             outside_ms=42.5,
+            robot_ms=42.0,
         ),
     )
     verdicts = "\n".join(summary.verdicts())
@@ -587,3 +591,214 @@ def test_the_gripper_channels_come_from_the_shared_layout():
     values = tuple(float(i) for i in range(DOF))
     assert record().grippers(values) == tuple(float(i) for i in GRIPPER_INDICES)
     assert len(ACTION_KEYS) == DOF
+
+
+# --------------------------------------------------------------------------- #
+# The chunk FIFO: per-chunk costs stay per-chunk
+# --------------------------------------------------------------------------- #
+#
+# The bug this section exists for: the trace remembered the last pipeline timing
+# it had seen and stamped it onto every tick. Under the FIFO the pipelines run
+# once per *chunk*, so a line read "per cached tick 34.1 ms ... pre 32.4 ·
+# post 46.2" — 79 ms of pipeline inside a 34 ms tick. On the arms that looked
+# like a loop drowning in preprocessing, and it was nothing of the kind.
+
+
+class FakeFifoEngine:
+    """``dk1lab.fifo``'s contract in miniature, with the report it emits.
+
+    Faithful in the two respects the trace depends on: the pipelines run once per
+    chunk (not per tick), and a chunk is reported from inside ``get_action`` on
+    the tick it is spliced in.
+    """
+
+    #: Detected by the trace, which hooks the engine rather than isinstance-ing it.
+    on_chunk = None
+
+    def __init__(self, ctx, *, every=15, model_ms=220.0, pre_ms=32.0, post_ms=46.0):
+        self.ctx = ctx
+        self.every = every
+        self.model_ms = model_ms
+        self.pre_ms = pre_ms
+        self.post_ms = post_ms
+        self.clock = SimpleNamespace(now=0.0)
+        self.tick_ms = 33.3
+        self._served = 0
+        self._chunks = 0
+        self._preprocessor = ctx.policy.preprocessor
+        self._postprocessor = ctx.policy.postprocessor
+
+    def get_action(self, _frame):
+        if self._served % self.every == 0:
+            # One chunk's worth of pipeline work, on the worker thread in the
+            # real engine. Here it just runs, once, and is reported once.
+            self._preprocessor({"observation.state": 0})
+            self.ctx.policy.policy.predict_action_chunk()
+            self._postprocessor(chunk(0.4, steps=1))
+            if self.on_chunk is not None:
+                self.on_chunk(
+                    ChunkReport(
+                        index=self._chunks,
+                        pre_ms=self.pre_ms,
+                        model_ms=self.model_ms,
+                        post_ms=self.post_ms,
+                        latency_ms=self.pre_ms + self.model_ms + self.post_ms,
+                        dropped=9,
+                        served=21,
+                        queue_before=6,
+                        queue_after=21,
+                        blended=4,
+                        starved=0,
+                        ticks=self.every,
+                        raw=tuple(0.1 * i for i in range(DOF)),
+                        robot=tuple(0.2 * i for i in range(DOF)),
+                    )
+                )
+            self._chunks += 1
+        self._served += 1
+        return "an action"
+
+
+def build_fifo(*, every=15, fps=30.0, robot_ms=4.0):
+    """A trace attached to a fake FIFO engine and a fake robot, on a fake clock."""
+    pre = FakePipeline()
+    post = FakePipeline(lambda value: value * -1.0 + 1.0)
+    clock = SimpleNamespace(now=0.0)
+
+    policy = SimpleNamespace(predict_action_chunk=lambda *a, **k: chunk(0.5))
+    robot = SimpleNamespace(
+        get_observation=lambda: clock.__setattr__("now", clock.now + robot_ms / 1000.0),
+        send_action=lambda action: None,
+    )
+    ctx = SimpleNamespace(
+        policy=SimpleNamespace(
+            policy=policy, preprocessor=pre, postprocessor=post, inference=None
+        ),
+        hardware=SimpleNamespace(robot_wrapper=robot),
+    )
+    engine = FakeFifoEngine(ctx, every=every)
+    engine.clock = clock
+    ctx.policy.inference = engine
+    trace = RolloutTrace(fps=fps)
+    trace.attach(ctx)
+    return trace, engine, robot
+
+
+def drive_fifo(trace, engine, robot, ticks):
+    """Run ``ticks`` control ticks the way ``BaseStrategy.run`` does."""
+    clock = engine.clock
+    real = trace_module.time
+    trace_module.time = SimpleNamespace(perf_counter=lambda: clock.now)
+    try:
+        for _ in range(ticks):
+            start = clock.now
+            robot.get_observation()
+            engine.get_action(None)
+            robot.send_action(None)
+            # Whatever is left of the tick is precise_sleep, not work.
+            clock.now = start + engine.tick_ms / 1000.0
+    finally:
+        trace_module.time = real
+
+
+def test_a_fifo_engine_is_hooked_rather_than_inferred_from():
+    trace, _engine, _robot = build_fifo()
+    assert trace.fifo is True
+    assert trace.rtc is False
+
+
+def test_per_chunk_pipeline_costs_do_not_become_per_tick_ones():
+    """The bug: 79 ms of pipeline reported inside a 34 ms tick."""
+    trace, engine, robot = build_fifo(every=15)
+    drive_fifo(trace, engine, robot, 46)
+    summary = trace.summary()
+    assert summary.fifo is not None
+    # The tick is the tick. The pipelines are nowhere in it.
+    assert summary.fifo.period_ms == pytest.approx(33.3, abs=0.5)
+    assert summary.fifo.engine_ms == pytest.approx(0.0, abs=0.5)
+    # And they are still reported — once per chunk, where they were paid.
+    assert summary.fifo.pre_ms == pytest.approx(32.0)
+    assert summary.fifo.post_ms == pytest.approx(46.0)
+    assert summary.fifo.model_ms == pytest.approx(220.0)
+
+
+def test_the_robot_work_is_separated_from_the_time_the_loop_spends_asleep():
+    """A loop with 29 ms of headroom must not read like one that is 29 ms busy."""
+    trace, engine, robot = build_fifo(every=15, robot_ms=4.0)
+    drive_fifo(trace, engine, robot, 46)
+    f = trace.summary().fifo
+    assert f.robot_ms == pytest.approx(4.0, abs=0.5)
+    assert f.wait_ms == pytest.approx(29.3, abs=1.0)
+    text = "\n".join(trace.summary().lines())
+    assert "robot read+send" in text
+    assert "idle" in text
+
+
+def test_a_chunk_is_paired_with_the_ticks_that_ran_while_it_computed():
+    trace, engine, robot = build_fifo(every=15)
+    drive_fifo(trace, engine, robot, 46)
+    # Chunk 0 is the cold start with no ticks alongside it; the rest have 15.
+    paired = [c for c in trace.chunks if c.ticks]
+    assert paired, [c.ticks for c in trace.chunks]
+    assert all(c.ticks == 15 for c in paired), [c.ticks for c in paired]
+
+
+def test_the_line_says_how_old_the_plan_is_and_what_the_tick_cost():
+    trace, engine, robot = build_fifo(every=15)
+    drive_fifo(trace, engine, robot, 46)
+    line = [c for c in trace.chunks if c.ticks][0].line()
+    assert "plan  298 ms old =  9 rows" in line
+    assert "queue  6 -> 21" in line
+    assert "blended 4" in line
+    assert "robot" in line and "wait" in line
+
+
+def test_the_summary_says_the_model_is_off_the_ticks_path():
+    trace, engine, robot = build_fifo(every=15)
+    drive_fifo(trace, engine, robot, 46)
+    text = "\n".join(trace.summary().lines())
+    assert "worst tick" in text
+    assert "the model is off the tick's path" in text
+    assert not [v for v in trace.summary().verdicts() if "CONTROL LOOP" in v]
+    assert "plan age" in text
+    # Nothing is wrong, so nothing is shouted about.
+    assert not [v for v in trace.summary().verdicts() if "LOOP IS SLOW" in v]
+
+
+def test_starved_ticks_are_totalled_rather_than_averaged_away():
+    """A run with one bad second has a median of zero starved ticks."""
+    summary = TraceSummary(
+        chunks=10, ticks_asked=150, ticks_served=150,
+        model_ms=0.0, pre_ms=0.0, post_ms=0.0, total_ms=0.0,
+        total_ticks=0, consumed=0, queue_after=0,
+        gripper_span=(-1.0, 1.0), rtc=False, fps=30.0,
+        fifo=FifoSummary(
+            chunks=10, ticks=15, period_ms=33.4, period_p95_ms=34.0,
+            period_max_ms=34.0, engine_ms=0.02, robot_ms=4.0, blocking_ticks=1,
+            pre_ms=32.0, model_ms=220.0, post_ms=46.0,
+            latency_ms=298.0, dropped=9, queue_before=1, queue_after=21, blended=4,
+            starved_ticks=7, late_chunks=0,
+        ),
+    )
+    verdicts = "\n".join(summary.verdicts())
+    assert "QUEUE RAN DRY on 7 tick(s)" in verdicts
+    assert "--replan-at" in verdicts
+
+
+def test_a_chunk_that_missed_its_own_window_is_named_as_that_and_not_as_tuning():
+    summary = TraceSummary(
+        chunks=10, ticks_asked=150, ticks_served=150,
+        model_ms=0.0, pre_ms=0.0, post_ms=0.0, total_ms=0.0,
+        total_ticks=0, consumed=0, queue_after=0,
+        gripper_span=(-1.0, 1.0), rtc=False, fps=30.0,
+        fifo=FifoSummary(
+            chunks=10, ticks=30, period_ms=33.4, period_p95_ms=34.0,
+            period_max_ms=34.0, engine_ms=0.02, robot_ms=4.0, blocking_ticks=1,
+            pre_ms=60.0, model_ms=800.0, post_ms=60.0,
+            latency_ms=920.0, dropped=30, queue_before=0, queue_after=0, blended=0,
+            starved_ticks=40, late_chunks=6,
+        ),
+    )
+    verdicts = "\n".join(summary.verdicts())
+    assert "past their own last row" in verdicts
+    assert "needs the model to get faster" in verdicts

@@ -144,16 +144,16 @@ path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.3:1.0-video-index0"
 rotation = 180
 hfov = 105.0
 target_hfov = 87.0
-crop_inset = 7.0
-crop_shift_y = -50.0
+crop_inset = 6.0
+crop_shift_y = -40
 
 [cameras.right]
 path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.4:1.0-video-index0"
 rotation = 180
 hfov = 105.0
 target_hfov = 87.0
-crop_inset = 7.0
-crop_shift_y = -50.0
+crop_inset = 6.0
+crop_shift_y = -40
 
 # --- Capture profiles --------------------------------------------------------
 #
@@ -325,9 +325,17 @@ checkpoint = "~/Documents/RobotLearning/trlc-dk1/outputs/molmoact2_bimanual_yam_
 # and the banner would say so; `dk1 policy home` would refuse outright.
 #
 # The sweep is NOT LeRobot's return_to_initial_position, which is forced off:
-# it ramps at [limits.policy].max_joint_rate, stops when the arms actually
-# arrive rather than after a fixed 3 s, and says so when they did not.
+# it stops when the arms actually arrive rather than after a fixed 3 s, and says
+# so when they did not.
+#
+# It does NOT run at [limits.policy].max_joint_rate. That cap is an upper bound
+# on a policy nobody trusts yet, not a speed to aim for, and homing inheriting
+# it as one is what made the 2026-08-20 raise to 1.0 rad/s speed up homing as a
+# side effect. The sweep peaks at dk1lab.home.DEFAULT_HOME_RATE (0.3 rad/s), or
+# at the cap when that is tighter, and eases in and out of it — smoothstep up
+# over the first 0.75 s and down again over the last 0.25 rad, so the arms
+# neither snap into motion nor stop dead on the target.
 
 [home]
-left = [0.020409, -0.010491, 0.005913, 0.01545, 0.000572, -0.001335, 4.1e-05]
-right = [0.023842, -0.00515, 0.005531, 0.005531, 0.003243, -0.006676, 0.000122]
+left = [0.010872, -0.015068, 0.006294, 0.01545, -0.000191, -0.024224, 4.1e-05]
+right = [0.017739, -0.007057, 0.006294, 0.004768, -0.000191, 0.015068, 4.1e-05]
