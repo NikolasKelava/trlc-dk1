@@ -277,10 +277,9 @@ recorded, no fine-tune completed, no success rate measured on the arms. What
 the evidence list below. The
 wrist crop **has** now run on the arms — the fourth rollout — and alignment is
 better and the gripper waits for a good position before closing. The retune on
-top of it (inset 6, view lifted 20, capture raised to 1280×720) has **not**:
-that is checked against the live cameras, the real preprocessor and the test
-suite, and that is all. The
-policy has now driven these arms five times. The third run — after the limit
+top of it (now inset 6, view lifted 40, capture raised to 1280×720) has run, in
+the fifth and sixth rollouts; nothing about it has been **scored**. The
+policy has now driven these arms six times. The third run — after the limit
 and engine changes below — moves **smoothly, without stalling**, visually
 tracks the dice and reaches for it, and **misaligns the gripper with the dice**.
 That is a real, specific, diagnosable failure rather than an impression, and it
@@ -764,10 +763,12 @@ field of view degrades more gracefully than too little.
 rollout: `crop_inset` (extra pixels off the left and right edges, with top and
 bottom following so the box keeps the frame's aspect ratio — an anisotropic box
 would be stretched on the way back out, which is the exact distortion this is
-undoing), and `crop_shift_x` / `crop_shift_y`. Currently **inset 7, shift_y −50**,
-i.e. the view is lifted. At 1280×720 that is the box **905×509 at (187, 5)** =
-**85.3° H / 54.8° V**, sitting 100 px above centre — and note the `y` of 5, which
-means about −52 is as far as this box can be raised before the shift clamps.
+undoing), and `crop_shift_x` / `crop_shift_y`. Currently **inset 6, shift_y −40**,
+i.e. the view is lifted. At 1280×720 that is the box **909×511 at (185, 24)** =
+**85.6° H / 55.0° V**, sitting 80 px above centre — and note the `y` of 24, which
+means about −64 is as far as this box can be raised before the shift clamps.
+Read the box off `dk1 config show` rather than from here; restating it by hand
+has gone stale twice.
 
 **All three are quoted in pixels at a 640-wide reference** (`fov.REFERENCE_WIDTH`)
 and scaled to whatever frame the camera delivers. They are eyeballed on a
