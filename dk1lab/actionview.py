@@ -182,6 +182,54 @@ class ActionView:
             logger.warning("action view disabled after an error: %s", exc)
 
 
+def build_blueprint(
+    keys: tuple[str, ...] = ACTION_KEYS,
+    camera_names: tuple[str, ...] = CAMERA_NAMES,
+    *,
+    model_input: bool = False,
+) -> Any:
+    """The layout itself: the cameras across the top, then one view per joint.
+
+    Split out from :func:`pin_blueprint` because it has two callers that send it
+    to different places — the live viewer, and the ``.rrd`` an episode recording
+    writes (:mod:`dk1lab.record`). A recording that laid its three series out
+    differently from the panel they were watched on would be a second thing to
+    learn rather than the same thing to replay.
+    """
+    import rerun.blueprint as rrb
+
+    joints = [
+        rrb.TimeSeriesView(
+            name=key.removesuffix(".pos"),
+            contents=[
+                f"{POLICY_PREFIX}/{key}",
+                f"{COMMAND_PREFIX}/{key}",
+                f"observation.{key}",
+            ],
+        )
+        for key in keys
+    ]
+    images = [
+        rrb.Spatial2DView(origin=f"observation.{name}", name=name) for name in camera_names
+    ]
+    if model_input:
+        names = [key.rsplit(".", 1)[-1] for key in IMAGE_KEYS]
+        images += [
+            rrb.Spatial2DView(origin=f"policy_input/{name}", name=f"model {name}")
+            for name in names
+        ]
+
+    # Seven columns puts one arm per row: joints 1-6 then the gripper.
+    columns = max(1, len(keys) // 2)
+    return rrb.Blueprint(
+        rrb.Vertical(
+            rrb.Horizontal(*images),
+            rrb.Grid(*joints, grid_columns=columns),
+            row_shares=[1, 2],
+        )
+    )
+
+
 def pin_blueprint(
     keys: tuple[str, ...] = ACTION_KEYS,
     camera_names: tuple[str, ...] = CAMERA_NAMES,
@@ -225,36 +273,7 @@ def pin_blueprint(
     if log_rerun_data is None or not hasattr(log_rerun_data, "blueprint"):
         return False
 
-    joints = [
-        rrb.TimeSeriesView(
-            name=key.removesuffix(".pos"),
-            contents=[
-                f"{POLICY_PREFIX}/{key}",
-                f"{COMMAND_PREFIX}/{key}",
-                f"observation.{key}",
-            ],
-        )
-        for key in keys
-    ]
-    images = [
-        rrb.Spatial2DView(origin=f"observation.{name}", name=name) for name in camera_names
-    ]
-    if model_input:
-        names = [key.rsplit(".", 1)[-1] for key in IMAGE_KEYS]
-        images += [
-            rrb.Spatial2DView(origin=f"policy_input/{name}", name=f"model {name}")
-            for name in names
-        ]
-
-    # Seven columns puts one arm per row: joints 1-6 then the gripper.
-    columns = max(1, len(keys) // 2)
-    blueprint = rrb.Blueprint(
-        rrb.Vertical(
-            rrb.Horizontal(*images),
-            rrb.Grid(*joints, grid_columns=columns),
-            row_shares=[1, 2],
-        )
-    )
+    blueprint = build_blueprint(keys, camera_names, model_input=model_input)
     try:
         rr.send_blueprint(blueprint)
     except Exception as exc:  # noqa: BLE001 - a layout must never stop a rollout

@@ -322,6 +322,16 @@ Not built yet — Phase 4.
 
 ## 6. Evaluate MolmoAct2 zero-shot
 
+**Two flags belong on every command here, and both are now ON by default:**
+
+* **`--invert-gripper`** — the checkpoint speaks YAM (1 = open) and this cell is
+  0 = open. Confirmed on the arms. Without it the grippers work backwards.
+* **`--home`** — sweep both arms to the `[home]` pose when the run ends.
+  Leaving them wherever the policy stopped is what wears them.
+
+`--no-invert-gripper` and `--no-home` turn them off, for deliberately re-testing
+one or the other. Nothing else here needs a flag.
+
 Phase 3, and the first real goal: find out how the off-the-shelf
 `lerobot/MolmoAct2-BimanualYAM-LeRobot` checkpoint behaves on this cell before
 recording anything or fine-tuning anything. Four commands, in escalating order of
@@ -333,6 +343,7 @@ dk1 policy check                       # reads JSON. No GPU, no robot, no motion
 dk1 policy smoke                       # loads the model, runs inference. GPU only.
 dk1 policy dryrun --task "..."         # arms attached; actions PRINTED, never sent.
 dk1 policy run --task "..."            # the rollout. The policy drives the arms.
+dk1 policy session                     # load once; a rollout is a line at a prompt.
 ```
 
 The checkpoint comes from `[policy]` in `dk1.toml`; `--checkpoint` overrides it
@@ -496,19 +507,161 @@ resize or aspect bug, which is most of what it is for.
 Do it on `dryrun` first. That energises the arms and sends nothing, so you can
 check the orientation with no risk at all.
 
-### The gripper inversion is a flag, and it is off
+### The workflow: load once, roll out, keep the good ones
+
+This is the whole loop. One command to start:
+
+```fish
+dk1 policy session --record
+```
+
+`--invert-gripper` and `--home` are already on, so that command is the whole of
+it. It loads the policy and connects the cell — about a minute, once — and then
+every attempt is a line at a prompt:
+
+```
+[episode 1 | 180s | rec] task> pick up the dice
+                                        the arms go. Ctrl-C when the task is
+                                        done, or when it has clearly failed.
+
+  recorded 2431 ticks (81.2 s at 29.9 Hz), 7293 camera frames, 214.3 MB
+    -> recordings/0001_pick-up-the-dice.rrd
+  keep this episode? [Y/n]              Enter keeps it. `n` deletes the file.
+                                        then both arms sweep home, ready for
+                                        the next attempt.
+
+[episode 2 | 180s | rec] task>          Enter alone runs the same task again
+[episode 3 | 180s | rec] task> :home    put the arms back mid-session, if needed
+[episode 4 | 180s | rec] task> :quit    disconnect and leave
+```
+
+Every episode already ends at the home pose, so `:home` is only for putting the
+arms back after you have moved them by hand.
+
+Only three things to know beyond that: **Ctrl-C ends the attempt, not the
+session**; an **empty line repeats the last instruction**, which is what scoring
+mostly is; and the recording is only offered when `--record` is on — `:record
+on` turns it on part-way through.
+
+The rest of the prompt:
+
+```
+[episode 3 | 180s] task> pick up the dice     run it
+[episode 3 | 180s] task>                      run the same instruction again
+[episode 3 | 180s] task> :record on|off       write each episode to a .rrd
+[episode 3 | 180s | rec] task> :duration 60   change the per-episode limit
+[episode 3 | 180s | rec] task> :home          sweep both arms home, now
+[episode 3 | 180s | rec] task> :help          this list
+[episode 3 | 180s | rec] task> :quit          disconnect and leave
+```
+
+`--display` adds the live Rerun panels, `--task` pre-fills the first
+instruction, and everything `dk1 policy run` takes — `--duration`,
+`--max-joint-rate`, `--no-home`, `--no-invert-gripper` — works here too and
+applies to every episode.
+
+**Ctrl-C ends the current rollout and gives you the prompt back**; it does not
+end the session, and a second Ctrl-C during one rollout interrupts for real.
+Every episode prints its own trace summary, so the readings stay per attempt.
+
+Everything else is held fixed by construction — same weights, same cameras, same
+speed cap, same crop — which is the point: what you are comparing between
+attempts is the policy, not the setup.
+
+**The arms stay connected and energised between episodes.** That is what makes a
+rollout one command, and it is also the hazard: live motors sit in the room while
+you type. Nothing is commanded between episodes, so each arm holds its last
+target and says so once (`No command for 0.50 s` — expected here, not a fault).
+`:quit` disconnects, which disables every motor, so support anything held up.
+
+An episode that fails does not end the session; the error is printed and the
+prompt comes back, with the arms still connected.
+
+### Recording what a rollout did
+
+```fish
+dk1 policy run --task "..." --record          # one episode
+dk1 policy session --record                   # every episode in the session
+```
+
+Writes a Rerun `.rrd` per episode to `recordings/`, named for an episode index
+and the task — `recordings/0007_pick-up-the-dice.rrd`. The index counts up from
+whatever is already in the directory, so it keeps rising across sessions;
+there is no other order to it. It holds the four streams `--display` draws and
+no fewer:
+
+* the **camera images**, as the cell produced them — after the rotation and
+  after the wrist crop, because that is where the crop lives;
+* the **policy's own plan** for each tick, before the cross-fade and the limiter;
+* the **command** the arms were given — what `send_action` returned, so after
+  both;
+* the **observation**, including every measured joint position.
+
+**Opening one:**
+
+```fish
+uv run rerun recordings/0007_pick-up-the-dice.rrd    # one episode
+uv run rerun recordings/                             # all of them, one per tab
+```
+
+The viewer ships inside the `rerun` package this project already depends on, so
+there is nothing to install — and a colleague with the file needs only
+`pip install rerun-sdk` and the same command. Scrub with the timeline at the
+bottom; `tick` is the control tick and `elapsed` is seconds, so playing on
+`elapsed` runs at the speed the arms did.
+
+The layout is the same one `--display` pins, so a replay is the thing you
+watched rather than a second thing to learn, and the run's settings — the task,
+the checkpoint, the speed cap, whether the gripper was inverted — are in the
+`run` panel, so a file handed to someone else explains itself.
+
+**You are asked whether to keep each episode** once it ends. The file is written
+while the arms move — there is nowhere else to put three minutes of video — so
+declining deletes it. Enter keeps it; an attempt you cannot repeat should not be
+lost to a stray keypress. A discarded episode's number is free again, since the
+file is gone; every episode you kept is still there and is counted.
+
+It is **not** a LeRobot dataset. There is no slot in that format for "the
+policy's own plan", which is the stream a rollout has to be diagnosed against,
+and this is not the Phase 4 recorder.
+
+`recordings/` is **tracked**, deliberately — these files are meant to be shared
+with colleagues. They are large: the first eight episodes ran 150–910 MB each,
+3.9 GB together. Keep the ones that show something and decline the rest at the
+prompt. Note that every one of those exceeds GitHub's 100 MB per-file limit, so
+pushing them needs Git LFS (`git lfs install; git lfs track "*.rrd"`) or another
+way of getting them to people.
+
+The images are JPEG-encoded on a background thread, so recording costs the
+control loop about 1.8 ms a tick out of 33.3. If the encoder ever falls behind,
+frames are dropped rather than the loop being slowed — and the count is printed
+at the end, because a recording with a hole in it has to say so.
+
+### The gripper inversion is on
 
 `--invert-gripper` flips both gripper channels, `x -> 1 - x`, in both
-directions. It is **off by default**. See the section below for why the
-inversion is very probably right and why it is nevertheless not the default.
+directions, and it is **on by default**. The DK1 is 0 = open, the checkpoint is
+1 = open; that is confirmed on the arms, and the simulator confirms it a fourth
+way by succeeding while mapping the policy's `1.0` to open. Left off, the policy
+opens the gripper every time it means to close it.
+
+`--no-invert-gripper` exists to re-test that, and `dk1 policy serve` keeps it
+off for a real reason — `sim_eval` already speaks the checkpoint's own
+convention on the wire. See the section below for what LeRobot does *not* do
+about this.
 
 ### Ending a run at a home pose
+
+**On by default.** `dk1 policy run` and `dk1 policy session` sweep both arms to
+the `[home]` pose when a run ends cleanly — the duration limit or Ctrl-C, never
+after a fault. `--no-home` leaves them where they stopped, which is the thing
+that wears them.
 
 ```fish
 dk1 policy home --capture     # put the arms where home is, then record it
 dk1 policy home               # drive there now, without loading the model
 dk1 policy home --show        # print the configured pose. No motion.
-dk1 policy run --task "..." --home
+dk1 policy run --task "..." --no-home    # opt out for one run
 ```
 
 `--capture` energises the arms but commands nothing; it reads both arms and
@@ -627,7 +780,9 @@ without cameras. The three camera facts above (shared serial, MJPG requirement,
 upside-down mounting).
 
 Added in Phase 1: all three cameras advertise 640×360 MJPG at 30 fps, so
-`[capture.policy]` is real and no 4:3 fallback is needed. The `top` / `left` /
+`[capture.policy]` is real and no 4:3 fallback is needed — and 1280×720 MJPG at
+30 fps too, which is what it was raised to once the model's 378-row input was
+established. The `top` / `left` /
 `right` labels in `dk1.toml` were confirmed by previewing each camera. The
 follower and leader ports were confirmed by USB adapter identity, which also
 settles a contradiction the earlier project left behind — an untracked
@@ -654,7 +809,9 @@ the policy agrees with the start pose to within 0.065 rad, its intended speed is
 about 0.2 rad/s, and `0 = open` on the grippers is confirmed — they read 0.0000
 standing open, and connecting does not close them.
 
-`dk1 policy run` has driven the arms four times. The judder is gone (RTC's
+`dk1 policy run` has driven the arms six times, and `dk1 policy session` has
+since driven them for eight recorded episodes over four tasks — none of it
+scored. The judder is gone (RTC's
 prefix blend was collapsing to zero width), the queue no longer starves, and the
 wrist field-of-view crop improved the alignment — the fourth run reaches for the
 object and waits for a good position before closing the gripper.
@@ -679,5 +836,6 @@ checkpoint's own embodiment, against about 50% for the reference HF server. The
 acts for the first 30 s.
 
 The home pose has been captured on the hardware — that path energises the arms
-and reads them, nothing more. The home *sweep*, which drives both arms, has run
-only against fakes in the test suite.
+and reads them, nothing more — and the *sweep* has run on them too, both at the
+end of the sixth rollout and again with the eased, slower profile that replaced
+it. Homing is settled.

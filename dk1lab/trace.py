@@ -1131,6 +1131,26 @@ class RolloutTrace:
             except Exception:  # noqa: BLE001 - never let reporting kill the run
                 logger.exception("trace callback failed")
 
+    def reset(self) -> None:
+        """Forget this episode's records, keeping the wrappers in place.
+
+        For :mod:`dk1lab.session`, where one trace instruments many rollouts.
+        Attaching a fresh trace per episode would stack another layer of wrappers
+        on the engine, the pipelines and the robot every time; resetting the
+        *records* is what a per-episode summary actually needs.
+
+        The attachment flags (``rtc``, ``fifo``) survive, because what the engine
+        is has not changed — only what it has done so far.
+        """
+        self.chunks.clear()
+        self.ticks_asked = 0
+        self.ticks_served = 0
+        self._model_ms = self._pre_ms = self._post_ms = self._robot_ms = 0.0
+        self._raw = self._robot = ()
+        self._images = {}
+        self._window.clear()
+        self._pending = None
+
     def close(self) -> None:
         """Close any window still open, so the last chunk is not silently lost.
 

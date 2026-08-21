@@ -214,17 +214,19 @@ def test_removing_the_cap_and_setting_it_contradict_each_other(
     assert result.exit_code != 0
 
 
-def test_dry_run_shows_that_stopping_does_not_move_the_arms(
+def test_a_run_ends_at_the_home_pose_unless_told_not_to(
     runner, config_file, checkpoint_dir, no_motion
 ):
-    output = dry_run(runner, config_file, checkpoint_dir).output
+    """On by default since 2026-08-21: leaving the arms where the policy stopped wears them."""
+    assert "HOME" in dry_run(runner, config_file, checkpoint_dir).output
+
+
+def test_stopping_can_still_be_told_to_leave_the_arms_alone(
+    runner, config_file, checkpoint_dir, no_motion
+):
+    output = dry_run(runner, config_file, checkpoint_dir, "--no-home").output
     assert "disconnect only" in output
     assert "HOME" not in output
-
-
-def test_home_shows_up_when_asked_for(runner, config_file, checkpoint_dir, no_motion):
-    output = dry_run(runner, config_file, checkpoint_dir, "--home").output
-    assert "HOME" in output
 
 
 def test_home_says_which_pose_it_would_use_when_the_file_names_none(
@@ -431,3 +433,231 @@ def test_the_run_uses_the_configured_pose_when_there_is_one(
     output = dry_run(runner, config_file, checkpoint_dir, "--home").output
     assert "+0.100" in output
     assert "captured at connect" not in output
+
+
+# --------------------------------------------------------------------------- #
+# session — load once, roll out many times
+# --------------------------------------------------------------------------- #
+
+
+def dry_session(runner, config_file, checkpoint_dir, *args):
+    return invoke(
+        runner, config_file, "session", "--checkpoint", str(checkpoint_dir), "--dry-run", *args
+    )
+
+
+def test_a_session_dry_run_connects_nothing(runner, config_file, checkpoint_dir, no_motion):
+    result = dry_session(runner, config_file, checkpoint_dir)
+    assert result.exit_code == 0
+    assert "the policy is loaded ONCE" in result.output
+    assert no_motion["run"] == []
+
+
+def test_a_session_needs_no_task_up_front(runner, config_file, checkpoint_dir, no_motion):
+    """Unlike `run`: the instruction is what you type at the prompt."""
+    assert dry_session(runner, config_file, checkpoint_dir).exit_code == 0
+
+
+def test_a_session_says_what_happens_after_each_episode_not_after_the_run(
+    runner, config_file, checkpoint_dir, no_motion
+):
+    output = dry_session(runner, config_file, checkpoint_dir, "--home").output
+    assert "after each episode" in output
+    assert "when the run ends" not in output
+
+
+def test_a_session_reports_where_recordings_would_go(runner, config_file, checkpoint_dir, no_motion):
+    output = dry_session(runner, config_file, checkpoint_dir, "--record").output
+    assert "recording ON" in output
+
+
+class FakeSession:
+    """A :class:`~dk1lab.session.PolicySession` that records what it was asked to do."""
+
+    def __init__(self):
+        self.task = ""
+        self.episodes = 0
+        self.record = False
+        self.record_dir = "recordings"
+        self.duration_s = 180.0
+        self.rollouts: list[str] = []
+        self.homes = 0
+
+    def rollout(self, task, *, home=None):
+        from dk1lab.session import EpisodeOutcome
+
+        self.task = task
+        self.episodes += 1
+        self.rollouts.append(task)
+        return EpisodeOutcome(index=self.episodes, task=task, seconds=1.0, ended="duration")
+
+    def home(self, pose=None):
+        self.homes += 1
+        from dk1lab.home import HomeReport
+
+        return HomeReport(reached=True, seconds=1.0, commands=30, worst_key="left_joint_1.pos",
+                          worst_error=0.001)
+
+
+def drive(monkeypatch, lines: list[str]) -> FakeSession:
+    """Run the prompt loop over ``lines``, as if they had been typed."""
+    from dk1lab.cli import policy_cmds
+
+    live = FakeSession()
+    supply = iter(lines)
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(supply))
+    policy_cmds._session_loop(live, None)
+    return live
+
+
+def test_typing_an_instruction_runs_one_episode(monkeypatch):
+    live = drive(monkeypatch, ["pick up the dice", ":quit"])
+    assert live.rollouts == ["pick up the dice"]
+
+
+def test_an_empty_line_runs_the_same_instruction_again(monkeypatch):
+    live = drive(monkeypatch, ["pick up the dice", "", "", ":quit"])
+    assert live.rollouts == ["pick up the dice"] * 3
+
+
+def test_recording_toggles_without_ending_the_session(monkeypatch):
+    live = drive(monkeypatch, [":record on", "pick up the dice", ":record off", ":quit"])
+    assert live.record is False
+    assert live.rollouts == ["pick up the dice"]
+
+
+def test_the_prompt_survives_a_line_it_cannot_understand(monkeypatch):
+    """Running `:recrod on` as an instruction would be the dangerous reading."""
+    live = drive(monkeypatch, [":recrod on", "pick up the dice", ":quit"])
+    assert live.rollouts == ["pick up the dice"]
+
+
+def test_end_of_input_leaves_the_session(monkeypatch):
+    from dk1lab.cli import policy_cmds
+
+    live = FakeSession()
+
+    def eof(_prompt):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    policy_cmds._session_loop(live, None)
+    assert live.rollouts == []
+
+
+def test_a_failing_episode_does_not_end_the_session(monkeypatch):
+    from dk1lab.cli import policy_cmds
+
+    live = FakeSession()
+
+    def explode(task, *, home=None):
+        live.rollouts.append(task)
+        raise RuntimeError("the cameras went away")
+
+    live.rollout = explode
+    supply = iter(["one", "two", ":quit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(supply))
+    policy_cmds._session_loop(live, None)
+    assert live.rollouts == ["one", "two"], "the second episode was still offered"
+
+
+def test_homing_from_the_prompt_moves_the_arms_without_a_rollout(monkeypatch):
+    live = drive(monkeypatch, [":home", ":quit"])
+    assert live.homes == 1
+    assert live.rollouts == []
+
+
+class FakeRecording:
+    """An :class:`~dk1lab.record.EpisodeRecording` that records being discarded."""
+
+    def __init__(self, path):
+        self.path = path
+        self.discarded = 0
+
+    def summary(self):
+        return f"recorded 100 ticks -> {self.path}"
+
+    def discard(self):
+        self.discarded += 1
+        return True
+
+
+def keep_or_not(monkeypatch, answer: str, path="recordings/0001_dice.rrd"):
+    from dk1lab.cli import policy_cmds
+
+    recording = FakeRecording(path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(policy_cmds.typer, "confirm", lambda *a, **kw: answer == "y")
+    kept = policy_cmds._keep_recording(recording)
+    return kept, recording
+
+
+def test_an_episode_is_kept_when_you_say_so(monkeypatch):
+    kept, recording = keep_or_not(monkeypatch, "y")
+    assert kept is True
+    assert recording.discarded == 0
+
+
+def test_declining_deletes_the_file_rather_than_leaving_it(monkeypatch):
+    kept, recording = keep_or_not(monkeypatch, "n")
+    assert kept is False
+    assert recording.discarded == 1
+
+
+def test_a_non_interactive_run_keeps_the_episode(monkeypatch):
+    """Nobody is there to answer, and throwing away an attempt is the worse default."""
+    from dk1lab.cli import policy_cmds
+
+    recording = FakeRecording("recordings/0001_dice.rrd")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    assert policy_cmds._keep_recording(recording) is True
+    assert recording.discarded == 0
+
+
+def test_nothing_is_asked_when_the_episode_was_not_recorded(monkeypatch):
+    from dk1lab.cli import policy_cmds
+
+    def asked(*_args, **_kwargs):
+        pytest.fail("nothing was recorded, so there is nothing to keep")
+
+    monkeypatch.setattr(policy_cmds.typer, "confirm", asked)
+    assert policy_cmds._keep_recording(None) is False
+
+
+def test_the_prompt_names_the_file_the_next_episode_will_write(monkeypatch, tmp_path):
+    """The session's own count restarts every time; the file index does not."""
+    from dk1lab.cli import policy_cmds
+
+    (tmp_path / "0007_pick-up-the-dice.rrd").touch()
+    live = FakeSession()
+    live.record_dir = tmp_path
+    live.record = True
+    assert "episode 8" in policy_cmds._prompt(live)
+    live.record = False
+    assert "episode 1" in policy_cmds._prompt(live)
+
+
+def test_the_gripper_inversion_is_on_by_default_now_that_it_is_confirmed(
+    runner, config_file, checkpoint_dir, no_motion
+):
+    """The checkpoint speaks YAM (1=open) and this cell is 0=open. Confirmed on the arms."""
+    assert "ON for" in dry_run(runner, config_file, checkpoint_dir).output
+
+
+def test_turning_the_inversion_off_says_the_grippers_will_work_backwards(
+    runner, config_file, checkpoint_dir, no_motion
+):
+    output = dry_run(runner, config_file, checkpoint_dir, "--no-invert-gripper").output
+    assert "BACKWARDS" in output or "backwards" in output
+
+
+def test_the_sim_server_does_not_invert(runner, config_file, checkpoint_dir, monkeypatch):
+    """`sim_eval` already speaks the checkpoint's own convention on the wire.
+
+    Inverting there would test the policy through a sign error the simulator
+    does not have — which is precisely what makes the sim a control.
+    """
+    served: dict = {}
+    monkeypatch.setattr("dk1lab.serve.serve", lambda *a, **kw: served.update(kw))
+    invoke(runner, config_file, "serve", "--checkpoint", str(checkpoint_dir), "--no-warmup")
+    assert served["invert_gripper"] is False

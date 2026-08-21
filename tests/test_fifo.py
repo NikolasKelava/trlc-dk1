@@ -490,3 +490,33 @@ def test_replan_at_and_blend_are_validated_rather_than_trusted():
         async_engine(replan_at=0)
     with pytest.raises(ValueError, match="blend"):
         async_engine(blend=-1)
+
+
+def test_an_engine_can_be_restarted_for_the_next_episode_in_a_session():
+    """`dk1 policy session` stops the engine between rollouts and starts it again.
+
+    The worker thread is the thing that has to survive that: a ``start`` after a
+    ``stop`` must produce one running worker, not a second one alongside the
+    first, and not a dead engine that quietly serves nothing.
+    """
+    import threading
+
+    engine, obs = async_engine(seconds=0.02)
+    before = threading.active_count()
+    for _ in range(3):
+        engine.reset()
+        engine.start()
+        assert drive(engine, obs, 8)[-1] is not None
+        engine.stop()
+    assert threading.active_count() == before, "no worker was left running"
+
+
+def test_the_instruction_can_be_changed_between_episodes_without_rebuilding():
+    """What `dk1 policy session` actually does to switch tasks."""
+    engine, obs = async_engine(seconds=0.01)
+    assert engine._task == "pick up the dice"
+    engine._task = "put it in the box"
+    engine.start()
+    drive(engine, obs, 4)
+    engine.stop()
+    assert engine._task == "put it in the box"

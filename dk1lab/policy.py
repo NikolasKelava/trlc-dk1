@@ -17,15 +17,14 @@ what the rollout runs.
 
 Three decisions are made here rather than left to a command line:
 
-**The gripper inversion is a flag, and it is OFF by default.** The DK1 is
-0 = open, 1 = closed; the checkpoint is 1 = open, 0 = closed, and
-:mod:`dk1lab.layout` gives two independent sources for that. It was on by
-default until the first rollouts, and it is now opt-in (``--invert-gripper``)
-because the argument for it, however good, is still an argument: no run has yet
-been watched to open or close a gripper on this cell, so the sign is a
-hypothesis to test rather than a setting to bake in. Run it both ways and watch
-the grippers; :mod:`dk1lab.trace` records the policy's own gripper channel
-either way, which is the measurement that settles it.
+**The gripper inversion is ON by default.** The DK1 is 0 = open, 1 = closed;
+the checkpoint is 1 = open, 0 = closed. It was a flag, off by default, through
+the middle rollouts — the argument for it was good but it was still an argument,
+and nothing had watched a gripper open and close on this cell. Nikolas confirmed
+it on the arms on 2026-08-21, so it is the default again on ``run``, ``session``,
+``dryrun`` and ``smoke``; ``--no-invert-gripper`` re-tests it.
+:mod:`dk1lab.serve` deliberately keeps it **off**: ``sim_eval`` already sends
+1 = open on the wire.
 
 **When it is on, the inversion is applied to the loaded pipeline objects**, not
 through the policy config, because through the policy config it does not work.
@@ -418,11 +417,12 @@ def build_context(
     Args:
         prewarm_engine: run one inference before returning, and report the
             resulting RTC headroom. Off only for tests.
-        invert_gripper: apply the gripper inversion. **Off by default** — see
-            :func:`apply_gripper_inversion` for what it does and
-            :mod:`dk1lab.layout` for the argument that it is the right thing to
-            do; it is a flag rather than a fact because nothing has yet watched
-            the policy open or close a gripper on this cell.
+        invert_gripper: apply the gripper inversion. The CLI passes ``True`` for
+            every path that drives this cell — see :func:`apply_gripper_inversion`
+            for what it does and :mod:`dk1lab.layout` for why. It stays an
+            argument rather than an assumption so ``dk1 policy serve``, which
+            talks to a simulator that already speaks the checkpoint's own
+            convention, can leave it off.
 
     Returns:
         The rollout context, and the applied inversion or ``None`` if it was off.
@@ -926,7 +926,7 @@ def dryrun(
     Args:
         steps: how many observations to run inference on.
         on_step: optional callback per step, for progressive output.
-        invert_gripper: apply the gripper inversion. Off by default.
+        invert_gripper: apply the gripper inversion. The CLI passes ``True``.
         trace: an optional :class:`~dk1lab.trace.RolloutTrace`. With one attached
             this is the cheapest way to see the *model's* own action next to the
             one the postprocessor produced, and — with ``display`` set on it —
@@ -1112,6 +1112,7 @@ def run(
     asynchronous: bool = True,
     replan_at: int = DEFAULT_REPLAN_AT,
     blend: int = DEFAULT_BLEND_STEPS,
+    recorder: Any = None,
 ) -> HomeReport | None:
     """Drive the followers with the policy. **Moves the arms.**
 
@@ -1132,7 +1133,7 @@ def run(
             in. A :class:`~dk1lab.config.HomePose`, or
             :data:`HOME_AT_START_POSE` to use the pose captured at connect. A
             second Ctrl-C during the sweep stops it where the arms are.
-        invert_gripper: apply the gripper inversion. Off by default.
+        invert_gripper: apply the gripper inversion. The CLI passes ``True``.
         trace: an optional :class:`~dk1lab.trace.RolloutTrace`, attached around
             the engine so the run records per-chunk latency, queue depth and the
             policy's own actions. It never changes what is sent.
@@ -1147,6 +1148,10 @@ def run(
             blocking engine — the one that pauses — kept for comparison.
         replan_at: queue depth, in rows, at which the next chunk is started.
         blend: rows over which a new chunk is cross-faded into the old one.
+        recorder: an optional :class:`~dk1lab.record.EpisodeRecorder`, started
+            around the loop and stopped after it. Like the trace, it only reads;
+            unlike the trace, it is per-episode, so it is attached last and
+            detached first.
 
     Returns:
         The :class:`~dk1lab.home.HomeReport`, or ``None`` if homing was not asked
@@ -1188,6 +1193,11 @@ def run(
     view = ActionView() if display else None
     if view is not None:
         view.attach(ctx)
+    # Last, so it is the outermost wrapper and detaching it in the finally puts
+    # the chain back exactly as the instruments above left it.
+    if recorder is not None:
+        recorder.attach(ctx)
+        recorder.start()
     report: HomeReport | None = None
     ended: BaseException | None = None
     try:
@@ -1206,6 +1216,9 @@ def run(
         ended = exc
         raise
     finally:
+        if recorder is not None:
+            recorder.stop()
+            recorder.detach()
         if home is not None and ended_cleanly(ended):
             try:
                 report = go_home_before_teardown(

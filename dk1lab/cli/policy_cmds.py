@@ -12,6 +12,7 @@ with the arms live.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
@@ -23,6 +24,7 @@ from ..cameras import crop_summary
 from ..config import DEFAULT_CONFIG_PATH, load
 from ..layout import ACTION_KEYS, GRIPPER_INDICES, IMAGE_KEYS
 from ..fifo import DEFAULT_BLEND_STEPS, DEFAULT_REPLAN_AT
+from ..record import DEFAULT_RECORD_DIR
 from ..policy import DEFAULT_EXECUTION_HORIZON, DEFAULT_FPS, HOME_AT_START_POSE, POLICY_LIMITS
 from .safety import ENERGISE_HELP, MOTION_HELP, confirm_motion
 
@@ -42,9 +44,9 @@ InvertOpt = Annotated[
     typer.Option(
         "--invert-gripper/--no-invert-gripper",
         help=(
-            "Flip the two gripper channels (x -> 1-x) in both directions. OFF by "
-            "default: the DK1 is 0=open and the checkpoint is 1=open, so it is "
-            "very likely right, but no run has been watched to confirm it."
+            "Flip the two gripper channels (x -> 1-x) in both directions. ON by "
+            "default: the DK1 is 0=open and the checkpoint is 1=open, and that was "
+            "confirmed on the arms. --no-invert-gripper is for testing it again."
         ),
     ),
 ]
@@ -99,6 +101,21 @@ BlendOpt = Annotated[
             "0 splices hard. Keep it well under the replan interval."
         ),
     ),
+]
+RecordOpt = Annotated[
+    bool,
+    typer.Option(
+        "--record",
+        help=(
+            "Write the episode to a Rerun .rrd: the camera images, the policy's own "
+            "plan, the command the arms were given (post-blend, post-limiter) and the "
+            "measured positions. The same four streams --display draws, kept."
+        ),
+    ),
+]
+RecordDirOpt = Annotated[
+    Path,
+    typer.Option("--record-dir", help="Where recordings are written."),
 ]
 WatchInputOpt = Annotated[
     bool,
@@ -161,12 +178,16 @@ def _echo_inversion(invert: bool | None = None) -> None:
     if invert is None:
         typer.echo(f"  available for {channels}  (x -> 1 - x, both directions)")
     elif invert:
-        typer.secho(f"  ON for {channels}  (x -> 1 - x, both directions)", fg=typer.colors.YELLOW)
+        typer.echo(f"  ON for {channels}  (x -> 1 - x, both directions) — the default")
     else:
-        typer.echo(f"  OFF — {channels} pass through unchanged (the default)")
-    typer.echo("  the DK1 is 0=open/1=closed, the checkpoint is 1=open/0=closed,")
-    typer.echo("  so inverting is the well-argued choice — but it has never been")
-    typer.echo("  watched to work here. Run it both ways and watch the grippers.")
+        typer.secho(
+            f"  OFF — {channels} pass through unchanged. The checkpoint speaks YAM "
+            f"(1=open) and this cell is 0=open, so the grippers will work backwards "
+            f"unless you are deliberately re-testing that.",
+            fg=typer.colors.YELLOW,
+        )
+    typer.echo("  the DK1 is 0=open/1=closed, the checkpoint is 1=open/0=closed;")
+    typer.echo("  confirmed on the arms, and confirmed a fourth way by the simulator")
     typer.echo("  applied to the loaded pipeline steps — --policy.joint_signs does nothing")
 
 
@@ -239,7 +260,7 @@ def smoke(
     task: TaskOpt = PLACEHOLDER_TASK,
     steps: Annotated[int, typer.Option("--steps", help="Inference calls to make.")] = 5,
     device: DeviceOpt = "cuda",
-    invert_gripper: InvertOpt = False,
+    invert_gripper: InvertOpt = True,
 ) -> None:
     """Load the policy and run inference on a synthetic frame. GPU only, no robot.
 
@@ -384,6 +405,7 @@ def _report(
     asynchronous: bool = True,
     replan_at: int = DEFAULT_REPLAN_AT,
     blend: int = DEFAULT_BLEND_STEPS,
+    home_when: str = "when the run ends",
 ) -> None:
     """Print everything that was built, before anything is connected."""
     robot = cfg.robot
@@ -436,12 +458,12 @@ def _report(
         typer.echo(f"  stopping after {cfg.duration}s")
     else:
         typer.echo("  until interrupted")
-    _echo_home(home)
+    _echo_home(home, when=home_when)
 
 
-def _echo_home(home) -> None:
+def _echo_home(home, *, when: str = "when the run ends") -> None:
     """What will happen when the loop ends. The last thing printed before it acts."""
-    typer.secho("\nwhen the run ends", bold=True)
+    typer.secho(f"\n{when}", bold=True)
     if home is None:
         typer.echo("  disconnect only — the arms stay where they are, and the motors")
         typer.echo("  are disabled, so support anything holding itself up")
@@ -483,6 +505,49 @@ def _make_trace(*, fps: float, enabled: bool, display_policy_input: bool):
         on_chunk=show if enabled else None,
         display=display_policy_input,
     )
+
+
+def _make_recorder(enabled: bool, directory, *, task: str, notes: dict):
+    """An :class:`~dk1lab.record.EpisodeRecorder`, or ``None``.
+
+    Built here rather than inside the rollout so the path is decided — and can
+    be printed — before anything is connected.
+    """
+    if not enabled:
+        return None
+    from ..record import EpisodeRecorder, episode_path, next_index
+
+    index = next_index(directory)
+    return EpisodeRecorder(
+        episode_path(directory, task, index), task=task, notes={**notes, "episode": index}
+    )
+
+
+def _keep_recording(recording) -> bool:
+    """Ask whether to keep the episode just recorded, and delete it if not.
+
+    Asked **after** the rollout because that is when you know: the episode ends
+    when the task is done or has visibly failed, and only then is it clear
+    whether the file is worth keeping. The recording itself has to be written as
+    the arms move — there is nowhere to put three minutes of video otherwise —
+    so declining is a delete, not a decision made in advance.
+
+    Keeping is the default: an accidental Enter should not throw away an attempt
+    that cannot be repeated. Non-interactive runs keep everything for the same
+    reason.
+    """
+    if recording is None:
+        return False
+    typer.secho(recording.summary(), fg=typer.colors.GREEN)
+    if not sys.stdin.isatty():
+        return True
+    if typer.confirm("  keep this episode?", default=True):
+        return True
+    if recording.discard():
+        typer.secho(f"  discarded {recording.path}", fg=typer.colors.YELLOW)
+    else:
+        typer.secho(f"  could not delete {recording.path}", fg=typer.colors.RED, err=True)
+    return False
 
 
 def _echo_trace_summary(trace) -> None:
@@ -529,7 +594,7 @@ def dryrun(
         str, typer.Option("--control-mode", help="Follower control mode: impedance or pos_vel.")
     ] = "impedance",
     device: DeviceOpt = "cuda",
-    invert_gripper: InvertOpt = False,
+    invert_gripper: InvertOpt = True,
     display_policy_input: WatchInputOpt = False,
     fifo: FifoOpt = True,
     asynchronous: AsyncOpt = True,
@@ -703,17 +768,25 @@ def run(
         ),
     ] = False,
     display_policy_input: WatchInputOpt = False,
+    record: RecordOpt = False,
+    record_dir: RecordDirOpt = DEFAULT_RECORD_DIR,
     trace: TraceOpt = True,
     fifo: FifoOpt = True,
     asynchronous: AsyncOpt = True,
     replan_at: ReplanAtOpt = DEFAULT_REPLAN_AT,
     blend: BlendOpt = DEFAULT_BLEND_STEPS,
     device: DeviceOpt = "cuda",
-    invert_gripper: InvertOpt = False,
+    invert_gripper: InvertOpt = True,
     home: Annotated[
         bool,
-        typer.Option("--home", help="Sweep the arms to the \\[home] pose when the run ends."),
-    ] = False,
+        typer.Option(
+            "--home/--no-home",
+            help=(
+                "Sweep the arms to the \\[home] pose when the run ends. ON by default: "
+                "leaving them wherever the policy stopped is what wears them."
+            ),
+        ),
+    ] = True,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Build and print everything; connect nothing.")
     ] = False,
@@ -768,9 +841,9 @@ def run(
 
     notes = ["The POLICY commands the arms. Nobody has verified what it does on this cell."]
     notes.append(
-        "Gripper inversion is ON (--invert-gripper)."
+        "Gripper inversion is ON, as it should be."
         if invert_gripper
-        else "Gripper inversion is OFF — the gripper channels pass through as the model gives them."
+        else "Gripper inversion is OFF (--no-invert-gripper) — the grippers will work BACKWARDS."
     )
     if limits.max_joint_rate is None:
         notes.append("The speed cap is OFF for this run (--no-limit).")
@@ -794,6 +867,17 @@ def run(
     tracer = _make_trace(
         fps=cfg.fps, enabled=trace, display_policy_input=display_policy_input
     )
+    recorder = _make_recorder(
+        record,
+        record_dir,
+        task=task,
+        notes={
+            "checkpoint": spec,
+            "max_joint_rate": limits.max_joint_rate,
+            "invert_gripper": invert_gripper,
+            "fps": cfg.fps,
+        },
+    )
     report = run_rollout(
         cfg,
         display=display,
@@ -804,9 +888,12 @@ def run(
         asynchronous=asynchronous,
         replan_at=replan_at,
         blend=blend,
+        recorder=recorder,
     )
     typer.secho("\nrollout ended; the robot is disconnected.", fg=typer.colors.GREEN)
     _echo_trace_summary(tracer)
+    if recorder is not None:
+        _keep_recording(recorder.stop())
     if report is not None:
         colour = typer.colors.GREEN if report.reached else typer.colors.YELLOW
         typer.secho(report.summary(), fg=colour)
@@ -815,6 +902,345 @@ def run(
                 "the motors are now disabled — support anything holding itself up.",
                 fg=typer.colors.YELLOW,
             )
+
+
+# --------------------------------------------------------------------------- #
+# session — load once, roll out many times
+# --------------------------------------------------------------------------- #
+
+
+HELP_SESSION = """Load the policy once, then run rollout after rollout, task by task.
+
+Everything `dk1 policy run` does, minus the minute it spends loading 10 GiB of
+weights, building the CUDA graph, opening three cameras and energising four arms
+— because it does that once, at the start, and keeps it. After that a rollout is
+one line at the prompt:
+
+  task> pick up the dice          run it
+  task>                           run the same instruction again
+  task> :record on                write the next episodes to a .rrd
+  task> :home                     sweep both arms to the \\[home] pose
+  task> :duration 60              change the per-episode limit
+  task> :quit                     disconnect and leave
+
+Ctrl-C ends the current rollout and returns you to the prompt; it does not end
+the session. A second Ctrl-C during one rollout interrupts for real.
+
+THE ARMS STAY CONNECTED AND ENERGISED BETWEEN ROLLOUTS. That is what makes a
+rollout one command — but it means live motors sit in the room while you type.
+Nothing is commanded between rollouts, so each arm holds its last target and
+says so once ("No command for 0.50 s"); that warning is expected here. Quitting
+disconnects, which disables every motor, so support anything held up.
+
+This is the command for SCORING: same policy, same cell, same settings, one
+instruction after another, with a success count kept on paper. Everything that
+would otherwise differ between attempts is held fixed by construction."""  # noqa: E501
+
+
+@app.command("session", help=HELP_SESSION + MOTION_HELP)
+def session(
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+    checkpoint: CheckpointOpt = None,
+    task: Annotated[
+        str | None,
+        typer.Option("--task", help="First instruction. Press Enter at the prompt to run it."),
+    ] = None,
+    duration_s: Annotated[
+        float, typer.Option("--duration", help="Seconds per episode. 0 = until stopped.")
+    ] = 180.0,
+    fps: Annotated[int, typer.Option("--fps", help="Control rate, Hz.")] = DEFAULT_FPS,
+    interpolation: Annotated[
+        int, typer.Option("--interpolation", help="Commands per policy action.")
+    ] = 1,
+    rtc: Annotated[
+        bool,
+        typer.Option("--rtc/--sync", help="RTC runs inference in a background thread."),
+    ] = False,
+    execution_horizon: Annotated[
+        int, typer.Option("--execution-horizon", help="RTC: actions executed per chunk.")
+    ] = DEFAULT_EXECUTION_HORIZON,
+    control_mode: Annotated[
+        str, typer.Option("--control-mode", help="Follower control mode: impedance or pos_vel.")
+    ] = "impedance",
+    max_joint_rate: Annotated[
+        float | None,
+        typer.Option("--max-joint-rate", help="Joint speed cap, rad/s. Overrides dk1.toml."),
+    ] = None,
+    no_limit: Annotated[
+        bool, typer.Option("--no-limit", help="Remove the speed cap. Read the warning it prints.")
+    ] = False,
+    display: Annotated[
+        bool,
+        typer.Option("--display", help="Stream to Rerun, with one panel per joint."),
+    ] = False,
+    display_policy_input: WatchInputOpt = False,
+    record: RecordOpt = False,
+    record_dir: RecordDirOpt = DEFAULT_RECORD_DIR,
+    trace: TraceOpt = True,
+    fifo: FifoOpt = True,
+    asynchronous: AsyncOpt = True,
+    replan_at: ReplanAtOpt = DEFAULT_REPLAN_AT,
+    blend: BlendOpt = DEFAULT_BLEND_STEPS,
+    device: DeviceOpt = "cuda",
+    invert_gripper: InvertOpt = True,
+    home: Annotated[
+        bool,
+        typer.Option(
+            "--home/--no-home",
+            help=(
+                "Sweep to the \\[home] pose after every episode. ON by default: leaving "
+                "the arms wherever the policy stopped is what wears them."
+            ),
+        ),
+    ] = True,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Build and print everything; connect nothing.")
+    ] = False,
+    assume_yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")
+    ] = False,
+) -> None:
+    from ..policy import rollout_config
+    from ..session import PolicySession
+
+    if control_mode not in ("impedance", "pos_vel"):
+        raise typer.BadParameter(f"control mode must be impedance or pos_vel, got {control_mode!r}")
+    if fps <= 0:
+        raise typer.BadParameter(f"--fps must be positive, got {fps}")
+    if interpolation < 1:
+        raise typer.BadParameter(f"--interpolation must be at least 1, got {interpolation}")
+
+    settings = load(config, require_devices=not dry_run)
+    spec = _checkpoint(settings, checkpoint)
+    limits = _limits(settings, max_joint_rate, no_limit)
+
+    cfg = rollout_config(
+        settings,
+        checkpoint=spec,
+        # The task is set per episode; this is only what the banner prints before
+        # the first one, and PolicySession.set_task overwrites it every time.
+        task=task or "",
+        limits=limits,
+        control_mode=control_mode,
+        fps=fps,
+        duration_s=duration_s,
+        interpolation=interpolation,
+        rtc=rtc,
+        execution_horizon=execution_horizon,
+        device=device,
+        display=display,
+        invert_gripper=invert_gripper,
+    )
+    home_pose = None
+    if home:
+        home_pose = settings.home if settings.home is not None else HOME_AT_START_POSE
+    _report(
+        cfg, spec, home=home_pose, invert=invert_gripper,
+        fifo=fifo, asynchronous=asynchronous, replan_at=replan_at, blend=blend,
+        home_when="after each episode",
+    )
+    typer.secho("\nsession", bold=True)
+    typer.echo("  the policy is loaded ONCE; each episode is one line at the prompt")
+    if record:
+        from ..record import next_index
+
+        typer.echo(f"  recording ON -> {record_dir}, next episode {next_index(record_dir)}")
+        typer.echo("  you are asked whether to keep each episode when it ends")
+    else:
+        typer.echo(f"  recording off (`:record on` at the prompt) -> {record_dir}")
+
+    if dry_run:
+        typer.secho("\n--dry-run: nothing was connected and nothing moved.", fg=typer.colors.GREEN)
+        return
+
+    notes = [
+        "The POLICY commands the arms, once per episode, until you quit.",
+        "The arms stay ENERGISED between episodes, holding their last target.",
+    ]
+    notes.append(
+        "Gripper inversion is ON, as it should be."
+        if invert_gripper
+        else "Gripper inversion is OFF (--no-invert-gripper) — the grippers will work BACKWARDS."
+    )
+    if limits.max_joint_rate is None:
+        notes.append("The speed cap is OFF for this session (--no-limit).")
+    if home_pose is not None:
+        notes.append("--home: BOTH ARMS SWEEP home after every episode that ends cleanly.")
+    confirm_motion(
+        "open a policy session on the follower arms",
+        assume_yes=assume_yes,
+        notes=notes,
+    )
+
+    tracer = _make_trace(fps=cfg.fps, enabled=trace, display_policy_input=display_policy_input)
+    live = PolicySession(
+        cfg,
+        display=display,
+        invert_gripper=invert_gripper,
+        fifo=fifo,
+        asynchronous=asynchronous,
+        replan_at=replan_at,
+        blend=blend,
+        trace=tracer,
+        record_dir=record_dir,
+        record=record,
+        duration_s=duration_s,
+        notes={
+            "checkpoint": spec,
+            "max_joint_rate": limits.max_joint_rate,
+            "invert_gripper": invert_gripper,
+            "fps": cfg.fps,
+        },
+    )
+    typer.secho("\nloading the policy and connecting the cell...", fg=typer.colors.YELLOW)
+    live.open()
+    if task:
+        live.set_task(task)
+    typer.secho("\nready. `:help` lists the commands, `:quit` leaves.\n", fg=typer.colors.GREEN)
+    try:
+        _session_loop(live, tracer, home=home_pose)
+    finally:
+        typer.secho("\nclosing the session...", fg=typer.colors.YELLOW)
+        live.close()
+        typer.secho(
+            "disconnected. The motors are now disabled — support anything held up.",
+            fg=typer.colors.GREEN,
+        )
+
+
+SESSION_HELP_LINES = (
+    "  <instruction>   run one episode with that task",
+    "  <empty>         run the last task again",
+    "  :record on|off  write each episode to a .rrd",
+    "  :duration <s>   seconds per episode; 0 runs until Ctrl-C",
+    "  :home           sweep both arms to the home pose now",
+    "  :help  :quit",
+)
+
+
+def _session_loop(live, tracer, *, home=None) -> None:
+    """Read a line, run an episode, print what it did. Until `:quit` or EOF.
+
+    The reading is here and the deciding is in
+    :func:`dk1lab.session.parse_command`, which is why the grammar can be tested
+    without a robot attached.
+    """
+    from ..session import DURATION, HELP, HOME, NOTHING, QUIT, RECORD, RUN, parse_command
+
+    while True:
+        try:
+            line = input(_prompt(live))
+        except EOFError:
+            typer.echo()
+            return
+        except KeyboardInterrupt:
+            # At the prompt, not in a rollout: nothing to stop. Say so rather
+            # than quitting, since quitting from here disables the motors.
+            typer.echo("\n(`:quit` to leave)")
+            continue
+
+        command = parse_command(line, last_task=live.task)
+        if command.error:
+            typer.secho(command.error, fg=typer.colors.RED)
+            continue
+        if command.kind == QUIT:
+            return
+        if command.kind == NOTHING:
+            typer.echo("type an instruction, or `:help`")
+            continue
+        if command.kind == HELP:
+            for text in SESSION_HELP_LINES:
+                typer.echo(text)
+            continue
+        if command.kind == RECORD:
+            live.record = bool(command.value)
+            typer.echo(f"recording {'ON' if live.record else 'off'} -> {live.record_dir}")
+            continue
+        if command.kind == DURATION:
+            live.duration_s = float(command.value)
+            typer.echo(
+                f"{live.duration_s:.0f} s per episode"
+                if live.duration_s
+                else "each episode runs until Ctrl-C"
+            )
+            continue
+        if command.kind == HOME:
+            _run_home(live)
+            continue
+        if command.kind == RUN:
+            _run_episode(live, tracer, command.task, home=home)
+
+
+def _episode_number(live) -> int:
+    """The number the next episode will carry.
+
+    While recording that is the **file's** index, read off the recordings
+    directory, so the prompt names the file that is about to appear rather than
+    a count that restarts with every session. Otherwise there is no file, and
+    the session's own count is all there is to show.
+    """
+    if not live.record:
+        return live.episodes + 1
+    from ..record import next_index
+
+    return next_index(live.record_dir)
+
+
+def _prompt(live) -> str:
+    """The prompt line: what the next episode will do, before you commit to it."""
+    limit = f"{live.duration_s:.0f}s" if live.duration_s else "no limit"
+    flags = f"episode {_episode_number(live)} | {limit}"
+    if live.record:
+        flags += " | rec"
+    return f"\n[{flags}] task> "
+
+
+def _run_episode(live, tracer, task: str, *, home=None) -> None:
+    """One rollout, with everything it produced printed after it."""
+    typer.secho(
+        f"\n>>> episode {_episode_number(live)}: {task!r} — Ctrl-C stops it\n",
+        fg=typer.colors.YELLOW,
+    )
+    try:
+        outcome = live.rollout(task, home=home)
+    except Exception as exc:  # noqa: BLE001 - one bad episode must not end the session
+        typer.secho(f"\nepisode failed: {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "the arms are still connected and energised; `:quit` to disconnect.",
+            fg=typer.colors.YELLOW,
+        )
+        return
+    typer.secho(f"\n{outcome.summary()}", fg=typer.colors.GREEN)
+    _echo_trace_summary(tracer)
+    _keep_recording(outcome.recording)
+    if outcome.home is not None:
+        _echo_home_report(outcome.home)
+
+
+def _run_home(live) -> None:
+    """The home sweep, from the prompt. **Moves the arms.**"""
+    typer.secho("\nsweeping both arms home — Ctrl-C stops it where they are\n",
+                fg=typer.colors.YELLOW)
+    try:
+        report = live.home()
+    except Exception as exc:  # noqa: BLE001 - a failed sweep must not end the session
+        typer.secho(f"home sweep failed: {exc}", fg=typer.colors.RED, err=True)
+        return
+    _echo_home_report(report)
+
+
+def _echo_home_report(report) -> None:
+    """What the sweep did, and the warning that matters when it did not arrive."""
+    typer.secho(
+        report.summary(), fg=typer.colors.GREEN if report.reached else typer.colors.YELLOW
+    )
+    if not report.reached:
+        typer.secho(
+            "the arms did not reach home — they are still energised, but a disconnect "
+            "now would disable the motors.",
+            fg=typer.colors.YELLOW,
+        )
+
 
 
 # --------------------------------------------------------------------------- #
