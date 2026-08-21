@@ -14,6 +14,11 @@ want to keep pulling its updates.
 ## Hard rules
 
 - **Never open a PR, never push.** Commit locally on a branch; Nikolas publishes.
+- **Ask before every commit, and commit late.** One commit at the end of a
+  session, or a small self-contained fix on its own — never a running series of
+  commits as the work goes. Nikolas confirms each one. The point is that the
+  history stays reviewable and nothing lands before it has been verified on the
+  cell; work that is built but unrun is a working tree, not a commit.
 - **Do not modify upstream files.** `lerobot_robot_trlc_dk1/`, `trlc_dk1_control/`,
   `urdf/`, `hardware/`, `media/`, `README.md` belong to upstream. Extend by
   subclassing in `dk1lab/`. The only accepted upstream deltas are listed below.
