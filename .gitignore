@@ -234,3 +234,13 @@ wandb/
 
 # Written atomically by dk1lab.config; never a real file for more than a moment.
 dk1.toml.tmp
+
+# The two-policy comparison's data (STUDY.md). LeRobot datasets, tens of GB, and
+# `dk1 policy run --record-dataset` writes here by default — so this line is what
+# stands between an accidental `git add -A` and a repository nobody can clone.
+# They belong on the Hugging Face Hub. Only the scores and the write-up are
+# tracked, hence the two exceptions.
+study/
+!study/scores/
+!study/results.md
+!study/scene.jpg

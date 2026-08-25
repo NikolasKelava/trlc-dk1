@@ -87,6 +87,11 @@ dk1lab/                 everything this fork adds; the only Python we own
   actionview.py         policy plan vs robot command vs measured, per joint, live
   fifo.py               ChunkFIFOInferenceEngine — one model call per chunk
   serve.py              the /act HTTP endpoint sim_eval drives — no robot
+  runprofile.py         optimized vs common: what the policy sees, how fast (no lerobot)
+  pi05.py               pi0.5: 32-D padding, renamed cameras, borrowed norm stats
+  dataset.py            the LeRobot v3.0 recorder — alongside record.py, not instead
+  scene.py              the bimanual MuJoCo scene, generated from urdf/  (no lerobot)
+  sim.py                SimRobot — the MuJoCo cell behind the real robot interface
   cli/                  Typer app; `dk1` entry point
 dk1.toml                THE device config. Tracked. Single source of truth.
 tests/                  the suite; none of it needs hardware
@@ -333,7 +338,7 @@ subsystem directory: `...-usb-0:4.3:1.0` names both a camera and a leader arm.
 | **3** | Zero-shot MolmoAct2 evaluation | **six debugging rollouts plus a first recorded session of eight episodes.** Every timing and motion fault this fork could cause is closed; what is left is the policy's own output. **Still not scored** |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **done: 3/3** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
-| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=5 | protocol in `STUDY.md`, which carries its own phase numbering |
+| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=5 | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0 and 1 are done**; Phase 2 is the arms — see below |
 
 **Phase 1** built `dk1 find cameras`, `dk1 find arms --inspect` (read-only USB
 identity) and `dk1 config check --formats`. That last one matters: OpenCV
@@ -452,6 +457,84 @@ the images are JPEG-encoded with **cv2** on a worker thread (1.8 ms per tick on
 the control thread, against 5.1 ms if the encode runs inline, and cv2 is 2.7x
 faster than rerun's own `Image.compress`). A frame that cannot be kept up with
 is dropped, counted, and reported.
+
+## The two-policy comparison — what Phase 0 built (2026-08-25)
+
+`STUDY.md` is the protocol. This is what exists in the tree for it. **Nothing has
+been run on the arms and nothing has been scored**; every item here is code and
+its tests.
+
+**`--profile {optimized,common}`** on `dk1 policy run` and `session`.
+`dk1lab/runprofile.py` owns it, and it is a *derived config*, not an edit:
+`profile.apply(settings)` returns a `DK1Config` with the crop stripped out of
+every camera, so `dk1.toml` is never written and every consumer downstream — the
+camera builders, the banner, the recorder's notes — reads the same thing.
+`optimized` stays the default and is the identity. `common` selects the new
+`[limits.study]` table (0.6 rad/s; `max_lag` deliberately unchanged, it is a
+torque clamp). `POLICY_LIMITS` moved to `runprofile.py` and is re-exported from
+`policy.py`.
+
+**π0.5** — `dk1lab/pi05.py`, and `dk1 policy check` / `smoke` detect the family
+off the checkpoint's own `type` rather than taking a flag. Three gaps are closed
+at load, all three printed before anything runs:
+32-D padded state/action narrowed to 14 by `output_features["action"].shape`,
+which is what trims the chunk (verified: `(1, 50, 14)`);
+`top/left/right` renamed onto `base_0_rgb`/`left_wrist_0_rgb`/`right_wrist_0_rgb`
+through the pipeline's own rename step, because the model embeds the views
+**positionally**; and the missing normalisation borrowed from
+`andreaskoepf/dk1-merge-2026-03`'s `meta/stats.json`, whose channel names are
+checked against `layout.ACTION_KEYS` before use and **match exactly**.
+The gripper inversion is **off for π0.5, always**.
+
+> **π0.5 is blocked on a licence.** Its prompt tokenizer is
+> `google/paligemma-3b-pt-224`, a **gated** HF repo. Nikolas must accept it and
+> `hf auth login`. `dk1lab.pi05.tokenizer_available` checks before loading 14 GB
+> of weights. Do not substitute a mirror: the tokenizer decides what the prompt
+> means, and the study compares two policies on one prompt.
+
+**`dk1lab/dataset.py`** — a LeRobot **v3.0** recorder, `--record-dataset` on both
+`run` and `session`. Alongside `record.py`, which is untouched: the `.rrd` keeps
+the policy's own plan, which no dataset format has a slot for. Same four-call
+instrument shape, so `dk1lab.dataset.one()` drives both at once and the operator
+is asked **once**. One dataset per directory, episodes appended, an existing
+directory resumed.
+**An episode is not written until it is kept.** `stop()` leaves it in the buffer;
+`keep()` calls `save_episode`, `discard()` clears it. The first version saved in
+`stop()` and had a `discard` that reported success and changed nothing —
+`save_episode` cannot be undone. `DatasetSession.close()` keeps anything pending.
+
+**The simulator** — `dk1lab/scene.py` generates the bimanual MJCF from this
+repo's own `urdf/` (upstream's file, read never written), and `dk1lab/sim.py`'s
+`SimRobot` is a LeRobot robot registered `dk1_sim`. `dk1 sim scene|view|sweep`,
+and `--sim` on `run` / `session`. Measured: **916 Hz free-run with all three
+cameras rendered**, exactly 30.0 Hz under `--realtime`.
+
+**Both policies drove it, 2026-08-25** — MolmoAct2 at 29.8 Hz over 40 chunks and
+π0.5 at 29.9 Hz over 17, no starved ticks either way, home sweep reaching within
+0.03 rad. That closes `STUDY.md`'s Phase 1 and is the whole of what it claims:
+the pipeline runs. Two things had to be fixed for π0.5 to get there, both of
+which would otherwise have failed silently:
+
+- `dk1 policy run` built a **MolmoAct2** config whatever the checkpoint was, so
+  π0.5 would have run with its MolmoAct2-only fields ignored and **no
+  normalisation at all**. `policy.family()` now reads the type off the
+  checkpoint's own `config.json`, `build_context` patches the borrowed statistics
+  into the loaded pipeline (same argument as `apply_gripper_inversion`: the
+  pipelines are rebuilt from JSON on every load, so the config is not a hook),
+  the rename map is set, and the gripper inversion is **refused** for π0.5.
+- The chunk FIFO's relative-actions guard matched by class name and ignored
+  `enabled`. π0.5 ships a `RelativeActionsProcessorStep` with `enabled: false` so
+  a fine-tune can switch it on; disabled it passes actions through untouched.
+  LeRobot's own guard tests the flag. Ours now does too.
+
+> **The scene itself is poor, and is not fixed.** The arms sit on 0.30 m
+> pedestals and **cannot reach the table** — the pedestal exists because at the
+> zero pose the DK1's elbow folds behind and below its own base, so a flat-
+> mounted arm starts with contact points through the table and its base yaw
+> pinned; solving that created this. The bowl is a **round base with four square
+> walls**. The arm spacing and camera poses are the *training rig's*, not this
+> cell's. So a sim rollout says the pipeline runs and nothing else — do not quote
+> it as a task result. `STUDY.md` § *The simulator* carries the same list.
 
 ## The defaults that were tuned, and why they are what they are
 

@@ -134,9 +134,17 @@ before spending five attempts.
 | --- | --- | --- | --- | --- |
 | R0 | MolmoAct2 optimized | `optimized` | none — frozen reference | 2 |
 | A0 | MolmoAct2 zero-shot | `common` | none | 2 |
-| B0 | π0.5 zero-shot | `common` | none | 2 |
 | A1 | MolmoAct2 + LoRA | `common` | LoRA | 4 |
+| B0 | π0.5 zero-shot | `common` | none | 5 |
 | B1 | π0.5 + LoRA | `common` | LoRA | 5 |
+
+**MolmoAct2 goes all the way first, then π0.5.** B0 was originally Phase 2's
+third row; it now runs alongside B1, after MolmoAct2 has been fine-tuned. The
+cell is only worth setting up for one policy at a time, and the ~100
+demonstrations are what both fine-tunes need, so nothing is learned by pushing
+π0.5 through the arms before that dataset exists. Nothing about the *comparison*
+changes: every configuration still runs the same task from the same scene under
+the same profile, and B0 is still zero-shot weights.
 
 `--duration` drops from the 180 s default to **60 s**: 180 was chosen for a
 multi-object sim task, and dice-in-bowl is a single pick and place.
@@ -175,6 +183,13 @@ afterwards.
 
 **LeRobot dataset v3.0** for the demonstrations and every scored rollout;
 viewable with `lerobot-dataset-viz` and the Hub's dataset viewer.
+
+**Except R0, which is generally not recorded.** It runs under `optimized`, so
+its frames carry the wrist crop and the offset — a different lens from every
+other row's. Putting them in the same dataset would give a fine-tune two
+geometries and no way to tell them apart, and R0 is a reference row rather than
+training data. Score it on paper; record it to an `.rrd` if a run needs
+diagnosing.
 
 `dk1lab/record.py` and its `.rrd` output stay exactly as they are, behind
 `--record-rrd`, used only when a rollout needs diagnosing against the policy's
@@ -255,10 +270,71 @@ engine, limiter and home sweep are untouched code. UI is `mujoco.viewer`. Sim
 decoupled by a `--realtime` / `--free-run` flag.
 
 **The sim produces no episodes and no scores.** It exists to confirm each policy
-drives the pipeline before it drives the arms. Gripper contact tuning is the
-schedule risk; if it slips, the sim degrades to a kinematic check — the arms
-move, nothing is grasped — which is an acceptable fallback and not a reason to
-delay Phase 2.
+drives the pipeline before it drives the arms.
+
+### The scene is wrong, and knowingly so
+
+Phase 1 passed on the only thing it was gating: both policies drove the sim arms
+through the unmodified pipeline at 30 Hz with nothing starved. The *scene* they
+drove is not good, and none of it is fixed yet:
+
+- **The arms are on poles and cannot reach the table.** They are mounted on
+  0.30 m pedestals — added because at the zero pose the DK1's elbow folds behind
+  and below its own base, so an arm bolted flat starts with contact points
+  through the table and its base yaw pinned. The pedestal solved that and created
+  this: the workspace is now out of reach.
+- **The bowl has a round base and four square walls.** It was built as "enough to
+  tell in from out"; it is not a bowl.
+- The arm spacing and camera poses are the *training rig's* (y = ±0.24 m, both
+  facing +X), not this cell's, and were never a claim about it.
+
+So a sim rollout right now says the pipeline runs. It says nothing about whether
+a policy can do the task, and it must not be quoted as if it did. Fixing the
+mounting geometry and the bowl is worth doing before the sim is used for
+anything beyond that — it is not a blocker for Phase 2, which is on the arms.
+
+---
+
+## Running it
+
+The profile, the checkpoint and the recorder are flags on one command. Nothing
+below edits `dk1.toml`.
+
+**The simulator** — no `/dev` node, no motor, nothing in the room moves:
+
+```
+dk1 policy run --sim --profile common --duration 60 \
+  --task "put the dice in the bowl" --yes
+
+dk1 policy run --sim --profile common --duration 60 \
+  --checkpoint ~/Documents/RobotLearning/policies/pi05/base \
+  --task "put the dice in the bowl" --yes
+```
+
+A MuJoCo window opens; `--no-view` runs it headless, `--display` adds the
+per-joint Rerun panels. Read the result as *the pipeline runs* and nothing more.
+
+**The arms**, one scored session per configuration. `--profile` and `--record-dataset`
+are the two flags that decide which row you are producing:
+
+```
+# R0 — the frozen reference. Optimized, and NOT recorded to the dataset.
+dk1 policy session --profile optimized --duration 60
+
+# A0 / A1 — the level playing field, recorded.
+dk1 policy session --profile common --duration 60 \
+  --record-dataset --dataset-dir study/rollouts/A0
+```
+
+At the prompt: type the task, Ctrl-C to end the attempt, Enter to keep it, empty
+line to run it again, `:quit` to leave. Score each attempt into
+`study/scores/<config>.csv` as it happens.
+
+The checkpoint defaults to `[policy]` in `dk1.toml` (MolmoAct2). For π0.5 pass
+`--checkpoint ~/Documents/RobotLearning/policies/pi05/base`; the gripper
+inversion turns itself off for it, and the borrowed normalisation is applied and
+announced. **The demonstrations in Phase 3 must be recorded under `--profile
+common`** — that is the invariant above.
 
 ---
 
@@ -266,12 +342,12 @@ delay Phase 2.
 
 | | | gate |
 | --- | --- | --- |
-| **0** | Setup | both policies load and infer; `--profile common` exists; the LeRobot recorder writes a readable dataset; the MuJoCo scene runs |
-| **1** | Sim check — nothing recorded | both policies drive the sim arms through the unmodified pipeline |
-| **2** | Zero-shot on the arms — R0, A0, then B0 **separately**, N=5 each | 15 scored attempts, three rows |
+| **0** | Setup | **done 2026-08-25.** Both policies load and infer; `--profile common` exists; the LeRobot recorder writes a readable dataset; the MuJoCo scene runs |
+| **1** | Sim check — nothing recorded | **done 2026-08-25.** Both policies drove the sim arms through the unmodified pipeline at ~29.9 Hz, no starved ticks. The scene itself is poor — see *The simulator* |
+| **2** | Zero-shot on the arms — R0, then A0, **separately**, N=5 each | 10 scored attempts, two rows |
 | **3** | Collect ~100 demonstrations | a LeRobot v3.0 dataset recorded under `--profile common` |
 | **4** | MolmoAct2 + LoRA → A1, N=5 | |
-| **5** | π0.5 + LoRA → B1, N=5 | |
+| **5** | π0.5 — B0 then B1, N=5 each | 10 scored attempts, two rows |
 | **6** | *If time:* action-expert-only, both models | |
 | **7** | Interpretation → `study/results.md` | |
 
@@ -283,9 +359,9 @@ clone and stays untouched. All code stays in `trlc-dk1-niko`. Fetch
 `lerobot/pi05_base`, verify with `dk1 policy check` / `smoke`. Build
 `--profile common`, the LeRobot recorder, and the MuJoCo scene.
 
-**Phase 2.** MolmoAct2 fully, then π0.5, in separate sessions. Escalate as
-`CLAUDE.md` prescribes — `dryrun` before `run`, for each new policy. π0.5 has
-never commanded these arms.
+**Phase 2.** R0 then A0, in separate sessions. Escalate as `CLAUDE.md`
+prescribes — `dryrun` before `run`. π0.5 has never commanded these arms and does
+not until Phase 5.
 
 **Phase 3.** ~100 episodes by teleoperation under `--profile common`, dice start
 varied within the marked region, bowl fixed. Teleop stays uncapped: the cap
@@ -301,6 +377,10 @@ underperform?
 ---
 
 ## Known risks, stated before they bite
+
+**The sim scene is not usable for anything but a pipeline check.** The arms are
+on pedestals and cannot reach the table, and the bowl is a round base with square
+walls. Known, recorded, not fixed. See *The simulator*.
 
 **π0.5 has no DK1 normalization statistics.** Its base checkpoint knows nothing
 about this 14-D action space, so a literal zero-shot load may not build a
@@ -334,4 +414,5 @@ A protocol that moves silently is not a protocol.
 
 | date | change | why |
 | --- | --- | --- |
-| — | — | — |
+| 2026-08-25 | B0 moves from Phase 2 to Phase 5 — MolmoAct2 all the way through first | The cell is worth setting up for one policy at a time, and both fine-tunes need the same ~100 demonstrations. The comparison is unaffected: same task, same scene, same profile, and B0 is still zero-shot weights |
+| 2026-08-25 | R0 is scored but **not** recorded to a LeRobot dataset | It runs under `optimized`, so its frames carry a different lens from every other row's. Mixing them into one dataset would give a fine-tune two geometries and no way to tell them apart |

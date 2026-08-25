@@ -65,6 +65,7 @@ QUIT = "quit"
 HOME = "home"
 HELP = "help"
 RECORD = "record"
+DATASET = "dataset"
 DURATION = "duration"
 NOTHING = "nothing"
 
@@ -114,6 +115,12 @@ def parse_command(line: str, *, last_task: str = "") -> Command:
         if rest.lower() in ("off", "no", "false"):
             return Command(RECORD, value=False)
         return Command(RECORD, error=f"say `:record on` or `:record off`, not {rest!r}")
+    if word == "dataset":
+        if rest.lower() in ("on", "yes", "true"):
+            return Command(DATASET, value=True)
+        if rest.lower() in ("off", "no", "false"):
+            return Command(DATASET, value=False)
+        return Command(DATASET, error=f"say `:dataset on` or `:dataset off`, not {rest!r}")
     if word == "duration":
         try:
             seconds = float(rest)
@@ -160,7 +167,14 @@ class PolicySession:
         trace: a :class:`~dk1lab.trace.RolloutTrace`, attached once and reset
             between episodes so each one gets its own summary.
         record_dir: where episode recordings are written when recording is on.
-        record: whether to record from the first rollout. Toggled at the prompt.
+        record: whether to write an ``.rrd`` from the first rollout. Toggled at
+            the prompt.
+        dataset: an open :class:`~dk1lab.dataset.DatasetSession` to append
+            episodes to, or ``None``. Unlike the ``.rrd`` path it is one object
+            for the whole session, so five scored attempts are five episodes of
+            one dataset.
+        record_dataset: whether to write each rollout into ``dataset``. Also
+            toggled at the prompt, and inert without a ``dataset``.
     """
 
     def __init__(
@@ -176,6 +190,8 @@ class PolicySession:
         trace: Any = None,
         record_dir: Path | str | None = None,
         record: bool = False,
+        dataset: Any = None,
+        record_dataset: bool = False,
         duration_s: float = 0.0,
         notes: dict[str, Any] | None = None,
     ) -> None:
@@ -189,6 +205,12 @@ class PolicySession:
         self.trace = trace
         self.record_dir = Path(record_dir) if record_dir is not None else None
         self.record = record
+        #: An open :class:`~dk1lab.dataset.DatasetSession`, or ``None``. Opened by
+        #: the caller before anything is connected, and closed by :meth:`close` —
+        #: it spans the whole session, because a scored run of five attempts is
+        #: five episodes of one dataset rather than five datasets.
+        self.dataset = dataset
+        self.record_dataset = record_dataset and dataset is not None
         self.duration_s = duration_s
         self.notes = dict(notes or {})
         self.task = ""
@@ -263,6 +285,9 @@ class PolicySession:
         if self._watching:
             shutdown_visualization("rerun")
             self._watching = False
+        if self.dataset is not None:
+            # Finalises the metadata, and keeps any episode nobody answered for.
+            self.dataset.close()
         self.ctx = None
 
     def __enter__(self) -> PolicySession:
@@ -301,6 +326,7 @@ class PolicySession:
         *,
         duration_s: float | None = None,
         record: bool | None = None,
+        dataset: bool | None = None,
         home: Any = None,
     ) -> EpisodeOutcome:
         """Drive the arms with the policy, once. **Moves the arms.**
@@ -316,12 +342,15 @@ class PolicySession:
             duration_s: seconds, or 0 for until-stopped. Defaults to the
                 session's.
             record: write this episode to a ``.rrd``. Defaults to the session's.
+            dataset: append this episode to the LeRobot dataset. Defaults to the
+                session's, and is inert without one.
             home: sweep to this pose afterwards, on a clean end only.
 
         Returns:
             An :class:`EpisodeOutcome`. Never raises for an ordinary stop —
             Ctrl-C is an ordinary stop.
         """
+        from .dataset import one as combine
         from .record import DEFAULT_RECORD_DIR, EpisodeRecorder, episode_path, next_index
 
         if task:
@@ -336,18 +365,26 @@ class PolicySession:
         if self.trace is not None:
             self.trace.reset()
 
-        recorder = None
+        rrd_recorder = None
         if recording_wanted:
             # The index comes off the directory, not off this session's count, so
             # it keeps rising across sessions rather than overwriting yesterday's
             # first episode with today's.
             directory = self.record_dir or DEFAULT_RECORD_DIR
             index = next_index(directory)
-            recorder = EpisodeRecorder(
+            rrd_recorder = EpisodeRecorder(
                 episode_path(directory, self.task, index),
                 task=self.task,
                 notes={**self.notes, "episode": index},
             )
+        dataset_wanted = self.record_dataset if dataset is None else dataset
+        dataset_recorder = None
+        if dataset_wanted and self.dataset is not None:
+            dataset_recorder = self.dataset.episode(
+                self.task, notes={**self.notes, "episode": self.dataset.episodes}
+            )
+        recorder = combine(rrd_recorder, dataset_recorder)
+        if recorder is not None:
             # After every session-level instrument, so it is the innermost
             # wrapper and detaching it puts the chain back as it was.
             recorder.attach(self.ctx)

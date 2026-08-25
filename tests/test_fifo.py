@@ -232,23 +232,51 @@ def test_a_queued_action_is_served_even_without_a_fresh_observation():
 # --------------------------------------------------------------------------- #
 
 
+def relative_step(**attributes):
+    """A stand-in for a relative-actions step. Matched by class name, so this is all."""
+    return type("RelativeActionsProcessorStep", (), attributes)()
+
+
+def build_engine(preprocessor):
+    features, _obs = frames()
+    return ChunkFIFOInferenceEngine(
+        policy=FakePolicy(),
+        preprocessor=preprocessor,
+        postprocessor=FakePipeline(),
+        dataset_features=features,
+        ordered_action_keys=list(ACTION_KEYS),
+        task="t",
+        device="cpu",
+        robot_type=ROBOT_TYPE,
+    )
+
+
 def test_a_relative_action_policy_is_refused_rather_than_drifted():
     """Serving precomputed rows is only correct for absolute actions."""
-    features, _obs = frames()
     preprocessor = FakePipeline()
-    # Matched by class name, so a class with the right name is the whole fake.
-    preprocessor.steps = [type("RelativeActionsProcessorStep", (), {})()]
+    preprocessor.steps = [relative_step(enabled=True)]
     with pytest.raises(ValueError, match="absolute actions"):
-        ChunkFIFOInferenceEngine(
-            policy=FakePolicy(),
-            preprocessor=preprocessor,
-            postprocessor=FakePipeline(),
-            dataset_features=features,
-            ordered_action_keys=list(ACTION_KEYS),
-            task="t",
-            device="cpu",
-            robot_type=ROBOT_TYPE,
-        )
+        build_engine(preprocessor)
+
+
+def test_a_step_with_no_enabled_flag_is_assumed_on():
+    """The conservative reading: refuse rather than guess it is inert."""
+    preprocessor = FakePipeline()
+    preprocessor.steps = [relative_step()]
+    with pytest.raises(ValueError, match="absolute actions"):
+        build_engine(preprocessor)
+
+
+def test_a_disabled_relative_step_is_not_a_relative_policy():
+    """π0.5 ships one, switched off, so a fine-tune can switch it on.
+
+    Switched off it passes actions through untouched, which is exactly the
+    absolute-action case this engine is correct for. Matching on the class alone
+    refused π0.5 outright — and LeRobot's own guard tests the same flag.
+    """
+    preprocessor = FakePipeline()
+    preprocessor.steps = [relative_step(enabled=False)]
+    assert build_engine(preprocessor) is not None
 
 
 def test_an_rtc_enabled_policy_is_refused_rather_than_called_wrongly():

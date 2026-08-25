@@ -221,14 +221,27 @@ class ChunkReport:
 
 
 def _relative_action_steps(preprocessor: Any) -> list[str]:
-    """Any pipeline step that makes actions relative to the current state.
+    """Any **enabled** pipeline step that makes actions relative to the current state.
 
     Matched by class name because the classes live in different modules across
     LeRobot versions and importing them all to ``isinstance`` against would make
     this file fail to import rather than fail to find one.
+
+    ``enabled`` is part of the test, not a nicety. π0.5's saved preprocessor
+    carries a ``RelativeActionsProcessorStep`` with ``enabled: false`` — the step
+    is there so a fine-tune can switch it on, and switched off it passes actions
+    through untouched, which is exactly the absolute-action case this engine is
+    correct for. Matching on the class alone refused π0.5 outright. LeRobot's own
+    guard in ``rollout/context.py`` tests the same flag, which is the tell that
+    presence is not the property that matters. A step with no such attribute is
+    assumed enabled, because that is the conservative reading.
     """
     steps = getattr(preprocessor, "steps", ()) or ()
-    return [type(s).__name__ for s in steps if "Relative" in type(s).__name__]
+    return [
+        type(step).__name__
+        for step in steps
+        if "Relative" in type(step).__name__ and getattr(step, "enabled", True)
+    ]
 
 
 def build(

@@ -10,7 +10,7 @@ dependencies = [
   "numpy>=2.0.1",
   "pyserial>=3.5",
   "dynamixel-sdk>=3.7.31",
-  "lerobot[dynamixel,viz,molmoact2,training]>= 0.5.1",
+  "lerobot[dynamixel,viz,molmoact2,training,pi,peft,dataset]>= 0.5.1",
   "mujoco>=3.0.0",
   # --- dk1lab (fork additions) ---
   "typer>=0.12",

@@ -22,10 +22,13 @@ import typer
 from .. import checkpoint as ckpt
 from ..cameras import crop_summary
 from ..config import DEFAULT_CONFIG_PATH, load
-from ..layout import ACTION_KEYS, GRIPPER_INDICES, IMAGE_KEYS
+from ..layout import ACTION_KEYS, CAMERA_NAMES, GRIPPER_INDICES, IMAGE_KEYS
 from ..fifo import DEFAULT_BLEND_STEPS, DEFAULT_REPLAN_AT
 from ..record import DEFAULT_RECORD_DIR
-from ..policy import DEFAULT_EXECUTION_HORIZON, DEFAULT_FPS, HOME_AT_START_POSE, POLICY_LIMITS
+from ..dataset import DEFAULT_DATASET_DIR, one
+from ..policy import DEFAULT_EXECUTION_HORIZON, DEFAULT_FPS, HOME_AT_START_POSE
+from ..runprofile import DEFAULT_PROFILE, ProfileError
+from ..runprofile import resolve as resolve_profile
 from .safety import ENERGISE_HELP, MOTION_HELP, confirm_motion
 
 app = typer.Typer(no_args_is_help=True, help=__doc__)
@@ -117,6 +120,58 @@ RecordDirOpt = Annotated[
     Path,
     typer.Option("--record-dir", help="Where recordings are written."),
 ]
+SimOpt = Annotated[
+    bool,
+    typer.Option(
+        "--sim",
+        help=(
+            "Drive the MuJoCo cell instead of the arms: no /dev node is opened, no "
+            "motor is energised, and nothing in the room moves. Everything else — "
+            "the rollout loop, the chunk FIFO, the speed limiter, the home sweep — "
+            "is the same code. A sim rollout is evidence that the pipeline runs and "
+            "nothing more; it produces no episodes and no scores."
+        ),
+    ),
+]
+SimRealtimeOpt = Annotated[
+    bool,
+    typer.Option(
+        "--realtime/--free-run",
+        help=(
+            "--sim only: keep the sim in step with the wall clock, or let it run as "
+            "fast as the model allows. Neither changes what the policy sees."
+        ),
+    ),
+]
+SimViewOpt = Annotated[
+    bool,
+    typer.Option("--view/--no-view", help="--sim only: open mujoco.viewer."),
+]
+DatasetOpt = Annotated[
+    bool,
+    typer.Option(
+        "--record-dataset",
+        help=(
+            "Write each episode into a LeRobot dataset v3.0 under --dataset-dir: "
+            "the 14-D state, the action the arms were GIVEN, and the three camera "
+            "streams as video. This is the format STUDY.md scores and fine-tunes "
+            "from, and it is viewable with lerobot-dataset-viz. Independent of "
+            "--record, which writes the .rrd carrying the policy's own plan; use "
+            "both when an attempt is worth diagnosing as well as keeping."
+        ),
+    ),
+]
+DatasetDirOpt = Annotated[
+    Path,
+    typer.Option(
+        "--dataset-dir",
+        help=(
+            "The dataset directory. Episodes are APPENDED to it, so a scored run of "
+            "five attempts is one dataset of five episodes; an existing directory is "
+            "resumed rather than replaced."
+        ),
+    ),
+]
 WatchInputOpt = Annotated[
     bool,
     typer.Option(
@@ -125,6 +180,20 @@ WatchInputOpt = Annotated[
             "Open Rerun and log the images and actions as the MODEL sees them: the "
             "378x378 tensors unpacked from pixel_values, not the robot-side view "
             "--display shows. This is where to check camera orientation."
+        ),
+    ),
+]
+
+ProfileOpt = Annotated[
+    str,
+    typer.Option(
+        "--profile",
+        help=(
+            "How the cell is set up for this run. `optimized` (the default) is "
+            "what it already runs: the wrist crop and \\[limits.policy]. `common` "
+            "is the level playing field for the two-policy comparison — no wrist "
+            "crop, no offset, the full lens on all three cameras, and "
+            "\\[limits.study]. Neither writes dk1.toml."
         ),
     ),
 ]
@@ -222,18 +291,25 @@ def check(
     if info.weights_bytes:
         typer.echo(f"  weights       {info.weights_bytes / 2**30:.1f} GiB  ({info.model_dtype})")
     typer.echo(f"  type          {info.policy_type}")
-    typer.echo(f"  norm_tag      {info.norm_tag}")
-    typer.echo(f"  setup_type    {info.setup_type}")
-    typer.echo(f"  control_mode  {info.control_mode}")
+    if info.policy_type != "pi05":
+        typer.echo(f"  norm_tag      {info.norm_tag}")
+        typer.echo(f"  setup_type    {info.setup_type}")
+        typer.echo(f"  control_mode  {info.control_mode}")
     typer.echo(f"  chunk         {info.chunk_size} steps, {info.n_action_steps} executed")
     typer.echo(f"  vectors       state {info.state_dim}-D, action {info.action_dim}-D")
+    if info.max_state_dim:
+        typer.echo(
+            f"                (padded widths; narrowed to {len(ACTION_KEYS)}-D at load)"
+        )
 
-    typer.secho("\nimage order (from the saved preprocessor, which is what runs)", bold=True)
-    for key in info.pipeline_image_keys or ["(none pinned)"]:
-        typer.echo(f"  {key}")
-    typer.echo(f"  this cell provides: {', '.join(IMAGE_KEYS)}")
-
-    _echo_inversion(None)
+    if info.policy_type == "pi05":
+        _echo_pi05_adaptation(info)
+    else:
+        typer.secho("\nimage order (from the saved preprocessor, which is what runs)", bold=True)
+        for key in info.pipeline_image_keys or ["(none pinned)"]:
+            typer.echo(f"  {key}")
+        typer.echo(f"  this cell provides: {', '.join(IMAGE_KEYS)}")
+        _echo_inversion(None)
 
     for note in ckpt.notes(info):
         typer.secho(f"\nnote: {note}", fg=typer.colors.YELLOW)
@@ -246,6 +322,96 @@ def check(
         raise typer.Exit(code=1)
 
     typer.secho("\ncheckpoint is usable on this cell.", fg=typer.colors.GREEN)
+
+
+def _family(spec: str) -> str:
+    """Which policy a checkpoint holds, read off its own ``config.json``.
+
+    Detected rather than asked for. A ``--policy pi05`` flag would let the flag
+    and the directory disagree, and the two are adapted to this cell in different
+    ways — 32-D padding and borrowed statistics for one, a gripper inversion for
+    the other. A checkpoint that cannot be read locally (a bare Hugging Face repo
+    id) is assumed to be MolmoAct2, which is what the [policy] section of dk1.toml points at.
+    """
+    try:
+        return ckpt.read(spec).policy_type or ckpt.EXPECTED_TYPE
+    except ckpt.CheckpointError:
+        return ckpt.EXPECTED_TYPE
+
+
+def _smoke_pi05(spec: str, *, task: str, steps: int, device: str, capture, source):
+    """π0.5's smoke test, with the adaptation printed before the weights load."""
+    from ..pi05 import Pi05Error, load_norm_stats
+    from ..pi05 import smoke as run_pi05_smoke
+
+    _echo_pi05_adaptation()
+    try:
+        stats = load_norm_stats(source)
+    except Pi05Error as exc:
+        typer.secho(f"\n{exc}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    typer.secho(f"\n  {stats.describe()}", fg=typer.colors.GREEN)
+
+    typer.echo("\nchecking the gated tokenizer before loading 14 GB of weights ...")
+    try:
+        typer.echo("loading ...")
+        return run_pi05_smoke(
+            spec,
+            task=task,
+            steps=steps,
+            device=device,
+            width=capture.width,
+            height=capture.height,
+            stats=stats,
+        )
+    except Pi05Error as exc:
+        typer.secho(f"\n{exc}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+
+def _echo_smoke_tail(result, periods: float) -> None:
+    """The end of a smoke report for a policy with no RTC path to time."""
+    if periods > 1:
+        typer.echo(
+            "\n  A model call costs more than one control period. The chunk FIFO serves\n"
+            "  the whole chunk from a queue while the next one is computed on a worker\n"
+            "  thread, which is what keeps the loop at 30 Hz — see `dk1 policy run`."
+        )
+    typer.echo(f"\npeak GPU memory {result.peak_gpu_gib:.1f} GiB")
+    typer.secho("smoke test passed. Nothing was connected.", fg=typer.colors.GREEN)
+
+
+def _echo_pi05_adaptation(info=None) -> None:
+    """What is done to π0.5 to make it drive this cell, and where it came from.
+
+    Printed by every π0.5 command. The borrowed-normalisation line is not a
+    footnote: a π0.5 number quoted without it is a number about a different
+    experiment.
+    """
+    from ..pi05 import IMAGE_RENAME, NORM_STATS_REPO
+
+    typer.secho("\nimage keys (renamed at load — the model embeds the views by position)", bold=True)
+    for ours, theirs in IMAGE_RENAME.items():
+        typer.echo(f"  {ours}  ->  {theirs}")
+
+    typer.secho("\nnormalisation", bold=True)
+    typer.secho(
+        f"  BORROWED from {NORM_STATS_REPO} (meta/stats.json)",
+        fg=typer.colors.YELLOW,
+    )
+    typer.echo("  π0.5's base checkpoint has no statistics for this robot and cannot make")
+    typer.echo("  any, so its saved normalizer covers no features at all. These are 1823")
+    typer.echo("  episodes of this exact bi_dk1_follower 14-D layout, and the channel")
+    typer.echo("  names are checked against dk1lab.layout before they are used.")
+    typer.secho(
+        "  Quote every π0.5 zero-shot result as ZERO-SHOT WEIGHTS, BORROWED NORMALISATION.",
+        fg=typer.colors.YELLOW,
+    )
+
+    typer.secho("\ngripper inversion", bold=True)
+    typer.echo("  OFF, always. π0.5's normalisation comes from DK1 data in DK1")
+    typer.echo("  convention (0=open), so there is nothing to flip. Inverting here")
+    typer.echo("  would introduce the sign error, not remove it.")
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +427,18 @@ def smoke(
     steps: Annotated[int, typer.Option("--steps", help="Inference calls to make.")] = 5,
     device: DeviceOpt = "cuda",
     invert_gripper: InvertOpt = True,
+    norm_stats: Annotated[
+        str | None,
+        typer.Option(
+            "--norm-stats",
+            help=(
+                "π0.5 only: a local LeRobot dataset to take 14-D normalisation "
+                "statistics from. Default: the dk1-merge-2026-03 dataset on the Hub, "
+                "which covers this exact layout. Ignored for MolmoAct2, which brings "
+                "its own."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Load the policy and run inference on a synthetic frame. GPU only, no robot.
 
@@ -273,28 +451,35 @@ def smoke(
     The images are noise, so the action values mean nothing. Only their shape,
     their ordering and the latency do.
     """
-    from ..policy import smoke as run_smoke
-
     settings = load(config)
     spec = _checkpoint(settings, checkpoint)
     capture = settings.profile("policy")
+    family = _family(spec)
 
     typer.secho("smoke test — no robot is connected by this command", bold=True)
     typer.echo(f"  checkpoint  {spec}")
+    typer.echo(f"  policy      {family}")
     typer.echo(f"  device      {device}")
     typer.echo(f"  frame       {capture.width}x{capture.height}, 3 views")
     typer.echo(f"  task        {task!r}")
-    typer.echo("\nloading (the first call also pays CUDA graph capture) ...")
 
-    result = run_smoke(
-        spec,
-        task=task,
-        steps=steps,
-        device=device,
-        width=capture.width,
-        height=capture.height,
-        invert_gripper=invert_gripper,
-    )
+    if family == "pi05":
+        result = _smoke_pi05(
+            spec, task=task, steps=steps, device=device, capture=capture, source=norm_stats
+        )
+    else:
+        from ..policy import smoke as run_smoke
+
+        typer.echo("\nloading (the first call also pays CUDA graph capture) ...")
+        result = run_smoke(
+            spec,
+            task=task,
+            steps=steps,
+            device=device,
+            width=capture.width,
+            height=capture.height,
+            invert_gripper=invert_gripper,
+        )
 
     typer.secho("\naction", bold=True)
     for key, value in zip(result.action_keys, result.action, strict=True):
@@ -312,6 +497,12 @@ def smoke(
         f"  cached call    {result.cached_ms:.0f} ms   "
         f"(29 calls in 30 — the chunk is already computed)"
     )
+    if not result.rtc_ms:
+        # π0.5 is deployed through --sync plus the chunk FIFO, as MolmoAct2 is;
+        # timing the RTC path would be measuring something nothing runs.
+        _echo_smoke_tail(result, periods)
+        return
+
     from ..policy import DEFAULT_EXECUTION_HORIZON, MIN_RTC_BLEND_STEPS, rtc_headroom
 
     delay, ok = rtc_headroom(
@@ -354,8 +545,29 @@ def smoke(
 # --------------------------------------------------------------------------- #
 
 
-def _limits(settings, max_joint_rate: float | None, no_limit: bool):
-    limits = settings.limit("policy", POLICY_LIMITS)
+def _profile(name: str):
+    """The :class:`~dk1lab.runprofile.RunProfile` ``--profile`` asked for.
+
+    A misspelled name is a :class:`typer.BadParameter` rather than a silent
+    fallback to the default: a run under a configuration nobody chose is evidence
+    about the wrong thing, which is the whole reason the profiles exist.
+    """
+    try:
+        return resolve_profile(name)
+    except ProfileError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
+
+def _limits(settings, max_joint_rate: float | None, no_limit: bool, profile=None):
+    """The speed cap this run will use: the profile's table, then the overrides.
+
+    ``profile`` is the run profile, which decides *which* ``[limits.*]`` table is
+    read — ``[limits.policy]`` under ``optimized`` and ``[limits.study]`` under
+    ``common``. ``None`` means the default profile, which is what the commands
+    that have no ``--profile`` of their own (``dk1 policy home``) want.
+    """
+    profile = resolve_profile(DEFAULT_PROFILE) if profile is None else profile
+    limits = profile.limits(settings)
     if no_limit and max_joint_rate is not None:
         raise typer.BadParameter("--no-limit and --max-joint-rate contradict each other.")
     if no_limit:
@@ -401,6 +613,7 @@ def _report(
     steps: int | None = None,
     home=None,
     invert: bool = False,
+    profile=None,
     fifo: bool = True,
     asynchronous: bool = True,
     replan_at: int = DEFAULT_REPLAN_AT,
@@ -410,17 +623,39 @@ def _report(
     """Print everything that was built, before anything is connected."""
     robot = cfg.robot
 
+    _echo_profile(profile)
+
+    pi05 = getattr(cfg.policy, "type", None) == "pi05"
+
     typer.secho("policy", bold=True)
     typer.echo(f"  checkpoint    {spec}")
-    typer.echo(f"  device        {cfg.policy.device}, {cfg.policy.model_dtype}")
-    typer.echo(f"  action mode   {cfg.policy.inference_action_mode}")
+    typer.echo(f"  type          {getattr(cfg.policy, 'type', '?')}")
+    # MolmoAct2 spells it `model_dtype` and pi0.5 spells it `dtype`; only one of
+    # them has an action mode at all.
+    dtype = getattr(cfg.policy, "model_dtype", None) or getattr(cfg.policy, "dtype", "?")
+    typer.echo(f"  device        {cfg.policy.device}, {dtype}")
+    if not pi05:
+        typer.echo(f"  action mode   {cfg.policy.inference_action_mode}")
+    typer.echo(f"  chunk         {cfg.policy.chunk_size} steps")
     typer.echo(f"  task          {cfg.task!r}")
     typer.echo(f"  inference     {cfg.inference.type}")
 
-    typer.secho("\nfollower (bi_dk1_follower_safe)", bold=True)
-    typer.echo(f"  left   {robot.left_arm_port}")
-    typer.echo(f"  right  {robot.right_arm_port}")
-    typer.echo(f"  control mode  {robot.control_mode}")
+    simulated = type(robot).__name__ == "SimRobotConfig"
+    if simulated:
+        typer.secho("\nrobot: THE SIMULATOR (dk1_sim)", bold=True, fg=typer.colors.GREEN)
+        typer.echo("  MuJoCo. No /dev node is opened, no motor is energised, and")
+        typer.echo("  nothing in the room moves. A sim rollout is evidence that the")
+        typer.echo("  pipeline runs — it is not a score and not a task result.")
+        typer.echo(
+            f"  {'realtime' if robot.realtime else 'free-run'}, "
+            f"{'viewer' if robot.view else 'headless'}, "
+            f"{robot.width}x{robot.height} rendered"
+        )
+    else:
+        typer.secho("\nfollower (bi_dk1_follower_safe)", bold=True)
+        typer.echo(f"  left   {robot.left_arm_port}")
+        typer.echo(f"  right  {robot.right_arm_port}")
+        typer.echo(f"  control mode  {robot.control_mode}")
 
     typer.secho("\nspeed limit", bold=True)
     if robot.max_joint_rate is None:
@@ -436,6 +671,11 @@ def _report(
         typer.echo(f"  max lag   {robot.max_lag} rad")
 
     typer.secho("\ncameras", bold=True)
+    if simulated:
+        # Rendered, not opened. The names still have to be this cell's, because
+        # they are what the checkpoint's image keys are built from.
+        for name in CAMERA_NAMES:
+            typer.echo(f"  {name:6s} rendered by MuJoCo at {robot.width}x{robot.height}")
     for name, camera in robot.cameras.items():
         typer.echo(
             f"  {name:6s} {camera.width}x{camera.height} @ {camera.fps} {camera.fourcc}"
@@ -446,7 +686,10 @@ def _report(
             + (f"  [{crop}]" if (crop := crop_summary(camera)) else "")
         )
 
-    _echo_inversion(invert)
+    if pi05:
+        _echo_pi05_adaptation()
+    else:
+        _echo_inversion(invert)
 
     typer.secho("\nloop", bold=True)
     typer.echo(f"  target {cfg.fps} Hz, interpolation x{cfg.interpolation_multiplier}")
@@ -459,6 +702,21 @@ def _report(
     else:
         typer.echo("  until interrupted")
     _echo_home(home, when=home_when)
+
+
+def _echo_profile(profile) -> None:
+    """Which configuration this run is, printed first because it decides the rest.
+
+    ``optimized`` is stated as plainly as ``common`` on purpose. The two differ in
+    what the policy is shown and how fast it may move, and a banner that only
+    mentioned the unusual one would leave every ordinary run's evidence unlabelled.
+    """
+    if profile is None:
+        return
+    colour = None if profile.cropped else typer.colors.YELLOW
+    typer.secho("profile", bold=True)
+    typer.secho(f"  {profile.name}", fg=colour)
+    typer.echo(f"  {profile.summary}")
 
 
 def _echo_home(home, *, when: str = "when the run ends") -> None:
@@ -523,6 +781,36 @@ def _make_recorder(enabled: bool, directory, *, task: str, notes: dict):
     )
 
 
+def _make_dataset(enabled: bool, directory, *, capture, fps: int, profile: str):
+    """A :class:`~dk1lab.dataset.DatasetSession`, or ``None``.
+
+    Opened here, before anything is connected, so an unwritable directory or a
+    dataset that cannot be resumed is a message rather than a surprise thirty
+    seconds into a rollout. The frame size comes from the capture profile the
+    run will actually use, because it is declared in the dataset's metadata.
+    """
+    if not enabled:
+        return None
+    from ..dataset import DatasetError, DatasetSession
+
+    session = DatasetSession(
+        directory,
+        fps=fps,
+        width=capture.width,
+        height=capture.height,
+    )
+    try:
+        session.open()
+    except DatasetError as exc:
+        typer.secho(f"\n{exc}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    typer.secho("\ndataset", bold=True)
+    typer.echo(f"  LeRobot v3.0 -> {session.root}  ({session.repo_id})")
+    typer.echo(f"  {session.episodes} episode(s) already there; this run appends")
+    typer.echo(f"  frames {capture.width}x{capture.height} at {fps} Hz, profile {profile}")
+    return session
+
+
 def _keep_recording(recording) -> bool:
     """Ask whether to keep the episode just recorded, and delete it if not.
 
@@ -539,15 +827,28 @@ def _keep_recording(recording) -> bool:
     if recording is None:
         return False
     typer.secho(recording.summary(), fg=typer.colors.GREEN)
-    if not sys.stdin.isatty():
-        return True
-    if typer.confirm("  keep this episode?", default=True):
+    keep = True
+    if sys.stdin.isatty():
+        keep = typer.confirm("  keep this episode?", default=True)
+    if keep:
+        # An .rrd is already on disk and needs nothing; a LeRobot episode is
+        # buffered until it is written, which is what lets declining one work at
+        # all. `keep` exists only on the latter, so this is the whole difference
+        # between the two recorders as far as the prompt is concerned.
+        if hasattr(recording, "keep"):
+            typer.echo("  writing the episode (encoding video) ...")
+            recording.keep()
         return True
     if recording.discard():
-        typer.secho(f"  discarded {recording.path}", fg=typer.colors.YELLOW)
+        typer.secho(f"  discarded {_where(recording)}", fg=typer.colors.YELLOW)
     else:
-        typer.secho(f"  could not delete {recording.path}", fg=typer.colors.RED, err=True)
+        typer.secho(f"  could not discard {_where(recording)}", fg=typer.colors.RED, err=True)
     return False
+
+
+def _where(recording) -> str:
+    """What to name in a message about a recording: its file, or its dataset."""
+    return str(getattr(recording, "path", None) or getattr(recording, "root", ""))
 
 
 def _echo_trace_summary(trace) -> None:
@@ -717,6 +1018,13 @@ for the first ~30 s and successful episodes averaged 54 s. A 30 s rollout does
 not give it enough time to do anything, which is worth knowing before reading a
 short run as a failure.
 
+--profile chooses how the cell is set up. `optimized`, the default, is what it
+already runs: the wrist crop and \\[limits.policy] at 1.0 rad/s. `common` is the
+level playing field STUDY.md defines for the two-policy comparison — no wrist
+crop, no offset, the full 105 degree lens on all three cameras, and
+\\[limits.study] at 0.6 rad/s. Neither writes dk1.toml; the profile is applied to
+the loaded config and printed at the top of the banner.
+
 Do `dk1 policy check`, then `smoke`, then `dryrun` first. Keep a hand on the
 e-stop."""
     + MOTION_HELP
@@ -728,6 +1036,7 @@ def run(
     task: TaskOpt,
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
     checkpoint: CheckpointOpt = None,
+    profile: ProfileOpt = DEFAULT_PROFILE,
     duration_s: Annotated[
         float, typer.Option("--duration", help="Stop after this many seconds. 0 = until stopped.")
     ] = 180.0,
@@ -770,6 +1079,11 @@ def run(
     display_policy_input: WatchInputOpt = False,
     record: RecordOpt = False,
     record_dir: RecordDirOpt = DEFAULT_RECORD_DIR,
+    record_dataset: DatasetOpt = False,
+    dataset_dir: DatasetDirOpt = DEFAULT_DATASET_DIR,
+    sim: SimOpt = False,
+    realtime: SimRealtimeOpt = True,
+    view: SimViewOpt = True,
     trace: TraceOpt = True,
     fifo: FifoOpt = True,
     asynchronous: AsyncOpt = True,
@@ -804,9 +1118,20 @@ def run(
     if interpolation < 1:
         raise typer.BadParameter(f"--interpolation must be at least 1, got {interpolation}")
 
-    settings = load(config, require_devices=not dry_run)
+    chosen = _profile(profile)
+    # The profile is applied to the loaded config rather than written to the
+    # file: under `common` every camera loses its crop here, once, and every
+    # consumer downstream — the camera builders, the banner, the recorder's
+    # notes — reads the same derived config. dk1.toml is never touched.
+    settings = chosen.apply(load(config, require_devices=not dry_run))
     spec = _checkpoint(settings, checkpoint)
-    limits = _limits(settings, max_joint_rate, no_limit)
+    limits = _limits(settings, max_joint_rate, no_limit, profile=chosen)
+    # The gripper inversion is MolmoAct2's, and applying it to pi0.5 would
+    # introduce the sign error rather than remove it: pi0.5's normalisation comes
+    # from DK1 data already in DK1 convention. Detected off the checkpoint rather
+    # than left to the operator, because the default is on and the failure is
+    # silent. STUDY.md § The gripper convention.
+    invert_gripper = invert_gripper and _family(spec) != "pi05"
 
     cfg = rollout_config(
         settings,
@@ -822,6 +1147,9 @@ def run(
         device=device,
         display=display,
         invert_gripper=invert_gripper,
+        sim=sim,
+        realtime=realtime,
+        view=view,
     )
     # LeRobot's own return_to_initial_position stays off whatever --home says:
     # it fires from teardown on every exit path including a crash, sweeps for a
@@ -831,15 +1159,29 @@ def run(
     if home:
         home_pose = settings.home if settings.home is not None else HOME_AT_START_POSE
     _report(
-        cfg, spec, home=home_pose, invert=invert_gripper,
+        cfg, spec, home=home_pose, invert=invert_gripper, profile=chosen,
         fifo=fifo, asynchronous=asynchronous, replan_at=replan_at, blend=blend,
     )
 
+    dataset = _make_dataset(
+        record_dataset, dataset_dir, capture=settings.profile("policy"),
+        fps=cfg.fps, profile=chosen.name,
+    ) if not dry_run else None
+
     if dry_run:
+        if record_dataset:
+            typer.echo(f"\n  --record-dataset would append to {dataset_dir}")
         typer.secho("\n--dry-run: nothing was connected and nothing moved.", fg=typer.colors.GREEN)
         return
 
+    if sim:
+        typer.secho(
+            "\n--sim: the MuJoCo cell. Ctrl-C stops. Nothing in the room moves.\n",
+            fg=typer.colors.GREEN,
+        )
     notes = ["The POLICY commands the arms. Nobody has verified what it does on this cell."]
+    if not chosen.cropped:
+        notes.append("--profile common: NO wrist crop. The policy sees the full 105 deg lens.")
     notes.append(
         "Gripper inversion is ON, as it should be."
         if invert_gripper
@@ -851,11 +1193,12 @@ def run(
         notes.append("--home: when the run ends, BOTH ARMS SWEEP to the home pose.")
         if home_pose is HOME_AT_START_POSE:
             notes.append("        no [home] in dk1.toml, so home = the pose at connect.")
-    confirm_motion(
-        f"run MolmoAct2 on the follower arms — {task!r}",
-        assume_yes=assume_yes,
-        notes=notes,
-    )
+    if not sim:
+        confirm_motion(
+            f"run MolmoAct2 on the follower arms — {task!r}",
+            assume_yes=assume_yes,
+            notes=notes,
+        )
     if home_pose is None:
         typer.secho("\nCtrl-C to stop. Stopping does not move the arms.\n", fg=typer.colors.GREEN)
     else:
@@ -867,16 +1210,16 @@ def run(
     tracer = _make_trace(
         fps=cfg.fps, enabled=trace, display_policy_input=display_policy_input
     )
-    recorder = _make_recorder(
-        record,
-        record_dir,
-        task=task,
-        notes={
-            "checkpoint": spec,
-            "max_joint_rate": limits.max_joint_rate,
-            "invert_gripper": invert_gripper,
-            "fps": cfg.fps,
-        },
+    notes_for_recording = {
+        "checkpoint": spec,
+        "profile": chosen.name,
+        "max_joint_rate": limits.max_joint_rate,
+        "invert_gripper": invert_gripper,
+        "fps": cfg.fps,
+    }
+    recorder = one(
+        _make_recorder(record, record_dir, task=task, notes=notes_for_recording),
+        dataset.episode(task, notes=notes_for_recording) if dataset is not None else None,
     )
     report = run_rollout(
         cfg,
@@ -894,6 +1237,11 @@ def run(
     _echo_trace_summary(tracer)
     if recorder is not None:
         _keep_recording(recorder.stop())
+    if dataset is not None:
+        # Finalises the metadata. A v3.0 dataset that is never closed can be
+        # missing its last episode even though the frames are on disk.
+        dataset.close()
+        typer.secho(f"dataset closed: {dataset.root}", fg=typer.colors.GREEN)
     if report is not None:
         colour = typer.colors.GREEN if report.reached else typer.colors.YELLOW
         typer.secho(report.summary(), fg=colour)
@@ -934,13 +1282,16 @@ disconnects, which disables every motor, so support anything held up.
 
 This is the command for SCORING: same policy, same cell, same settings, one
 instruction after another, with a success count kept on paper. Everything that
-would otherwise differ between attempts is held fixed by construction."""  # noqa: E501
+would otherwise differ between attempts is held fixed by construction — the
+--profile included, which is fixed for the life of the session and named in
+every recording's notes."""  # noqa: E501
 
 
 @app.command("session", help=HELP_SESSION + MOTION_HELP)
 def session(
     config: ConfigOpt = DEFAULT_CONFIG_PATH,
     checkpoint: CheckpointOpt = None,
+    profile: ProfileOpt = DEFAULT_PROFILE,
     task: Annotated[
         str | None,
         typer.Option("--task", help="First instruction. Press Enter at the prompt to run it."),
@@ -976,6 +1327,11 @@ def session(
     display_policy_input: WatchInputOpt = False,
     record: RecordOpt = False,
     record_dir: RecordDirOpt = DEFAULT_RECORD_DIR,
+    record_dataset: DatasetOpt = False,
+    dataset_dir: DatasetDirOpt = DEFAULT_DATASET_DIR,
+    sim: SimOpt = False,
+    realtime: SimRealtimeOpt = True,
+    view: SimViewOpt = True,
     trace: TraceOpt = True,
     fifo: FifoOpt = True,
     asynchronous: AsyncOpt = True,
@@ -1010,9 +1366,20 @@ def session(
     if interpolation < 1:
         raise typer.BadParameter(f"--interpolation must be at least 1, got {interpolation}")
 
-    settings = load(config, require_devices=not dry_run)
+    chosen = _profile(profile)
+    # The profile is applied to the loaded config rather than written to the
+    # file: under `common` every camera loses its crop here, once, and every
+    # consumer downstream — the camera builders, the banner, the recorder's
+    # notes — reads the same derived config. dk1.toml is never touched.
+    settings = chosen.apply(load(config, require_devices=not dry_run))
     spec = _checkpoint(settings, checkpoint)
-    limits = _limits(settings, max_joint_rate, no_limit)
+    limits = _limits(settings, max_joint_rate, no_limit, profile=chosen)
+    # The gripper inversion is MolmoAct2's, and applying it to pi0.5 would
+    # introduce the sign error rather than remove it: pi0.5's normalisation comes
+    # from DK1 data already in DK1 convention. Detected off the checkpoint rather
+    # than left to the operator, because the default is on and the failure is
+    # silent. STUDY.md § The gripper convention.
+    invert_gripper = invert_gripper and _family(spec) != "pi05"
 
     cfg = rollout_config(
         settings,
@@ -1030,12 +1397,15 @@ def session(
         device=device,
         display=display,
         invert_gripper=invert_gripper,
+        sim=sim,
+        realtime=realtime,
+        view=view,
     )
     home_pose = None
     if home:
         home_pose = settings.home if settings.home is not None else HOME_AT_START_POSE
     _report(
-        cfg, spec, home=home_pose, invert=invert_gripper,
+        cfg, spec, home=home_pose, invert=invert_gripper, profile=chosen,
         fifo=fifo, asynchronous=asynchronous, replan_at=replan_at, blend=blend,
         home_when="after each episode",
     )
@@ -1044,10 +1414,14 @@ def session(
     if record:
         from ..record import next_index
 
-        typer.echo(f"  recording ON -> {record_dir}, next episode {next_index(record_dir)}")
+        typer.echo(f"  .rrd ON -> {record_dir}, next episode {next_index(record_dir)}")
         typer.echo("  you are asked whether to keep each episode when it ends")
     else:
-        typer.echo(f"  recording off (`:record on` at the prompt) -> {record_dir}")
+        typer.echo(f"  .rrd off (`:record on` at the prompt) -> {record_dir}")
+    if record_dataset:
+        typer.echo(f"  dataset ON -> {dataset_dir}")
+    else:
+        typer.echo(f"  dataset off (`:dataset on` at the prompt) -> {dataset_dir}")
 
     if dry_run:
         typer.secho("\n--dry-run: nothing was connected and nothing moved.", fg=typer.colors.GREEN)
@@ -1057,6 +1431,8 @@ def session(
         "The POLICY commands the arms, once per episode, until you quit.",
         "The arms stay ENERGISED between episodes, holding their last target.",
     ]
+    if not chosen.cropped:
+        notes.append("--profile common: NO wrist crop. The policy sees the full 105 deg lens.")
     notes.append(
         "Gripper inversion is ON, as it should be."
         if invert_gripper
@@ -1066,13 +1442,25 @@ def session(
         notes.append("The speed cap is OFF for this session (--no-limit).")
     if home_pose is not None:
         notes.append("--home: BOTH ARMS SWEEP home after every episode that ends cleanly.")
-    confirm_motion(
-        "open a policy session on the follower arms",
-        assume_yes=assume_yes,
-        notes=notes,
-    )
+    if sim:
+        typer.secho(
+            "\n--sim: the MuJoCo cell. Nothing in the room moves.\n", fg=typer.colors.GREEN
+        )
+    else:
+        confirm_motion(
+            "open a policy session on the follower arms",
+            assume_yes=assume_yes,
+            notes=notes,
+        )
 
     tracer = _make_trace(fps=cfg.fps, enabled=trace, display_policy_input=display_policy_input)
+    dataset = _make_dataset(
+        record_dataset and not dry_run,
+        dataset_dir,
+        capture=settings.profile("policy"),
+        fps=cfg.fps,
+        profile=chosen.name,
+    )
     live = PolicySession(
         cfg,
         display=display,
@@ -1084,9 +1472,12 @@ def session(
         trace=tracer,
         record_dir=record_dir,
         record=record,
+        dataset=dataset,
+        record_dataset=record_dataset,
         duration_s=duration_s,
         notes={
             "checkpoint": spec,
+            "profile": chosen.name,
             "max_joint_rate": limits.max_joint_rate,
             "invert_gripper": invert_gripper,
             "fps": cfg.fps,
@@ -1112,6 +1503,7 @@ SESSION_HELP_LINES = (
     "  <instruction>   run one episode with that task",
     "  <empty>         run the last task again",
     "  :record on|off  write each episode to a .rrd",
+    "  :dataset on|off append each episode to the LeRobot dataset",
     "  :duration <s>   seconds per episode; 0 runs until Ctrl-C",
     "  :home           sweep both arms to the home pose now",
     "  :help  :quit",
@@ -1125,7 +1517,9 @@ def _session_loop(live, tracer, *, home=None) -> None:
     :func:`dk1lab.session.parse_command`, which is why the grammar can be tested
     without a robot attached.
     """
-    from ..session import DURATION, HELP, HOME, NOTHING, QUIT, RECORD, RUN, parse_command
+    from ..session import (
+        DATASET, DURATION, HELP, HOME, NOTHING, QUIT, RECORD, RUN, parse_command,
+    )
 
     while True:
         try:
@@ -1154,7 +1548,19 @@ def _session_loop(live, tracer, *, home=None) -> None:
             continue
         if command.kind == RECORD:
             live.record = bool(command.value)
-            typer.echo(f"recording {'ON' if live.record else 'off'} -> {live.record_dir}")
+            typer.echo(f".rrd {'ON' if live.record else 'off'} -> {live.record_dir}")
+            continue
+        if command.kind == DATASET:
+            if live.dataset is None:
+                typer.secho(
+                    "this session has no dataset open — start it with --record-dataset, "
+                    "since the directory has to be resolved before anything connects",
+                    fg=typer.colors.YELLOW,
+                )
+                continue
+            live.record_dataset = bool(command.value)
+            state = "ON" if live.record_dataset else "off"
+            typer.echo(f"dataset {state} -> {live.dataset.root}")
             continue
         if command.kind == DURATION:
             live.duration_s = float(command.value)
@@ -1191,7 +1597,9 @@ def _prompt(live) -> str:
     limit = f"{live.duration_s:.0f}s" if live.duration_s else "no limit"
     flags = f"episode {_episode_number(live)} | {limit}"
     if live.record:
-        flags += " | rec"
+        flags += " | rrd"
+    if live.record_dataset:
+        flags += " | dataset"
     return f"\n[{flags}] task> "
 
 

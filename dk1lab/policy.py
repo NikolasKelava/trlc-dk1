@@ -75,37 +75,21 @@ from .layout import (
     yam_joint_signs,
 )
 from .robot import SafeBiDK1FollowerConfig
+from .runprofile import POLICY_LIMITS as _POLICY_LIMITS
 from .teleop import follower_config as _follower_config
 
 logger = logging.getLogger(__name__)
 
 #: The speed limit rollout runs under when ``dk1.toml`` says nothing.
 #:
-#: **Capped**, unlike teleoperation, but no longer timid. Both numbers were
-#: raised on 2026-08-20 from measurement rather than from caution:
+#: Re-exported from :mod:`dk1lab.runprofile`, which is where it now lives so that
+#: the fallback and the ``--profile`` that selects it sit together, and so that a
+#: reader of the number does not have to import torch to see it. The reasoning
+#: behind both values — why 1.0 rad/s and not 0.3, and why ``max_lag`` is a
+#: torque clamp rather than a position one — is in that module's docstring.
 #:
-#: ``max_joint_rate`` 0.3 -> 1.0 rad/s. A recorded 120 s sim episode of this
-#: checkpoint demands a median of 0.036 rad/s but a p95 of 0.31 and peaks of
-#: 4.56 — bursty, not fast. Replayed through :class:`~dk1lab.limiter.SlewLimiter`,
-#: a 0.3 cap leaves the worst joint 0.98 rad (56 deg) behind the policy's intent
-#: on 26% of ticks; 1.0 cuts that to 0.40 rad on 3.3%; 2.0 is transparent.
-#:
-#: ``max_lag`` 0.1 -> 0.4 rad. This is a **torque** limit wearing a position
-#: clamp's costume: impedance torque is ``arm_kp * (q_des - q)`` with
-#: ``arm_kp = [100, 100, 100, 20, 20, 10]``, so a 0.1 rad lead cap held the PD
-#: torque to 10 Nm on j1-j3 (motor limit 28) and 1 Nm on j6 (limit 10). Since
-#: the limiter stores the *clamped* value as the new previous command, a joint
-#: that cannot break stiction inside 0.1 rad stalls there silently forever —
-#: the very deadlock :mod:`dk1lab.limiter` was designed to avoid.
-#:
-#: The gripper is not slowed to match — a gripper that takes three seconds to
-#: close fails every grasp, and it is not the hazard here.
-POLICY_LIMITS = LimitProfile(
-    max_joint_rate=1.0,
-    max_gripper_rate=1.0,
-    max_lag=0.4,
-    max_dt=0.1,
-)
+#: The ``common`` profile reads :data:`dk1lab.runprofile.STUDY_LIMITS` instead.
+POLICY_LIMITS = _POLICY_LIMITS
 
 #: MolmoAct2 BimanualYAM was trained at 30 Hz with a 30-step chunk. This is a
 #: property of the checkpoint, not a preference.
@@ -161,6 +145,25 @@ HOME_AT_START_POSE = "start-pose"
 # --------------------------------------------------------------------------- #
 
 
+def family(checkpoint: str) -> str:
+    """Which policy a checkpoint holds — ``"molmoact2"`` or ``"pi05"``.
+
+    Read off the checkpoint's own ``config.json`` rather than taken as a flag, so
+    the flag and the directory cannot disagree. The two are adapted to this cell
+    in different ways and neither adaptation is safe to apply to the other: π0.5
+    without its borrowed statistics is handed raw radians, and MolmoAct2 without
+    the gripper inversion opens when it means to close. A checkpoint that cannot
+    be read locally is assumed to be MolmoAct2, which is what ``[policy]`` in
+    ``dk1.toml`` points at.
+    """
+    from .checkpoint import CheckpointError, EXPECTED_TYPE, read
+
+    try:
+        return read(checkpoint).policy_type or EXPECTED_TYPE
+    except CheckpointError:
+        return EXPECTED_TYPE
+
+
 def policy_config(
     checkpoint: str,
     *,
@@ -197,6 +200,15 @@ def policy_config(
     from lerobot.configs import PreTrainedConfig
 
     path = resolve(checkpoint)
+    if family(path) == "pi05":
+        # A different model with different fields: 32-D padding to narrow, no
+        # inference_action_mode, no image_keys, and a `dtype` where MolmoAct2 has
+        # `model_dtype`. Setting MolmoAct2's fields on it would do nothing at all,
+        # quietly. See dk1lab.pi05.
+        from .pi05 import policy_config as pi05_policy_config
+
+        return pi05_policy_config(path, device=device, dtype=dtype)
+
     config = PreTrainedConfig.from_pretrained(path)
     config.pretrained_path = path
 
@@ -236,6 +248,48 @@ def follower_config(
     )
 
 
+def sim_config(
+    config: DK1Config,
+    *,
+    limits: LimitProfile | None = None,
+    fps: int = DEFAULT_FPS,
+    realtime: bool = True,
+    view: bool = True,
+) -> Any:
+    """The MuJoCo cell, configured like the real one. **Opens no device.**
+
+    The same speed limit and the same 14-D contract; what differs is that nothing
+    is energised and nothing in the room moves. See :mod:`dk1lab.sim` for what
+    a sim rollout is and is not evidence of.
+
+    The frame size is :mod:`dk1lab.sim`'s own rather than ``[capture.policy]``'s:
+    a rendered picture costs what it costs to render, the crop that makes 1280x720
+    worth paying for lives in the real camera, and the sim renders the lens's
+    whole field of view — which is what ``--profile common`` shows the policy
+    anyway.
+    """
+    from .sim import SimRobotConfig
+
+    limits = limits if limits is not None else config.limit("policy", POLICY_LIMITS)
+    return SimRobotConfig(
+        fps=fps,
+        realtime=realtime,
+        view=view,
+        max_joint_rate=limits.max_joint_rate,
+        max_gripper_rate=limits.max_gripper_rate,
+        max_lag=limits.max_lag,
+        max_dt=limits.max_dt,
+        id="dk1_sim",
+    )
+
+
+def _pi05_rename() -> dict[str, str]:
+    """π0.5's camera rename, imported lazily so MolmoAct2 never pays for it."""
+    from .pi05 import IMAGE_RENAME
+
+    return IMAGE_RENAME
+
+
 def rollout_config(
     config: DK1Config,
     *,
@@ -253,6 +307,9 @@ def rollout_config(
     display: bool = False,
     return_home: bool = False,
     invert_gripper: bool = False,
+    sim: bool = False,
+    realtime: bool = True,
+    view: bool = True,
 ) -> Any:
     """Assemble LeRobot's :class:`RolloutConfig` for this cell.
 
@@ -273,6 +330,10 @@ def rollout_config(
             the config so that ``_report`` and the banner can state what the run
             will actually do; the effect itself comes from
             :func:`apply_gripper_inversion` at :func:`build_context`.
+        sim: drive :class:`dk1lab.sim.SimRobot` instead of the followers — the
+            MuJoCo cell, which opens no device and moves nothing in the room.
+            Everything else about the run is the same code, which is the point.
+        realtime, view: the sim's clock and its window. Ignored without ``sim``.
     """
     from lerobot.rollout import RolloutConfig
     from lerobot.rollout.configs import BaseStrategyConfig
@@ -283,8 +344,19 @@ def rollout_config(
         inference = RTCInferenceConfig()
         inference.rtc.execution_horizon = execution_horizon
 
+    robot = (
+        sim_config(config, limits=limits, fps=fps, realtime=realtime, view=view)
+        if sim
+        else follower_config(config, limits=limits, control_mode=control_mode)
+    )
+    # π0.5's cameras are named for its own pretraining rig and the model embeds
+    # the views POSITIONALLY, so the keys have to be renamed before the model
+    # sees them. `build_rollout_context` already overrides the pipeline's rename
+    # step with this, which is why it is the whole of the wiring.
+    rename_map = dict(_pi05_rename()) if family(resolve(checkpoint)) == "pi05" else {}
     return RolloutConfig(
-        robot=follower_config(config, limits=limits, control_mode=control_mode),
+        robot=robot,
+        rename_map=rename_map,
         policy=policy_config(
             checkpoint, device=device, dtype=dtype, invert_gripper=invert_gripper
         ),
@@ -395,12 +467,18 @@ def apply_gripper_inversion(preprocessor: Any, postprocessor: Any) -> Inversion:
 # --------------------------------------------------------------------------- #
 
 
+def is_pi05(cfg: Any) -> bool:
+    """Whether this rollout's policy is π0.5, from the config that was built."""
+    return getattr(getattr(cfg, "policy", None), "type", None) == "pi05"
+
+
 def build_context(
     cfg: Any,
     shutdown_event: Event | None = None,
     *,
     prewarm_engine: bool = True,
     invert_gripper: bool = False,
+    norm_stats: Any = None,
 ) -> tuple[Any, Inversion | None]:
     """Load the policy, connect the robot, and switch the gripper inversion on.
 
@@ -418,11 +496,15 @@ def build_context(
         prewarm_engine: run one inference before returning, and report the
             resulting RTC headroom. Off only for tests.
         invert_gripper: apply the gripper inversion. The CLI passes ``True`` for
-            every path that drives this cell — see :func:`apply_gripper_inversion`
-            for what it does and :mod:`dk1lab.layout` for why. It stays an
-            argument rather than an assumption so ``dk1 policy serve``, which
-            talks to a simulator that already speaks the checkpoint's own
-            convention, can leave it off.
+            every MolmoAct2 path that drives this cell — see
+            :func:`apply_gripper_inversion` for what it does and
+            :mod:`dk1lab.layout` for why. It stays an argument rather than an
+            assumption so ``dk1 policy serve``, which talks to a simulator that
+            already speaks the checkpoint's own convention, can leave it off, and
+            it is **refused** for π0.5.
+        norm_stats: the 14-D statistics π0.5 is normalised with. Ignored for
+            MolmoAct2, which brings its own. ``None`` fetches the dataset
+            :mod:`dk1lab.pi05` names.
 
     Returns:
         The rollout context, and the applied inversion or ``None`` if it was off.
@@ -432,12 +514,29 @@ def build_context(
     ctx = build_rollout_context(cfg, shutdown_event or Event())
     # Before any strategy runs, and therefore before the RTC thread starts: the
     # inference engine holds references to these pipeline objects, so patching
-    # the steps in place reaches it.
-    inversion = (
-        apply_gripper_inversion(ctx.policy.preprocessor, ctx.policy.postprocessor)
-        if invert_gripper
-        else None
-    )
+    # the steps in place reaches it. Both patches below are of that kind, and for
+    # the same reason — the pipelines are rebuilt from the checkpoint's saved
+    # JSON on every load, so nothing set on the config would survive.
+    inversion = None
+    if is_pi05(cfg):
+        # π0.5's saved normalizer covers no features at all. Without this it is
+        # handed raw radians where it expects roughly [-1, 1], and its actions
+        # come back in the same wrong units — silently.
+        from .pi05 import apply_norm_stats, load_norm_stats
+
+        stats = norm_stats if norm_stats is not None else load_norm_stats()
+        apply_norm_stats(ctx.policy.preprocessor, ctx.policy.postprocessor, stats)
+        if invert_gripper:
+            # Not a preference. π0.5's normalisation comes from DK1 data recorded
+            # in DK1 convention, so inverting would introduce the sign error
+            # rather than remove it. STUDY.md § The gripper convention.
+            raise InversionError(
+                "the gripper inversion is for MolmoAct2's YAM weights and must never "
+                "be applied to pi0.5, whose normalisation is already DK1 convention. "
+                "Pass --no-invert-gripper."
+            )
+    elif invert_gripper:
+        inversion = apply_gripper_inversion(ctx.policy.preprocessor, ctx.policy.postprocessor)
     freeze_for_inference(ctx.policy.policy)
     if prewarm_engine:
         latency = prewarm(ctx)

@@ -11,7 +11,7 @@ usable on a machine with no robot stack installed. :mod:`dk1lab.cameras` and
 :mod:`dk1lab.robot` are where LeRobot enters.
 """
 
-__all__ = ["CroppedOpenCVCamera", "SafeBiDK1Follower", "__version__"]
+__all__ = ["CroppedOpenCVCamera", "SafeBiDK1Follower", "SimRobot", "__version__"]
 
 __version__ = "0.1.0"
 
@@ -53,4 +53,11 @@ def __getattr__(name: str):
         from .crop import CroppedOpenCVCamera
 
         return CroppedOpenCVCamera
+    if name == "SimRobot":
+        # And once more, for the MuJoCo cell: `make_robot_from_config` finds a
+        # robot by stripping "Config" off its config class's name and looking for
+        # the result in the package holding that config's module — here.
+        from .sim import SimRobot
+
+        return SimRobot
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

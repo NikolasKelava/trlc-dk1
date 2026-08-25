@@ -971,6 +971,14 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+dataset = [
+    { name = "av" },
+    { name = "datasets" },
+    { name = "jsonlines" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "torchcodec", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+]
 dynamixel = [
     { name = "deepdiff" },
     { name = "dynamixel-sdk" },
@@ -978,6 +986,14 @@ dynamixel = [
 ]
 molmoact2 = [
     { name = "peft" },
+    { name = "scipy" },
+    { name = "transformers" },
+]
+peft = [
+    { name = "peft" },
+    { name = "transformers" },
+]
+pi = [
     { name = "scipy" },
     { name = "transformers" },
 ]
@@ -1004,7 +1020,7 @@ dependencies = [
     { name = "dynamixel-sdk" },
     { name = "fastapi" },
     { name = "json-numpy" },
-    { name = "lerobot", extra = ["dynamixel", "molmoact2", "training", "viz"] },
+    { name = "lerobot", extra = ["dataset", "dynamixel", "molmoact2", "peft", "pi", "training", "viz"] },
     { name = "mujoco" },
     { name = "numpy" },
     { name = "opencv-python" },
@@ -1024,7 +1040,7 @@ requires-dist = [
     { name = "dynamixel-sdk", specifier = ">=3.7.31" },
     { name = "fastapi", specifier = ">=0.116" },
     { name = "json-numpy", specifier = ">=2.1" },
-    { name = "lerobot", extras = ["dynamixel", "viz", "molmoact2", "training"], specifier = ">=0.5.1" },
+    { name = "lerobot", extras = ["dynamixel", "viz", "molmoact2", "training", "pi", "peft", "dataset"], specifier = ">=0.5.1" },
     { name = "mujoco", specifier = ">=3.0.0" },
     { name = "numpy", specifier = ">=2.0.1" },
     { name = "opencv-python", specifier = ">=4.9" },

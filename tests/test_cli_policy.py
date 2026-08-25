@@ -436,6 +436,94 @@ def test_the_run_uses_the_configured_pose_when_there_is_one(
 
 
 # --------------------------------------------------------------------------- #
+# --profile — the level playing field, and the frozen configuration
+# --------------------------------------------------------------------------- #
+
+
+PROFILE_COMMANDS = (
+    ("run", "--task", "put the dice in the bowl"),
+    ("session",),
+)
+
+
+@pytest.mark.parametrize("command", PROFILE_COMMANDS, ids=lambda c: c[0])
+def test_the_default_profile_is_the_one_the_cell_already_runs(
+    runner, config_file, checkpoint_dir, no_motion, command
+):
+    output = invoke(
+        runner, config_file, *command, "--checkpoint", str(checkpoint_dir), "--dry-run"
+    ).output
+    assert "optimized" in output
+    assert "1.0 rad/s" in output
+
+
+@pytest.mark.parametrize("command", PROFILE_COMMANDS, ids=lambda c: c[0])
+def test_common_drops_the_cap_to_the_study_rate(
+    runner, config_file, checkpoint_dir, no_motion, command
+):
+    output = invoke(
+        runner, config_file, *command, "--checkpoint", str(checkpoint_dir),
+        "--profile", "common", "--dry-run",
+    ).output
+    assert "0.6 rad/s" in output
+
+
+@pytest.mark.parametrize("command", PROFILE_COMMANDS, ids=lambda c: c[0])
+def test_common_shows_no_crop_on_any_camera(
+    runner, config_file, checkpoint_dir, no_motion, command
+):
+    """The banner is where an operator checks this before an attempt is scored."""
+    common = invoke(
+        runner, config_file, *command, "--checkpoint", str(checkpoint_dir),
+        "--profile", "common", "--dry-run",
+    ).output
+    optimized = invoke(
+        runner, config_file, *command, "--checkpoint", str(checkpoint_dir), "--dry-run"
+    ).output
+    # `[crop ...]` is what `crop_summary` appends to a camera's banner line.
+    assert "[crop " in optimized
+    assert "[crop " not in common
+
+
+@pytest.mark.parametrize("command", PROFILE_COMMANDS, ids=lambda c: c[0])
+def test_a_misspelled_profile_stops_before_anything_is_built(
+    runner, config_file, checkpoint_dir, no_motion, command
+):
+    result = invoke(
+        runner, config_file, *command, "--checkpoint", str(checkpoint_dir),
+        "--profile", "optimised", "--dry-run",
+    )
+    assert result.exit_code == 2
+    assert not no_motion["run"]
+
+
+def test_the_profile_is_written_into_a_recordings_notes(
+    runner, config_file, checkpoint_dir, no_motion, monkeypatch, tmp_path
+):
+    """A recording that cannot say which configuration produced it proves nothing."""
+    from dk1lab.cli import policy_cmds
+
+    seen: dict = {}
+
+    def capture(enabled, directory, *, task, notes):
+        seen.update(notes)
+        return None
+
+    monkeypatch.setattr(policy_cmds, "_make_recorder", capture)
+    # The devices are not plugged in here, and this test is about what reaches the
+    # recorder rather than about what is attached.
+    real_load = policy_cmds.load
+    monkeypatch.setattr(policy_cmds, "load", lambda path, **_: real_load(path))
+    invoke(
+        runner, config_file, "run", "--task", "put the dice in the bowl",
+        "--checkpoint", str(checkpoint_dir), "--profile", "common",
+        "--record", "--record-dir", str(tmp_path / "rec"), "--yes",
+    )
+    assert seen["profile"] == "common"
+    assert seen["max_joint_rate"] == 0.6
+
+
+# --------------------------------------------------------------------------- #
 # session — load once, roll out many times
 # --------------------------------------------------------------------------- #
 
@@ -468,7 +556,7 @@ def test_a_session_says_what_happens_after_each_episode_not_after_the_run(
 
 def test_a_session_reports_where_recordings_would_go(runner, config_file, checkpoint_dir, no_motion):
     output = dry_session(runner, config_file, checkpoint_dir, "--record").output
-    assert "recording ON" in output
+    assert ".rrd ON" in output
 
 
 class FakeSession:
@@ -479,6 +567,8 @@ class FakeSession:
         self.episodes = 0
         self.record = False
         self.record_dir = "recordings"
+        self.dataset = None
+        self.record_dataset = False
         self.duration_s = 180.0
         self.rollouts: list[str] = []
         self.homes = 0

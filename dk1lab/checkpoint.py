@@ -27,6 +27,15 @@ cell needs is expressed exactly that way — and the saved pipelines in the
 BimanualYAM checkpoint have ``joint_signs: null``. :func:`problems` reports the
 resulting state of affairs plainly, and :func:`dk1lab.policy.apply_gripper_inversion`
 is what actually fixes it, on the loaded pipeline objects.
+
+**Two policies, one reader.** Since the two-policy comparison this cell now runs
+(``STUDY.md``) needs the same check for π0.5, :func:`problems` and :func:`notes`
+dispatch on the checkpoint's own ``type``. The reading is shared — a LeRobot
+policy directory is a LeRobot policy directory — and only the *judging* differs,
+because what counts as a usable checkpoint is a fact about the policy: MolmoAct2
+has to arrive 14-D with the right normalisation tag and the right image order,
+while π0.5 arrives 32-D by design and brings no statistics at all. See
+:mod:`dk1lab.pi05` for what is done about the latter.
 """
 
 from __future__ import annotations
@@ -62,6 +71,13 @@ ACTION_TRANSFORM_STEP = "molmoact2_action_frame_transform"
 
 #: Registry name of the step that pins the camera order.
 PACK_INPUTS_STEP = "molmoact2_pack_inputs"
+
+#: Registry names of the two generic steps π0.5's adaptation goes through.
+RENAME_STEP = "rename_observations_processor"
+NORMALIZER_STEP = "normalizer_processor"
+
+#: The policy types this fork knows how to judge.
+KNOWN_TYPES = ("molmoact2", "pi05")
 
 
 class CheckpointError(Exception):
@@ -134,6 +150,20 @@ class CheckpointInfo:
     pipeline_action_signs: list[float] | None = None
     pipeline_action_offsets: list[float] | None = None
     weights_bytes: int = 0
+    #: Image feature keys declared in ``config.json``'s ``input_features``. For
+    #: π0.5 this is where the camera names live; MolmoAct2 pins them in the
+    #: pipeline instead.
+    input_image_keys: list[str] = field(default_factory=list)
+    #: π0.5's padded internal widths. ``None`` on a checkpoint that has no such
+    #: notion, which is every MolmoAct2 one.
+    max_state_dim: int | None = None
+    max_action_dim: int | None = None
+    #: The saved rename step's map, which is empty on both base checkpoints and
+    #: is what :mod:`dk1lab.pi05` overrides.
+    pipeline_rename_map: dict[str, str] = field(default_factory=dict)
+    #: Feature keys the saved normalizer covers. Empty means it normalises
+    #: nothing, which is π0.5's published state and a problem to be closed.
+    pipeline_norm_features: list[str] = field(default_factory=list)
 
     @property
     def gripper_inversion_baked_in(self) -> bool:
@@ -161,6 +191,8 @@ def parse(
     pack = pre_steps.get(PACK_INPUTS_STEP, {})
     state_transform = pre_steps.get(STATE_TRANSFORM_STEP, {})
     action_transform = post_steps.get(ACTION_TRANSFORM_STEP, {})
+    rename = pre_steps.get(RENAME_STEP, {})
+    normalizer = pre_steps.get(NORMALIZER_STEP, {})
 
     return CheckpointInfo(
         path=path,
@@ -170,7 +202,7 @@ def parse(
         control_mode=config_raw.get("control_mode"),
         action_mode=config_raw.get("action_mode"),
         inference_action_mode=config_raw.get("inference_action_mode"),
-        model_dtype=config_raw.get("model_dtype"),
+        model_dtype=config_raw.get("model_dtype") or config_raw.get("dtype"),
         device=config_raw.get("device"),
         chunk_size=config_raw.get("chunk_size"),
         n_action_steps=config_raw.get("n_action_steps"),
@@ -185,6 +217,15 @@ def parse(
         pipeline_action_signs=action_transform.get("joint_signs"),
         pipeline_action_offsets=action_transform.get("joint_offsets"),
         weights_bytes=weights_bytes,
+        input_image_keys=[
+            key
+            for key, feature in features.items()
+            if isinstance(feature, dict) and feature.get("type") == "VISUAL"
+        ],
+        max_state_dim=config_raw.get("max_state_dim"),
+        max_action_dim=config_raw.get("max_action_dim"),
+        pipeline_rename_map=dict(rename.get("rename_map") or {}),
+        pipeline_norm_features=list((normalizer.get("features") or {}).keys()),
     )
 
 
@@ -251,7 +292,34 @@ def read(spec: str | Path) -> CheckpointInfo:
 
 
 def problems(info: CheckpointInfo) -> list[str]:
-    """Reasons not to deploy this checkpoint on this cell. Empty is good."""
+    """Reasons not to deploy this checkpoint on this cell. Empty is good.
+
+    Dispatches on the checkpoint's own ``type``: what makes a checkpoint usable
+    is a fact about the policy, not about the directory. An unrecognised type is
+    itself the problem — this fork deploys exactly two.
+    """
+    if info.policy_type == "pi05":
+        return _pi05_problems(info)
+    if info.policy_type != EXPECTED_TYPE:
+        return [
+            f"policy type is {info.policy_type!r}; this cell deploys {list(KNOWN_TYPES)}"
+        ]
+    return _molmoact2_problems(info)
+
+
+def notes(info: CheckpointInfo) -> list[str]:
+    """Things worth saying out loud that are not reasons to stop."""
+    if info.policy_type == "pi05":
+        return _pi05_notes(info)
+    return _molmoact2_notes(info)
+
+
+# --------------------------------------------------------------------------- #
+# MolmoAct2
+# --------------------------------------------------------------------------- #
+
+
+def _molmoact2_problems(info: CheckpointInfo) -> list[str]:
     found: list[str] = []
 
     if info.policy_type != EXPECTED_TYPE:
@@ -299,8 +367,7 @@ def problems(info: CheckpointInfo) -> list[str]:
     return found
 
 
-def notes(info: CheckpointInfo) -> list[str]:
-    """Things worth saying out loud that are not reasons to stop."""
+def _molmoact2_notes(info: CheckpointInfo) -> list[str]:
     said: list[str] = []
 
     if info.device and info.device != "cuda":
@@ -354,3 +421,100 @@ def _expected_inversion() -> tuple[list[float], list[float]]:
     from .layout import yam_joint_offsets, yam_joint_signs
 
     return yam_joint_signs(), yam_joint_offsets()
+
+
+# --------------------------------------------------------------------------- #
+# π0.5
+# --------------------------------------------------------------------------- #
+#
+# π0.5's base checkpoint is judged against a different bar than MolmoAct2's, and
+# deliberately a lower one. MolmoAct2-BimanualYAM is *supposed* to arrive fitting
+# this cell — 14-D, the right norm tag, the right image order — so any departure
+# is a fault. π0.5-base is supposed to arrive fitting nothing in particular: 32-D
+# padded, three camera names of its own, and a normalizer covering no features at
+# all. None of that is wrong with the checkpoint; it is what a general-purpose
+# base model looks like, and :mod:`dk1lab.pi05` is what closes each gap.
+#
+# So the problems below are only the ones that would mean the adaptation cannot
+# be applied, and everything the adaptation *does* apply is reported as a note —
+# loudly, because "borrowed normalisation" has to travel with every number this
+# policy produces.
+
+
+def _pi05_problems(info: CheckpointInfo) -> list[str]:
+    """Reasons π0.5 cannot be adapted to this cell. Padding is not one of them."""
+    from .pi05 import PI05_IMAGE_NAMES
+
+    found: list[str] = []
+
+    expected_images = [f"observation.images.{name}" for name in PI05_IMAGE_NAMES]
+    if info.input_image_keys and list(info.input_image_keys) != expected_images:
+        found.append(
+            f"config.json declares image features {info.input_image_keys}, but the "
+            f"rename in dk1lab/pi05.py targets {expected_images}. The model embeds the "
+            f"views positionally, so a mismatch feeds the wrong camera to each slot"
+        )
+
+    for what, dim, width in (
+        ("state", info.state_dim, info.max_state_dim),
+        ("action", info.action_dim, info.max_action_dim),
+    ):
+        if width is None:
+            found.append(
+                f"config.json has no max_{what}_dim, so there is no padded width to "
+                f"narrow to {DOF}-D. This is not the pi05 checkpoint this was written for"
+            )
+        elif dim is not None and DOF > width:
+            found.append(
+                f"this cell's {what} is {DOF}-D but the checkpoint pads to {width}-D; "
+                f"a {DOF}-D vector does not fit"
+            )
+
+    return found
+
+
+def _pi05_notes(info: CheckpointInfo) -> list[str]:
+    """What the adaptation will change, said out loud before anything runs."""
+    from .pi05 import IMAGE_RENAME, NORM_STATS_REPO, TOKENIZER_REPO
+
+    said: list[str] = []
+
+    if not info.pipeline_norm_features:
+        said.append(
+            f"the saved normalizer covers NO features, so a literal zero-shot load "
+            f"normalises nothing — the policy would be handed raw radians where it "
+            f"expects roughly [-1, 1]. {DOF}-D statistics are borrowed from "
+            f"{NORM_STATS_REPO} instead. π0.5 zero-shot on this cell is ZERO-SHOT "
+            f"WEIGHTS, BORROWED NORMALISATION, and must be labelled that way."
+        )
+    if info.state_dim != DOF or info.action_dim != DOF:
+        said.append(
+            f"config.json declares state {info.state_dim}-D and action "
+            f"{info.action_dim}-D — the model's padded width, not a robot's. Both are "
+            f"narrowed to {DOF} at load, which is what trims the action chunk to this "
+            f"cell's {DOF} channels rather than 32 with 18 meaningless ones"
+        )
+    if not info.pipeline_rename_map:
+        said.append(
+            "the saved rename step is empty; this cell's "
+            + ", ".join(f"{ours.rsplit('.', 1)[-1]} -> {theirs.rsplit('.', 1)[-1]}"
+                        for ours, theirs in IMAGE_RENAME.items())
+            + " is applied as an override at load"
+        )
+    if info.device and info.device != "cuda":
+        said.append(
+            f'config.json says "device": {info.device!r}; overridden to cuda at load'
+        )
+    if info.model_dtype not in (None, "bfloat16"):
+        said.append(
+            f"dtype is {info.model_dtype!r}; this cell loads bfloat16 (8.8 GiB measured)"
+        )
+    said.append(
+        f"the prompt tokenizer comes from {TOKENIZER_REPO}, a GATED Hugging Face "
+        f"repository. `dk1 policy smoke` checks it is reachable before loading weights."
+    )
+    said.append(
+        "the gripper inversion is OFF for π0.5, always: its normalisation comes from "
+        "DK1 data in DK1 convention, so there is nothing to flip"
+    )
+    return said

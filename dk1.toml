@@ -283,6 +283,27 @@ max_gripper_rate = 1.0
 max_lag = 0.4
 max_dt = 0.1
 
+# The two-policy comparison's LEVEL PLAYING FIELD, selected by `--profile common`
+# on `dk1 policy run` and `dk1 policy session`. STUDY.md is the protocol; this is
+# the one table it adds to this file, and it adds nothing else — [limits.policy]
+# above is untouched and stays the default.
+#
+# Only the rate drops, to 0.6 rad/s. It sits between two measured points: at 0.3
+# the worst joint ended 0.98 rad behind the policy's intent on 26% of ticks; at
+# 1.0, 0.40 rad on 3.3%. Expect it to cost both policies something and record
+# what it costs — both wear the same handicap, so the comparison survives while
+# the absolute numbers carry the caveat.
+#
+# max_lag is deliberately NOT tightened with it. It is a TORQUE clamp, not a
+# position one: tightening it once held j6 to a tenth of its authority and could
+# deadlock the setpoint. Lowering it would stall the arms, not make them safer.
+# See the [limits.policy] comment above.
+[limits.study]
+max_joint_rate = 0.6
+max_gripper_rate = 1.0
+max_lag = 0.4
+max_dt = 0.1
+
 # --- Policy checkpoint -------------------------------------------------------
 #
 # The MolmoAct2 BimanualYAM checkpoint this cell is evaluated against. `~` is
