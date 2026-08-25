@@ -1,8 +1,9 @@
 # CLAUDE.md — architecture and project state
 
 Read this first. It is what is true now, and why the code is shaped the way it
-is. Two companions, neither of which repeats this one: `GUIDE.md` is the
-operator-facing version, and **`DIAGNOSTICS.md` is the record** — every
+is. Three companions, none of which repeats this one: `GUIDE.md` is the
+operator-facing version, **`STUDY.md` is the protocol** for the two-policy
+comparison, and **`DIAGNOSTICS.md` is the record** — every
 measurement, every fault chased to its cause, and the hypotheses that turned out
 wrong. Sections below point into it as `DIAGNOSTICS § name`. Read the section
 before re-measuring or undoing anything it covers.
@@ -332,6 +333,7 @@ subsystem directory: `...-usb-0:4.3:1.0` names both a camera and a leader arm.
 | **3** | Zero-shot MolmoAct2 evaluation | **six debugging rollouts plus a first recorded session of eight episodes.** Every timing and motion fault this fork could cause is closed; what is left is the policy's own output. **Still not scored** |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **done: 3/3** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
+| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=5 | protocol in `STUDY.md`, which carries its own phase numbering |
 
 **Phase 1** built `dk1 find cameras`, `dk1 find arms --inspect` (read-only USB
 identity) and `dk1 config check --formats`. That last one matters: OpenCV
@@ -483,6 +485,7 @@ re-measuring anything.
 | touch the speed caps or the home sweep | § *What the caps were doing*, § *The home sweep speed* |
 | touch the trace, `--display` or `--display-policy-input` | § *The instruments* |
 | re-run the simulator, or quote the sim result | § *The sim run* |
+| run, change or quote the two-policy comparison | `STUDY.md` — the protocol, not `DIAGNOSTICS.md` |
 | wonder what a past rollout on the arms actually showed | § *The rollouts on the arms* |
 | benchmark anything | § *The 27.7 Hz loop* — a flat-out loop and a paced one disagree about the same function, and separate processes drift by more than the effect you are chasing |
 
