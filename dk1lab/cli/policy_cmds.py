@@ -1668,7 +1668,10 @@ def _score_attempt(scored: StudyRun, outcome) -> None:
     typer.secho(f"\n  score this attempt ({plan.label()})", bold=True)
     for line in RUBRIC:
         typer.echo(f"    {line}")
-    typer.echo("    e.g. `3 left dropped it short of the bowl`, `5 right 21.4`, `skip`")
+    typer.echo(
+        "    e.g. `3 left dropped it short of the bowl`, `5 right`, `skip`. "
+        "A 5 takes its time from the episode."
+    )
 
     while True:
         try:
@@ -1695,9 +1698,13 @@ def _score_attempt(scored: StudyRun, outcome) -> None:
             continue
         break
 
+    # Time to success is READ OFF THE EPISODE, not typed: the episode ends when
+    # the operator stops it, which is at the success, so asking them for a number
+    # from the same clock is a prompt and a chance to mistype. A time typed
+    # inline still wins, for the attempt where the arms kept moving afterwards.
     seconds = scoring.seconds
     if scoring.success and seconds is None:
-        seconds = _ask_seconds(outcome.seconds)
+        seconds = outcome.seconds
     attempt = replace(
         scoring,
         scene=plan.scene,
@@ -1717,27 +1724,6 @@ def _score_attempt(scored: StudyRun, outcome) -> None:
         )
     else:
         typer.echo(f"  {plan.total}/{plan.wanted} done — next: {plan.label()}")
-
-
-def _ask_seconds(default: float) -> float | None:
-    """Time to success, defaulting to how long the episode ran.
-
-    Offered as a default rather than taken silently: the episode ends when the
-    operator stops it, which is at or after the success, never before it.
-    """
-    while True:
-        try:
-            text = input(f"  time to success in s [{default:.1f}]> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            typer.echo()
-            return default
-        if not text:
-            return default
-        try:
-            return float(text)
-        except ValueError:
-            typer.secho("  a number of seconds, or Enter for the episode length",
-                        fg=typer.colors.RED)
 
 
 SESSION_HELP_LINES = (

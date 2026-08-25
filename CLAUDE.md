@@ -501,7 +501,9 @@ scenes x three attempts = 9**, prints which layout to set up before the first
 attempt at each, and asks for the 0–5 rubric the moment an attempt ends —
 appending it to `study/scores/<row>.csv` as it happens, never afterwards. The
 module is pure bookkeeping and imports no lerobot: the score grammar
-(`<0-5> [arm] [seconds] [note]`, arm required above 0, a time only on a 5), the
+(`<0-5> [arm] [seconds] [note]`, arm required above 0, and a time only on a 5 —
+where it is **derived from the episode's own length** and typed only to override
+it, since the episode ends when the operator stops it, at the success), the
 CSV, and `ScenePlan`, which is **built from the rows already in the file** so an
 interrupted row resumes where it stopped. Three things it must keep doing:
 

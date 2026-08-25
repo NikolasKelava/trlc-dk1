@@ -106,20 +106,26 @@ def test_an_attempt_is_written_under_the_live_scene(monkeypatch, scored):
     assert scored.plan.next_attempt == 2
 
 
-def test_a_success_is_asked_for_its_time_and_offered_the_episode_length(monkeypatch, scored):
-    asked = answers(monkeypatch, "5 left", "")
+def test_a_success_takes_its_time_from_the_episode(monkeypatch, scored):
+    """One line, no second prompt: the episode ends at the success, so it knows."""
+    asked = answers(monkeypatch, "5 left")
     policy_cmds._score_attempt(scored, outcome(seconds=42.0))
 
-    assert any("time to success" in prompt for prompt in asked)
+    assert asked == ["  score> "]
     assert study.read(scored.path)[0].seconds == pytest.approx(42.0)
 
 
-def test_a_time_typed_inline_is_not_asked_for_again(monkeypatch, scored):
-    asked = answers(monkeypatch, "5 right 21.4")
-    policy_cmds._score_attempt(scored, outcome())
-
-    assert not any("time to success" in prompt for prompt in asked)
+def test_a_time_typed_inline_overrides_the_episode_length(monkeypatch, scored):
+    """For the attempt that succeeded early and the arms went on moving."""
+    answers(monkeypatch, "5 right 21.4")
+    policy_cmds._score_attempt(scored, outcome(seconds=42.0))
     assert study.read(scored.path)[0].seconds == pytest.approx(21.4)
+
+
+def test_only_a_success_carries_a_time(monkeypatch, scored):
+    answers(monkeypatch, "3 left nearly")
+    policy_cmds._score_attempt(scored, outcome(seconds=42.0))
+    assert study.read(scored.path)[0].seconds is None
 
 
 def test_a_line_that_cannot_be_understood_is_asked_again(monkeypatch, scored):

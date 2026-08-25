@@ -167,12 +167,13 @@ was R0's only job, and it is not worth a session on the arms.
 | --- | --- | --- | --- | --- |
 | ~~R0~~ | ~~MolmoAct2 optimized~~ | — | — | **dropped 2026-08-25** |
 | A0 | MolmoAct2 zero-shot | `common` | none | 2 |
-| A1 | MolmoAct2 + LoRA | `common` | LoRA | 4 |
-| B0 | π0.5 zero-shot | `common` | none | 5 |
-| B1 | π0.5 + LoRA | `common` | LoRA | 5 |
+| A1 | MolmoAct2 + LoRA | `common` | LoRA | 5 |
+| B0 | π0.5 zero-shot | `common` | none | 6 |
+| B1 | π0.5 + LoRA | `common` | LoRA | 8 |
 
 **MolmoAct2 goes all the way first, then π0.5.** B0 was originally Phase 2's
-third row; it now runs alongside B1, after MolmoAct2 has been fine-tuned. The
+third row; it now runs at Phase 6, after MolmoAct2 has been fine-tuned and
+scored. The
 cell is only worth setting up for one policy at a time, and the ~100
 demonstrations are what both fine-tunes need, so nothing is learned by pushing
 π0.5 through the arms before that dataset exists. Nothing about the *comparison*
@@ -226,7 +227,7 @@ scene,attempt,episode,score,seconds,arm,note
 | `attempt` | which of the three attempts at that scene, 1–3 |
 | `episode` | the dataset episode index this attempt was written as, or the `.rrd` stem when that is all there is, or empty when the attempt recorded nothing. **This is the only join between a score and its frames** — the task string is byte-identical everywhere and the scene is not in it |
 | `score` | the rubric, 0–5 |
-| `seconds` | time to success, only when `score` is 5 |
+| `seconds` | time to success, only when `score` is 5. **Derived from the episode** — it ends when the operator stops it, which is at the success |
 | `arm` | `left`, `right`, `both`, or `none` |
 | `note` | one line, why it stopped where it did. Empty on a 5 |
 
@@ -313,7 +314,7 @@ fully trained; a native flag in both (`train_action_expert_only` on MolmoAct2,
 via CPU offload for the other is two experiments, not a comparison.
 
 **Fixed for every run:** a **step budget, not epochs** — fixed once in Phase 4
-and reused verbatim. Hold out 10 of the ~100 episodes for validation and
+and reused verbatim in Phase 7. Hold out 10 of the ~100 episodes for validation and
 early-stop on it. Log the checkpoint hash, the `dk1.toml` in force, the command
 line and the git SHA into each run directory.
 
@@ -425,11 +426,12 @@ for it and waits at the prompt:
 [A0 scene 1/3, attempt 2/3 | episode 1 | 60s | dataset] task>     <- Enter repeats it
 ```
 
-The score line is `<0-5> [arm] [seconds] [note...]`. The arm is **required for
-anything above 0** — that column exists to settle an open question about this
-cell. A time is accepted only on a 5, where it means time-to-success, and if it
-is left off the session asks, offering the episode's length. A line it cannot
-understand is asked again rather than dropped: the attempt has already happened.
+The score line is `<0-5> [arm] [seconds] [note...]`, and it is the only prompt.
+The arm is **required for anything above 0** — that column exists to settle an
+open question about this cell. **Time-to-success is derived from the episode**,
+which ends when you stop it, at the success; type a number only to override that,
+and only on a 5. A line it cannot understand is asked again rather than dropped:
+the attempt has already happened.
 
 Enter at the prompt repeats the task, which is the ordinary case — the string
 never changes. After the third attempt at a scene the session advances and asks
@@ -460,10 +462,13 @@ common`** — that is the invariant above.
 | **1** | Sim check — nothing recorded | **done 2026-08-25.** Both policies drove the sim arms through the unmodified pipeline at ~29.9 Hz, no starved ticks. The scene itself is poor — see *The simulator* |
 | **2** | Zero-shot on the arms — A0, N=9 (3 scenes x 3) | 9 scored attempts, one row |
 | **3** | Collect ~100 demonstrations | a LeRobot v3.0 dataset recorded under `--profile common` |
-| **4** | MolmoAct2 + LoRA → A1, N=9 | 9 scored attempts |
-| **5** | π0.5 — B0 then B1, N=9 each | 18 scored attempts, two rows |
-| **6** | *If time:* action-expert-only, both models | |
-| **7** | Interpretation → `study/results.md` | |
+| **4** | MolmoAct2 + LoRA — the training run | a checkpoint, its loss curve, and the run directory recorded |
+| **5** | A1 on the arms, N=9 | 9 scored attempts, one row |
+| **6** | π0.5 zero-shot — B0, N=9 | 9 scored attempts, one row |
+| **7** | π0.5 + LoRA — the training run | a checkpoint, same recipe, same dataset bytes |
+| **8** | B1 on the arms, N=9 | 9 scored attempts, one row |
+| **9** | *If time:* action-expert-only, both models | |
+| **10** | Interpretation → `study/results.md` | |
 
 **Phase 0.** `lerobot[pi,peft,dataset]` into the existing environment
 (`molmoact2` and `training` are already there). Lay out
@@ -478,14 +483,24 @@ attempts apiece, scored into the CSV as they happen.
 Escalate as `CLAUDE.md` prescribes — `check`, `smoke`, `dryrun`, then `run`.
 Photograph the three layouts with `dk1 study photo --scene N` when the marks are
 set. π0.5 has never commanded these
-arms and does not until Phase 5.
+arms and does not until Phase 6.
 
 **Phase 3.** ~100 episodes by teleoperation under `--profile common`, dice start
 varied within the marked region and the three scored scenes among them, bowl
 fixed. Teleop stays uncapped: the cap
 exists to bound a policy, and demonstrations come from a human hand.
 
-**Phase 7.** Beyond the tables: does the ranking change after fine-tuning, and
+**Phases 4 and 7 are the training runs, and 5, 6 and 8 are the arms.** Each pair
+is split because a fine-tune that trains is not a fine-tune that works, and
+running them as one phase is how a bad checkpoint reaches the cell before anyone
+has looked at its loss curve. A training phase ends with a checkpoint, its
+curve, and the run directory recorded — the checkpoint hash, the `dk1.toml` in
+force, the command line, the git SHA. A scored phase ends with nine attempts in
+a CSV. Confirm the gripper convention behaviourally on the **first** episode of
+Phase 5 (the fine-tune speaks DK1, so the inversion goes **off**) before spending
+nine attempts on it.
+
+**Phase 10.** Beyond the tables: does the ranking change after fine-tuning, and
 does the pretraining mix explain it? Does MolmoAct2's visual plan degrade under
 the uncropped 105° input — it is inspectable, and π0.5 has no equivalent, which
 is itself worth writing down. Did the 0.6 rad/s cap bound either policy, read off
@@ -541,3 +556,5 @@ A protocol that moves silently is not a protocol.
 | 2026-08-25 | A scored row's `.rrd` go to **`study/rrd/<row>/`** | So a scored row's recordings never mix into `recordings/`, which holds six unscored tasks from before the study |
 | 2026-08-25 | **R0 is dropped.** The optimized configuration will not be captured again | Nikolas's call: it sits outside this comparison rather than as its first row. Every row that runs is now under one profile, `common`, which is what the level playing field was for. What is given up is a measurement of what that playing field costs — R0's only job — and it is not worth a session on the arms |
 | 2026-08-25 | In a scored session every recording is kept **without asking** | `keep this episode?` is one keypress away from deleting an attempt that cannot be repeated, and in a scored row a 0 is exactly as much evidence as a 5. The score prompt replaces it |
+| 2026-08-25 | The phases split: fine-tuning and scoring are separate phases (4/5 for MolmoAct2, 7/8 for π0.5), and π0.5 zero-shot gets its own phase 6 | A fine-tune that trains is not a fine-tune that works. Keeping them in one phase is how a bad checkpoint reaches the arms before anyone has read its loss curve, and it hides which half a slipped schedule is stuck in. Nothing about the rows, the task, the scenes or the rubric moves |
+| 2026-08-25 | Time-to-success is **derived from the episode**, not typed | The episode ends when the operator stops it, which is at the success; asking for a number they would read off the same clock added a prompt and a chance to mistype. A time can still be typed inline to override it |
