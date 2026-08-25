@@ -67,6 +67,7 @@ HELP = "help"
 RECORD = "record"
 DATASET = "dataset"
 DURATION = "duration"
+SCENE = "scene"
 NOTHING = "nothing"
 
 
@@ -121,6 +122,14 @@ def parse_command(line: str, *, last_task: str = "") -> Command:
         if rest.lower() in ("off", "no", "false"):
             return Command(DATASET, value=False)
         return Command(DATASET, error=f"say `:dataset on` or `:dataset off`, not {rest!r}")
+    if word == "scene":
+        # Only meaningful in a scored session; the prompt loop says so when
+        # there is no study, rather than the grammar knowing about one.
+        try:
+            number = int(rest)
+        except ValueError:
+            return Command(SCENE, error=f"`:scene` wants a scene number, got {rest!r}")
+        return Command(SCENE, value=number)
     if word == "duration":
         try:
             seconds = float(rest)

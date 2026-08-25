@@ -13,7 +13,7 @@ with the arms live.
 from __future__ import annotations
 
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Annotated
 
@@ -28,6 +28,18 @@ from ..record import DEFAULT_RECORD_DIR
 from ..dataset import DEFAULT_DATASET_DIR, one
 from ..policy import DEFAULT_EXECUTION_HORIZON, DEFAULT_FPS, HOME_AT_START_POSE
 from ..runprofile import DEFAULT_PROFILE, ProfileError
+from ..study import (
+    DEFAULT_ATTEMPTS,
+    DEFAULT_SCENE_DIR,
+    DEFAULT_SCENES,
+    DEFAULT_SCORES_DIR,
+    DEFAULT_STUDY_RRD_DIR,
+    RUBRIC,
+    Attempt,
+    ScenePlan,
+    ScoreError,
+)
+from .. import study as study_sheet
 from ..runprofile import resolve as resolve_profile
 from .safety import ENERGISE_HELP, MOTION_HELP, confirm_motion
 
@@ -182,6 +194,32 @@ WatchInputOpt = Annotated[
             "--display shows. This is where to check camera orientation."
         ),
     ),
+]
+
+StudyOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--study",
+        help=(
+            "Score this session as one row of STUDY.md — R0, A0, A1, B0, B1. The "
+            "session then walks the scene layouts in order, three attempts each, "
+            "asks for the 0-5 rubric as every attempt ends, and appends it to "
+            "study/scores/<row>.csv. Recordings are KEPT without asking: in a "
+            "scored row a failure is evidence."
+        ),
+    ),
+]
+ScenesOpt = Annotated[
+    int, typer.Option("--scenes", help="--study: how many marked scene layouts.")
+]
+AttemptsOpt = Annotated[
+    int, typer.Option("--attempts", help="--study: attempts at each scene.")
+]
+ScoresDirOpt = Annotated[
+    Path, typer.Option("--scores-dir", help="--study: where the score CSVs are written.")
+]
+SceneDirOpt = Annotated[
+    Path, typer.Option("--scene-dir", help="--study: where the scene photographs live.")
 ]
 
 ProfileOpt = Annotated[
@@ -811,8 +849,8 @@ def _make_dataset(enabled: bool, directory, *, capture, fps: int, profile: str):
     return session
 
 
-def _keep_recording(recording) -> bool:
-    """Ask whether to keep the episode just recorded, and delete it if not.
+def _keep_recording(recording, *, ask: bool = True) -> bool:
+    """Keep the episode just recorded — asking first, unless a row is being scored.
 
     Asked **after** the rollout because that is when you know: the episode ends
     when the task is done or has visibly failed, and only then is it clear
@@ -822,13 +860,15 @@ def _keep_recording(recording) -> bool:
 
     Keeping is the default: an accidental Enter should not throw away an attempt
     that cannot be repeated. Non-interactive runs keep everything for the same
-    reason.
+    reason, and so does a scored row (``ask=False``) — there the operator is
+    asked for a rubric score instead, and an attempt that scored 0 is exactly as
+    much evidence as one that scored 5.
     """
     if recording is None:
         return False
     typer.secho(recording.summary(), fg=typer.colors.GREEN)
     keep = True
-    if sys.stdin.isatty():
+    if ask and sys.stdin.isatty():
         keep = typer.confirm("  keep this episode?", default=True)
     if keep:
         # An .rrd is already on disk and needs nothing; a LeRobot episode is
@@ -1271,6 +1311,13 @@ one line at the prompt:
   task> :duration 60              change the per-episode limit
   task> :quit                     disconnect and leave
 
+With --study <row> it also keeps the score sheet. The session walks the marked
+scene layouts in order — three attempts at scene 1, then scene 2, then scene 3 —
+prints which layout to set up before the first attempt at each, and asks for the
+0-5 rubric the moment an attempt ends, appending it to study/scores/<row>.csv.
+Recordings are kept without asking: in a scored row a failure is evidence. Use
+`:scene <n>` to go back to a layout after a VOID attempt.
+
 Ctrl-C ends the current rollout and returns you to the prompt; it does not end
 the session. A second Ctrl-C during one rollout interrupts for real.
 
@@ -1281,7 +1328,8 @@ says so once ("No command for 0.50 s"); that warning is expected here. Quitting
 disconnects, which disables every motor, so support anything held up.
 
 This is the command for SCORING: same policy, same cell, same settings, one
-instruction after another, with a success count kept on paper. Everything that
+instruction after another, and with --study the count is kept in a file rather
+than on paper. Everything that
 would otherwise differ between attempts is held fixed by construction — the
 --profile included, which is fixed for the life of the session and named in
 every recording's notes."""  # noqa: E501
@@ -1326,9 +1374,24 @@ def session(
     ] = False,
     display_policy_input: WatchInputOpt = False,
     record: RecordOpt = False,
-    record_dir: RecordDirOpt = DEFAULT_RECORD_DIR,
+    record_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--record-dir",
+            help=(
+                "Where .rrd recordings are written. Default: recordings/, or "
+                "study/rrd/<row> under --study, which is what keeps a scored row's "
+                "recordings apart from every other row's and from the old ones."
+            ),
+        ),
+    ] = None,
     record_dataset: DatasetOpt = False,
     dataset_dir: DatasetDirOpt = DEFAULT_DATASET_DIR,
+    study: StudyOpt = None,
+    scenes: ScenesOpt = DEFAULT_SCENES,
+    attempts: AttemptsOpt = DEFAULT_ATTEMPTS,
+    scores_dir: ScoresDirOpt = DEFAULT_SCORES_DIR,
+    scene_dir: SceneDirOpt = DEFAULT_SCENE_DIR,
     sim: SimOpt = False,
     realtime: SimRealtimeOpt = True,
     view: SimViewOpt = True,
@@ -1358,6 +1421,15 @@ def session(
 ) -> None:
     from ..policy import rollout_config
     from ..session import PolicySession
+
+    # A scored row keeps its recordings in its own directory. R0 runs under
+    # `optimized`, so its frames must not join any other row's dataset — but they
+    # are still the only visual record of the reference row, so they are written
+    # and kept rather than mixed into recordings/ or thrown away.
+    scored = _study(study, scenes=scenes, attempts=attempts, scores_dir=scores_dir,
+                    scene_dir=scene_dir)
+    if record_dir is None:
+        record_dir = DEFAULT_STUDY_RRD_DIR / study if scored is not None else DEFAULT_RECORD_DIR
 
     if control_mode not in ("impedance", "pos_vel"):
         raise typer.BadParameter(f"control mode must be impedance or pos_vel, got {control_mode!r}")
@@ -1415,13 +1487,26 @@ def session(
         from ..record import next_index
 
         typer.echo(f"  .rrd ON -> {record_dir}, next episode {next_index(record_dir)}")
-        typer.echo("  you are asked whether to keep each episode when it ends")
+        typer.echo(
+            "  every episode is kept — this row is scored"
+            if scored is not None
+            else "  you are asked whether to keep each episode when it ends"
+        )
     else:
         typer.echo(f"  .rrd off (`:record on` at the prompt) -> {record_dir}")
     if record_dataset:
         typer.echo(f"  dataset ON -> {dataset_dir}")
     else:
         typer.echo(f"  dataset off (`:dataset on` at the prompt) -> {dataset_dir}")
+
+    if scored is not None:
+        _report_study(scored)
+        if not record and not record_dataset:
+            typer.secho(
+                "  nothing is being recorded — a scored row with no frames cannot be "
+                "reviewed. Use --record (R0) or --record-dataset (every other row).",
+                fg=typer.colors.YELLOW,
+            )
 
     if dry_run:
         typer.secho("\n--dry-run: nothing was connected and nothing moved.", fg=typer.colors.GREEN)
@@ -1489,7 +1574,7 @@ def session(
         live.set_task(task)
     typer.secho("\nready. `:help` lists the commands, `:quit` leaves.\n", fg=typer.colors.GREEN)
     try:
-        _session_loop(live, tracer, home=home_pose)
+        _session_loop(live, tracer, home=home_pose, study=scored)
     finally:
         typer.secho("\nclosing the session...", fg=typer.colors.YELLOW)
         live.close()
@@ -1499,6 +1584,162 @@ def session(
         )
 
 
+@dataclass
+class StudyRun:
+    """A scored row in progress: where it is, and where its scores go.
+
+    Held here rather than on :class:`~dk1lab.session.PolicySession` because none
+    of it reaches the robot — it decides what the prompt says and what lands in
+    the CSV, and the session is already the thing that must not grow opinions
+    about the study.
+    """
+
+    row: str
+    plan: ScenePlan
+    path: Path
+    scene_dir: Path
+    #: The scene whose set-up banner has already been printed, so it is printed
+    #: once per scene rather than before every prompt.
+    announced: int | None = None
+
+
+def _study(
+    row: str | None,
+    *,
+    scenes: int,
+    attempts: int,
+    scores_dir: Path,
+    scene_dir: Path,
+) -> StudyRun | None:
+    """Build the scored row, resuming from whatever its CSV already holds."""
+    if row is None:
+        return None
+    path = study_sheet.scores_path(row, scores_dir)
+    try:
+        done = study_sheet.read(path)
+    except ScoreError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    try:
+        plan = ScenePlan(scenes=scenes, attempts=attempts, done=done)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    return StudyRun(row=row, plan=plan, path=path, scene_dir=scene_dir)
+
+
+def _report_study(scored: StudyRun) -> None:
+    """What the scored row is, before anything is connected."""
+    plan = scored.plan
+    typer.secho("\nscored row", bold=True)
+    typer.echo(
+        f"  {scored.row}: {plan.scenes} scene(s) x {plan.attempts} attempts "
+        f"= {plan.wanted}, scored into {scored.path}"
+    )
+    if plan.total:
+        typer.echo(f"  {plan.total} already scored — resuming at {plan.label()}")
+    typer.echo("  every attempt is KEPT: in a scored row a failure is evidence")
+
+
+def _study_banner(scored: StudyRun) -> None:
+    """Ask for the desk to be set up, once per scene."""
+    plan = scored.plan
+    if not plan.scene_starting or scored.announced == plan.scene:
+        return
+    typer.secho(f"\n{plan.banner(scored.scene_dir)}", fg=typer.colors.CYAN, bold=True)
+    scored.announced = plan.scene
+
+
+def _score_attempt(scored: StudyRun, outcome) -> None:
+    """Ask for the rubric and write the row. Called the moment an episode ends.
+
+    Written here and now rather than reconstructed later, because the only
+    person who can score an attempt is the one who just watched it, and the only
+    time they can is before the next one.
+    """
+    plan = scored.plan
+    reference = study_sheet.episode_reference(outcome.recording)
+    if not sys.stdin.isatty():
+        typer.secho(
+            "  not a terminal — this attempt was NOT scored. Add it to "
+            f"{scored.path} by hand.",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    typer.secho(f"\n  score this attempt ({plan.label()})", bold=True)
+    for line in RUBRIC:
+        typer.echo(f"    {line}")
+    typer.echo("    e.g. `3 left dropped it short of the bowl`, `5 right 21.4`, `skip`")
+
+    while True:
+        try:
+            text = input("  score> ").strip()
+        except EOFError:
+            typer.secho("\n  not scored.", fg=typer.colors.YELLOW)
+            return
+        except KeyboardInterrupt:
+            # Ctrl-C here is not "stop the rollout" — there is nothing running.
+            # The attempt happened; refusing to lose it is the whole point.
+            typer.secho("\n  the attempt still needs a score — or type `skip`.",
+                        fg=typer.colors.YELLOW)
+            continue
+        if text.lower() in ("skip", ":skip"):
+            typer.secho(
+                "  not scored, and not counted. The attempt was void.",
+                fg=typer.colors.YELLOW,
+            )
+            return
+        try:
+            scoring = study_sheet.parse_score(text)
+        except ScoreError as exc:
+            typer.secho(f"  {exc}", fg=typer.colors.RED)
+            continue
+        break
+
+    seconds = scoring.seconds
+    if scoring.success and seconds is None:
+        seconds = _ask_seconds(outcome.seconds)
+    attempt = replace(
+        scoring,
+        scene=plan.scene,
+        attempt=plan.next_attempt,
+        episode=reference,
+        seconds=seconds,
+    )
+    study_sheet.append(scored.path, attempt)
+    plan.record(attempt)
+    typer.secho(f"  {attempt.line()} -> {scored.path}", fg=typer.colors.GREEN)
+    if plan.complete:
+        typer.secho(
+            f"\n{scored.row} is complete: {plan.total} attempt(s). "
+            f"`dk1 study scores {scored.row}` reads it back.",
+            fg=typer.colors.GREEN,
+            bold=True,
+        )
+    else:
+        typer.echo(f"  {plan.total}/{plan.wanted} done — next: {plan.label()}")
+
+
+def _ask_seconds(default: float) -> float | None:
+    """Time to success, defaulting to how long the episode ran.
+
+    Offered as a default rather than taken silently: the episode ends when the
+    operator stops it, which is at or after the success, never before it.
+    """
+    while True:
+        try:
+            text = input(f"  time to success in s [{default:.1f}]> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            typer.echo()
+            return default
+        if not text:
+            return default
+        try:
+            return float(text)
+        except ValueError:
+            typer.secho("  a number of seconds, or Enter for the episode length",
+                        fg=typer.colors.RED)
+
+
 SESSION_HELP_LINES = (
     "  <instruction>   run one episode with that task",
     "  <empty>         run the last task again",
@@ -1506,11 +1747,12 @@ SESSION_HELP_LINES = (
     "  :dataset on|off append each episode to the LeRobot dataset",
     "  :duration <s>   seconds per episode; 0 runs until Ctrl-C",
     "  :home           sweep both arms to the home pose now",
+    "  :scene <n>      --study: go back to a scene, for a VOID attempt",
     "  :help  :quit",
 )
 
 
-def _session_loop(live, tracer, *, home=None) -> None:
+def _session_loop(live, tracer, *, home=None, study=None) -> None:
     """Read a line, run an episode, print what it did. Until `:quit` or EOF.
 
     The reading is here and the deciding is in
@@ -1518,12 +1760,14 @@ def _session_loop(live, tracer, *, home=None) -> None:
     without a robot attached.
     """
     from ..session import (
-        DATASET, DURATION, HELP, HOME, NOTHING, QUIT, RECORD, RUN, parse_command,
+        DATASET, DURATION, HELP, HOME, NOTHING, QUIT, RECORD, RUN, SCENE, parse_command,
     )
 
     while True:
+        if study is not None:
+            _study_banner(study)
         try:
-            line = input(_prompt(live))
+            line = input(_prompt(live, study))
         except EOFError:
             typer.echo()
             return
@@ -1570,11 +1814,26 @@ def _session_loop(live, tracer, *, home=None) -> None:
                 else "each episode runs until Ctrl-C"
             )
             continue
+        if command.kind == SCENE:
+            if study is None:
+                typer.secho(
+                    "this session is not scoring a row — start it with --study <row>",
+                    fg=typer.colors.YELLOW,
+                )
+                continue
+            try:
+                study.plan.jump(int(command.value))
+            except ValueError as exc:
+                typer.secho(str(exc), fg=typer.colors.RED)
+                continue
+            study.announced = None
+            typer.echo(f"back to {study.plan.label()} — for a VOID attempt; say so in the note")
+            continue
         if command.kind == HOME:
             _run_home(live)
             continue
         if command.kind == RUN:
-            _run_episode(live, tracer, command.task, home=home)
+            _run_episode(live, tracer, command.task, home=home, study=study)
 
 
 def _episode_number(live) -> int:
@@ -1592,10 +1851,12 @@ def _episode_number(live) -> int:
     return next_index(live.record_dir)
 
 
-def _prompt(live) -> str:
+def _prompt(live, study=None) -> str:
     """The prompt line: what the next episode will do, before you commit to it."""
     limit = f"{live.duration_s:.0f}s" if live.duration_s else "no limit"
     flags = f"episode {_episode_number(live)} | {limit}"
+    if study is not None:
+        flags = f"{study.row} {study.plan.label()} | {flags}"
     if live.record:
         flags += " | rrd"
     if live.record_dataset:
@@ -1603,7 +1864,7 @@ def _prompt(live) -> str:
     return f"\n[{flags}] task> "
 
 
-def _run_episode(live, tracer, task: str, *, home=None) -> None:
+def _run_episode(live, tracer, task: str, *, home=None, study=None) -> None:
     """One rollout, with everything it produced printed after it."""
     typer.secho(
         f"\n>>> episode {_episode_number(live)}: {task!r} — Ctrl-C stops it\n",
@@ -1620,7 +1881,9 @@ def _run_episode(live, tracer, task: str, *, home=None) -> None:
         return
     typer.secho(f"\n{outcome.summary()}", fg=typer.colors.GREEN)
     _echo_trace_summary(tracer)
-    _keep_recording(outcome.recording)
+    _keep_recording(outcome.recording, ask=study is None)
+    if study is not None:
+        _score_attempt(study, outcome)
     if outcome.home is not None:
         _echo_home_report(outcome.home)
 

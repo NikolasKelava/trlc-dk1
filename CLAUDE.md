@@ -90,6 +90,7 @@ dk1lab/                 everything this fork adds; the only Python we own
   runprofile.py         optimized vs common: what the policy sees, how fast (no lerobot)
   pi05.py               pi0.5: 32-D padding, renamed cameras, borrowed norm stats
   dataset.py            the LeRobot v3.0 recorder — alongside record.py, not instead
+  study.py              the score sheet: scenes, attempts, the CSV  (no lerobot import)
   scene.py              the bimanual MuJoCo scene, generated from urdf/  (no lerobot)
   sim.py                SimRobot — the MuJoCo cell behind the real robot interface
   cli/                  Typer app; `dk1` entry point
@@ -338,7 +339,7 @@ subsystem directory: `...-usb-0:4.3:1.0` names both a camera and a leader arm.
 | **3** | Zero-shot MolmoAct2 evaluation | **six debugging rollouts plus a first recorded session of eight episodes.** Every timing and motion fault this fork could cause is closed; what is left is the policy's own output. **Still not scored** |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **done: 3/3** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
-| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=5 | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0 and 1 are done**; Phase 2 is the arms — see below |
+| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=15 per row (5 scene configurations x 3 attempts) | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0 and 1 are done**; Phase 2 is the arms — see below |
 
 **Phase 1** built `dk1 find cameras`, `dk1 find arms --inspect` (read-only USB
 identity) and `dk1 config check --formats`. That last one matters: OpenCV
@@ -368,6 +369,8 @@ it open, so a finger resting in a trigger gets pushed.
 | `dk1 policy run` | the rollout | the policy drives the arms |
 | `dk1 policy session` | load once, then rollout after rollout, task by task | the policy drives the arms |
 | `dk1 policy home` | the home sweep alone, no model | both arms move |
+| `dk1 study photo` | one still of a scene layout | a video device, nothing else |
+| `dk1 study scores` | reads a scored row's CSV back | none — a text file |
 
 `dk1lab/policy.py` is the single implementation; `dk1lab/checkpoint.py` is the
 JSON-only reader behind `check`; `dk1lab/session.py` holds the loaded policy
@@ -458,7 +461,7 @@ the control thread, against 5.1 ms if the encode runs inline, and cv2 is 2.7x
 faster than rerun's own `Image.compress`). A frame that cannot be kept up with
 is dropped, counted, and reported.
 
-## The two-policy comparison — what Phase 0 built (2026-08-25)
+## The two-policy comparison — what is built for it (2026-08-25)
 
 `STUDY.md` is the protocol. This is what exists in the tree for it. **Nothing has
 been run on the arms and nothing has been scored**; every item here is code and
@@ -491,6 +494,31 @@ The gripper inversion is **off for π0.5, always**.
 > `hf auth login`. `dk1lab.pi05.tokenizer_available` checks before loading 14 GB
 > of weights. Do not substitute a mirror: the tokenizer decides what the prompt
 > means, and the study compares two policies on one prompt.
+
+**`dk1lab/study.py` and `--study <row>`** (2026-08-25) — the scored session.
+`dk1 policy session --study A0` walks the marked scene layouts in order, **three
+scenes x three attempts = 9**, prints which layout to set up before the first
+attempt at each, and asks for the 0–5 rubric the moment an attempt ends —
+appending it to `study/scores/<row>.csv` as it happens, never afterwards. The
+module is pure bookkeeping and imports no lerobot: the score grammar
+(`<0-5> [arm] [seconds] [note]`, arm required above 0, a time only on a 5), the
+CSV, and `ScenePlan`, which is **built from the rows already in the file** so an
+interrupted row resumes where it stopped. Three things it must keep doing:
+
+- **the scene never enters the task string** — that string is the prompt and is
+  byte-identical at every rollout, so the scene is a CSV column and nothing else;
+- **the `episode` column is the only join** from a score to its frames (the
+  dataset episode index, or the `.rrd` stem when that is all there is);
+- **a scored session keeps every recording without asking.** A 0 is as much
+  evidence as a 5, and `keep this episode?` is one keypress from deleting an
+  attempt that cannot be repeated. The score prompt replaces it.
+
+`dk1 study photo --scene N` writes `study/scene/N.jpg` off the top camera —
+video device only, no motor — and `dk1 study scores <row>` reads a row back with
+its per-scene grid. Under `--study`, `.rrd` recordings default to
+`study/rrd/<row>/`, so a scored row's recordings never mix into `recordings/`.
+**R0 was dropped on 2026-08-25**: the `optimized` configuration is not captured
+again and sits outside the comparison, so every row that runs is `common`.
 
 **`dk1lab/dataset.py`** — a LeRobot **v3.0** recorder, `--record-dataset` on both
 `run` and `session`. Alongside `record.py`, which is untouched: the `.rrd` keeps

@@ -21,6 +21,7 @@ from dk1lab.session import (
     QUIT,
     RECORD,
     RUN,
+    SCENE,
     PolicySession,
     parse_command,
 )
@@ -69,6 +70,14 @@ def test_a_command_that_cannot_be_understood_complains_instead_of_running_it():
     assert parse_command(":record maybe").error is not None
     assert parse_command(":duration soon").error is not None
     assert parse_command(":duration -5").error is not None
+
+
+def test_a_scene_is_a_number_the_scored_session_jumps_to():
+    """The grammar knows nothing about a study; the prompt loop refuses if there is none."""
+    assert parse_command(":scene 2").kind == SCENE
+    assert parse_command(":scene 2").value == 2
+    assert parse_command(":scene two").error is not None
+    assert parse_command(":scene").error is not None
 
 
 def test_a_duration_is_seconds_and_zero_means_until_stopped():

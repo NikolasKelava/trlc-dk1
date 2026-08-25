@@ -60,10 +60,35 @@ recorded in every demonstration.
 
 Chosen because it resets in two seconds and its success is not a judgement call.
 
-**Scene reset.** Dice at a marked position, bowl at another. Photograph the
-layout once to `study/scene.jpg` and reproduce it before every attempt — the
-configurations are evaluated on different days, so the photograph is what holds
-them comparable.
+### Three scene configurations, three attempts each
+
+One task string, but not one layout. **The dice and the bowl take three marked
+positions, numbered 1 to 3, and each one is attempted three times** — nine
+scored attempts per row. A policy that can only reach one corner of the table
+scores the same as one that can do the task if all nine attempts share a layout;
+three layouts is what tells them apart, and three attempts each is what keeps a
+single lucky grasp from carrying a layout.
+
+Two words that are easy to confuse, so they are fixed here:
+
+- a **configuration** (or **row**) is A0 / A1 / B0 / B1 — a policy under a
+  profile, one line of the results table;
+- a **scene configuration** (**scene 1, 2, 3**) is where the dice and the bowl
+  sit. The same three scenes are used by every row.
+
+**Scene reset.** The positions are **marked on the desk in pen**, so a scene is
+reproduced by putting the dice and the bowl back on their marks. Each scene is
+photographed to `study/scene/1.jpg` … `3.jpg` with `dk1 study photo --scene N`,
+which grabs a still from the `top` camera — cameras only, no motor is touched.
+The rows are run on different days, so the marks and the photographs are what
+hold them comparable.
+
+**The scenes are run in order, and grouped.** A session does scene 1 three
+times, then scene 2 three times, then scene 3. The session prompt shows which
+scene is live and which attempt of the three is next, and asks the operator to
+set the scene up before the first attempt of each one — the scoring is grouped by
+scene in the CSV, and interleaving the layouts is how that grouping stops being
+true.
 
 ---
 
@@ -122,17 +147,25 @@ grasp.
 
 Both models train on the same dataset bytes, which is what keeps the tuning
 comparison clean. Confirm it behaviourally on the *first* fine-tuned episode
-before spending five attempts.
+before spending nine attempts.
 
 ---
 
-## The five configurations
+## The configurations
 
-**N = 5 scored attempts each**, one task, 25 attempts total.
+**N = 9 scored attempts each** — three scene configurations, three attempts
+apiece — one task string, 36 attempts across the four rows that will be run.
+
+**R0 is not one of them.** The `optimized` configuration is what this cell
+already ran before the study, and it is not being captured again: it sits
+outside the comparison rather than as its first row. Everything the study
+compares now runs under one profile — `common` — which is what the level playing
+field was for. What is lost is the price of that playing field, measured; that
+was R0's only job, and it is not worth a session on the arms.
 
 | # | configuration | profile | tuning | phase |
 | --- | --- | --- | --- | --- |
-| R0 | MolmoAct2 optimized | `optimized` | none — frozen reference | 2 |
+| ~~R0~~ | ~~MolmoAct2 optimized~~ | — | — | **dropped 2026-08-25** |
 | A0 | MolmoAct2 zero-shot | `common` | none | 2 |
 | A1 | MolmoAct2 + LoRA | `common` | LoRA | 4 |
 | B0 | π0.5 zero-shot | `common` | none | 5 |
@@ -143,14 +176,14 @@ third row; it now runs alongside B1, after MolmoAct2 has been fine-tuned. The
 cell is only worth setting up for one policy at a time, and the ~100
 demonstrations are what both fine-tunes need, so nothing is learned by pushing
 π0.5 through the arms before that dataset exists. Nothing about the *comparison*
-changes: every configuration still runs the same task from the same scene under
-the same profile, and B0 is still zero-shot weights.
+changes: every configuration still runs the same task from the same three scenes
+under the same profile, and B0 is still zero-shot weights.
 
 `--duration` drops from the 180 s default to **60 s**: 180 was chosen for a
 multi-object sim task, and dice-in-bowl is a single pick and place.
 
 The action-expert-only fine-tune is an **optional extra** (see *Fine-tuning*),
-not one of the five.
+not one of the four.
 
 ---
 
@@ -168,14 +201,41 @@ credit is what stops a table of zeros from being uninformative.
 | 4 | **transport** — carried over the bowl |
 | 5 | **success** — released into the bowl, stays there |
 
-Also per attempt: time to success, **which arm was used**, and a one-line failure
-note. That third column is not bookkeeping — `CLAUDE.md` carries an unexplained
+Also per attempt: the scene configuration, the attempt number within it, time to
+success, **which arm was used**, and a one-line failure note. That arm column is
+not bookkeeping — `CLAUDE.md` carries an unexplained
 observation that *the right arm was reported not to pick anything up*, and this
 is the first thing that will produce enough labelled attempts to confirm or kill
 it. If both policies favour the left arm, that is a finding about the cell.
 
 Written to `study/scores/<config>.csv` **during** the session, not reconstructed
-afterwards.
+afterwards. One row per attempt, nine rows per file, in the order they were
+run:
+
+```csv
+scene,attempt,episode,score,seconds,arm,note
+1,1,0,3,,left,grasped the dice, dropped it short of the bowl
+1,2,1,5,21.4,left,
+1,3,2,0,,none,no purposeful motion
+2,1,3,2,,right,nudged the dice out of reach
+```
+
+| column | what it holds |
+| --- | --- |
+| `scene` | the scene configuration, 1–3 |
+| `attempt` | which of the three attempts at that scene, 1–3 |
+| `episode` | the dataset episode index this attempt was written as, or the `.rrd` stem when that is all there is, or empty when the attempt recorded nothing. **This is the only join between a score and its frames** — the task string is byte-identical everywhere and the scene is not in it |
+| `score` | the rubric, 0–5 |
+| `seconds` | time to success, only when `score` is 5 |
+| `arm` | `left`, `right`, `both`, or `none` |
+| `note` | one line, why it stopped where it did. Empty on a 5 |
+
+The scene never goes into the **task string**: that string is the prompt and is
+byte-identical at every rollout. It is a column here and nowhere else.
+
+Report the success rate per row **and** the 3×3 grid per row. Three scenes of
+three is a coarse instrument for per-scene skill, but "it only ever works at
+scene 2" is a conclusion that nine attempts at one layout cannot reach at all.
 
 ---
 
@@ -184,23 +244,24 @@ afterwards.
 **LeRobot dataset v3.0** for the demonstrations and every scored rollout;
 viewable with `lerobot-dataset-viz` and the Hub's dataset viewer.
 
-**Except R0, which is generally not recorded.** It runs under `optimized`, so
-its frames carry the wrist crop and the offset — a different lens from every
-other row's. Putting them in the same dataset would give a fine-tune two
-geometries and no way to tell them apart, and R0 is a reference row rather than
-training data. Score it on paper; record it to an `.rrd` if a run needs
-diagnosing.
+Every row that is run goes under `--profile common`, so one dataset per row and
+no lens ever mixes. (This is what R0 could not have done, and one of the reasons
+it is not being captured.)
 
-`dk1lab/record.py` and its `.rrd` output stay exactly as they are, behind
-`--record-rrd`, used only when a rollout needs diagnosing against the policy's
-own plan — the one stream the LeRobot format has no slot for.
+`dk1lab/record.py` and its `.rrd` output are unchanged and stay available behind
+`--record`, for an attempt worth diagnosing against the policy's own plan — the
+one stream no dataset format has a slot for. Under `--study <row>` they are
+written to **`study/rrd/<row>/`**, a directory of their own, so a scored row's
+recordings never mix into `recordings/`, which holds six unscored tasks from
+before the study.
 
 ```
 study/
-  scene.jpg              the reset layout, photographed once
+  scene/1.jpg .. 3.jpg   the three scene configurations         [tracked]
   demos/                 ~100 teleop episodes, LeRobot v3.0     [not in git]
   rollouts/<config>/     one LeRobot dataset per scored run     [not in git]
-  scores/<config>.csv    the rubric, one row per attempt        [tracked]
+  rrd/<config>/          .rrd kept when a row is diagnosed      [not in git]
+  scores/<config>.csv    the rubric, 9 rows: scene x attempt    [tracked]
   results.md             the tables and the interpretation      [tracked]
 recordings/              the eight legacy .rrd — UNCHANGED, and prior evidence
                          for the optimized configuration, not a scored row
@@ -209,7 +270,13 @@ recordings/              the eight legacy .rrd — UNCHANGED, and prior evidence
 
 The datasets do not go in git — the eight `.rrd` already exceed GitHub's 100 MB
 hard limit. They are LeRobot datasets, so they belong on the **Hugging Face
-Hub**. Only `scores/` and `results.md` are tracked.
+Hub**. Only `scores/`, `scene/` and `results.md` are tracked.
+
+**A dataset holds all nine attempts of a row, in scene order** — one dataset per
+configuration, not one per scene. Episodes are appended, so episode index 0–2 are
+scene 1, 3–5 are scene 2, 6–8 are scene 3; the `episode` column of the CSV is
+what records that rather than the arithmetic, because a failed attempt that is
+re-run shifts it.
 
 **One invariant, and it is the one that will be violated if anything is:**
 
@@ -314,21 +381,68 @@ dk1 policy run --sim --profile common --duration 60 \
 A MuJoCo window opens; `--no-view` runs it headless, `--display` adds the
 per-joint Rerun panels. Read the result as *the pipeline runs* and nothing more.
 
-**The arms**, one scored session per configuration. `--profile` and `--record-dataset`
-are the two flags that decide which row you are producing:
+**The scene photographs** — a video device, nothing else. No motor is energised
+and no arm moves:
 
 ```
-# R0 — the frozen reference. Optimized, and NOT recorded to the dataset.
-dk1 policy session --profile optimized --duration 60
+dk1 study photo --scene 1        # -> study/scene/1.jpg, off the top camera
+```
 
-# A0 / A1 — the level playing field, recorded.
-dk1 policy session --profile common --duration 60 \
+**The arms**, one scored session per configuration. `--study` is what turns a
+session into a row: it walks the scenes, asks for the rubric as each attempt
+ends, and appends to `study/scores/<row>.csv`.
+
+```
+# A0 / A1 / B0 / B1 — the level playing field, recorded as a LeRobot dataset.
+dk1 policy session --study A0 --profile common --duration 60 \
   --record-dataset --dataset-dir study/rollouts/A0
 ```
 
-At the prompt: type the task, Ctrl-C to end the attempt, Enter to keep it, empty
-line to run it again, `:quit` to leave. Score each attempt into
-`study/scores/<config>.csv` as it happens.
+Add `--record` to also write the `.rrd` with the policy's own plan, into
+`study/rrd/A0/`. It is the stream to diagnose a rollout against, and it is
+hundreds of MB an episode; the dataset is what the study scores and fine-tunes
+from.
+
+`--scenes` and `--attempts` default to 3 and 3; `--scores-dir` and `--scene-dir`
+default to `study/scores` and `study/scene`. A session started against a CSV
+that already has attempts **resumes where it left off** — the file is the state.
+
+**The prompt walks the three scenes in order**, three attempts each, and says
+which one it is on. Setting the scene up is the operator's job; the session asks
+for it and waits at the prompt:
+
+```
+=== scene 1 of 3 — put the dice and the bowl on their marks for scene 1 (study/scene/1.jpg) ===
+[A0 scene 1/3, attempt 1/3 | episode 0 | 60s | dataset] task> put the dice in the bowl
+  ... the arms go; Ctrl-C ends the attempt, then the arms sweep home
+
+  score this attempt (scene 1/3, attempt 1/3)
+    0 no purposeful motion  1 approach  2 contact  3 grasp  4 transport  5 success
+  score> 3 left dropped it short of the bowl
+  scene 1 attempt 1: score 3, left — dropped it short of the bowl -> study/scores/A0.csv
+  1/9 done — next: scene 1/3, attempt 2/3
+
+[A0 scene 1/3, attempt 2/3 | episode 1 | 60s | dataset] task>     <- Enter repeats it
+```
+
+The score line is `<0-5> [arm] [seconds] [note...]`. The arm is **required for
+anything above 0** — that column exists to settle an open question about this
+cell. A time is accepted only on a 5, where it means time-to-success, and if it
+is left off the session asks, offering the episode's length. A line it cannot
+understand is asked again rather than dropped: the attempt has already happened.
+
+Enter at the prompt repeats the task, which is the ordinary case — the string
+never changes. After the third attempt at a scene the session advances and asks
+for the next layout; after scene 3 it says the row is complete. `:scene <n>` goes
+back to a layout for an attempt that was **void** — the dice knocked off the desk
+before the policy moved, a camera that had dropped out — and the extra attempt is
+numbered onward (4) with the reason in its note. `:quit` leaves.
+
+**Every recording in a scored session is kept, without asking.** In a scored row
+a failure is evidence, and `keep this episode?` is one keypress away from
+deleting it. The score prompt is the only question after an attempt.
+
+`dk1 study scores A0` reads a row back: every attempt, then the per-scene grid.
 
 The checkpoint defaults to `[policy]` in `dk1.toml` (MolmoAct2). For π0.5 pass
 `--checkpoint ~/Documents/RobotLearning/policies/pi05/base`; the gripper
@@ -344,10 +458,10 @@ common`** — that is the invariant above.
 | --- | --- | --- |
 | **0** | Setup | **done 2026-08-25.** Both policies load and infer; `--profile common` exists; the LeRobot recorder writes a readable dataset; the MuJoCo scene runs |
 | **1** | Sim check — nothing recorded | **done 2026-08-25.** Both policies drove the sim arms through the unmodified pipeline at ~29.9 Hz, no starved ticks. The scene itself is poor — see *The simulator* |
-| **2** | Zero-shot on the arms — R0, then A0, **separately**, N=5 each | 10 scored attempts, two rows |
+| **2** | Zero-shot on the arms — A0, N=9 (3 scenes x 3) | 9 scored attempts, one row |
 | **3** | Collect ~100 demonstrations | a LeRobot v3.0 dataset recorded under `--profile common` |
-| **4** | MolmoAct2 + LoRA → A1, N=5 | |
-| **5** | π0.5 — B0 then B1, N=5 each | 10 scored attempts, two rows |
+| **4** | MolmoAct2 + LoRA → A1, N=9 | 9 scored attempts |
+| **5** | π0.5 — B0 then B1, N=9 each | 18 scored attempts, two rows |
 | **6** | *If time:* action-expert-only, both models | |
 | **7** | Interpretation → `study/results.md` | |
 
@@ -359,12 +473,16 @@ clone and stays untouched. All code stays in `trlc-dk1-niko`. Fetch
 `lerobot/pi05_base`, verify with `dk1 policy check` / `smoke`. Build
 `--profile common`, the LeRobot recorder, and the MuJoCo scene.
 
-**Phase 2.** R0 then A0, in separate sessions. Escalate as `CLAUDE.md`
-prescribes — `dryrun` before `run`. π0.5 has never commanded these arms and does
-not until Phase 5.
+**Phase 2.** A0, one session of nine attempts: scenes 1 to 3 in order, three
+attempts apiece, scored into the CSV as they happen.
+Escalate as `CLAUDE.md` prescribes — `check`, `smoke`, `dryrun`, then `run`.
+Photograph the three layouts with `dk1 study photo --scene N` when the marks are
+set. π0.5 has never commanded these
+arms and does not until Phase 5.
 
 **Phase 3.** ~100 episodes by teleoperation under `--profile common`, dice start
-varied within the marked region, bowl fixed. Teleop stays uncapped: the cap
+varied within the marked region and the three scored scenes among them, bowl
+fixed. Teleop stays uncapped: the cap
 exists to bound a policy, and demonstrations come from a human hand.
 
 **Phase 7.** Beyond the tables: does the ranking change after fine-tuning, and
@@ -372,7 +490,9 @@ does the pretraining mix explain it? Does MolmoAct2's visual plan degrade under
 the uncropped 105° input — it is inspectable, and π0.5 has no equivalent, which
 is itself worth writing down. Did the 0.6 rad/s cap bound either policy, read off
 the trace rather than off impressions? Did either arm systematically
-underperform?
+underperform? And does any scene configuration separate the rows — a layout one
+policy handles and another does not is the closest thing nine attempts can offer
+to a claim about generalisation.
 
 ---
 
@@ -392,8 +512,10 @@ labelled that way every time it is quoted.**
 **The 0.6 rad/s cap may dominate the result.** Accepted deliberately; report it
 as a caveat on the absolute numbers, not on the comparison.
 
-**N = 5 on one task is a small number.** 2/5 against 3/5 is not a significant
-difference and will not be reported as one.
+**N = 9 on one task is still a small number.** Three scenes of three is enough
+to say a policy works nowhere, or works everywhere; 4/9 against 6/9 is not a
+significant difference and will not be reported as one. Nor is one scene against
+another at n = 3.
 
 **Dice-in-bowl barely exercises bimanual coordination**, so the study says
 nothing about it. Stated, not discovered.
@@ -415,4 +537,7 @@ A protocol that moves silently is not a protocol.
 | date | change | why |
 | --- | --- | --- |
 | 2026-08-25 | B0 moves from Phase 2 to Phase 5 — MolmoAct2 all the way through first | The cell is worth setting up for one policy at a time, and both fine-tunes need the same ~100 demonstrations. The comparison is unaffected: same task, same scene, same profile, and B0 is still zero-shot weights |
-| 2026-08-25 | R0 is scored but **not** recorded to a LeRobot dataset | It runs under `optimized`, so its frames carry a different lens from every other row's. Mixing them into one dataset would give a fine-tune two geometries and no way to tell them apart |
+| 2026-08-25 | **N goes from 5 to 9 per row** — three scene configurations, three attempts each, run and scored grouped by scene | Five attempts at one layout measure one layout. The three marked dice/bowl positions are what separate a policy that can do the task from one that can reach one corner, and three attempts per scene keep a single lucky grasp from carrying it. The task string, the profiles, the rubric and the rows are unchanged; the study grows from 25 attempts to 45 |
+| 2026-08-25 | A scored row's `.rrd` go to **`study/rrd/<row>/`** | So a scored row's recordings never mix into `recordings/`, which holds six unscored tasks from before the study |
+| 2026-08-25 | **R0 is dropped.** The optimized configuration will not be captured again | Nikolas's call: it sits outside this comparison rather than as its first row. Every row that runs is now under one profile, `common`, which is what the level playing field was for. What is given up is a measurement of what that playing field costs — R0's only job — and it is not worth a session on the arms |
+| 2026-08-25 | In a scored session every recording is kept **without asking** | `keep this episode?` is one keypress away from deleting an attempt that cannot be repeated, and in a scored row a 0 is exactly as much evidence as a 5. The score prompt replaces it |

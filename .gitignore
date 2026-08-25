@@ -240,7 +240,11 @@ dk1.toml.tmp
 # stands between an accidental `git add -A` and a repository nobody can clone.
 # They belong on the Hugging Face Hub. Only the scores and the write-up are
 # tracked, hence the two exceptions.
-study/
+# The study: only the text and the photographs are tracked. The datasets and the
+# .rrd are hundreds of MB an episode and belong on the Hub. Note `study/*` and
+# not `study/`: git does not descend into an excluded DIRECTORY, so the
+# re-includes below would never be looked at.
+study/*
 !study/scores/
+!study/scene/
 !study/results.md
-!study/scene.jpg

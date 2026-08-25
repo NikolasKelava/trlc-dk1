@@ -5,7 +5,7 @@ from __future__ import annotations
 import typer
 
 from ..config import ConfigError
-from . import config_cmds, find_cmds, policy_cmds, sim_cmds, teleop_cmds
+from . import config_cmds, find_cmds, policy_cmds, sim_cmds, study_cmds, teleop_cmds
 
 HELP = """Operate the bimanual TRLC-DK1: devices, teleoperation, policies.
 
@@ -33,6 +33,11 @@ app.add_typer(
     sim_cmds.app,
     name="sim",
     help="The MuJoCo cell. Nothing here touches the arms.",
+)
+app.add_typer(
+    study_cmds.app,
+    name="study",
+    help="The scored comparison: scene photographs and the score sheets.",
 )
 
 
