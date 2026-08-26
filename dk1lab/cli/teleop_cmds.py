@@ -136,6 +136,21 @@ def teleop(
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Build and print everything; connect to nothing.")
     ] = False,
+    log: Annotated[
+        bool,
+        typer.Option("--log/--no-log", help="Write this run to logs/<time>-teleop.log, fsynced."),
+    ] = True,
+    telemetry: Annotated[
+        bool,
+        typer.Option(
+            "--telemetry/--no-telemetry",
+            help=(
+                "Sample PSU power, the +12 V rail, CPU and GPU once a second into "
+                "logs/<time>-teleop.jsonl. ON by default: this machine has frozen "
+                "during teleoperation too, and the last line is what it was doing."
+            ),
+        ),
+    ] = True,
     assume_yes: Annotated[
         bool,
         typer.Option(
@@ -205,15 +220,38 @@ def teleop(
         )
         model_view = ModelInputProbe(None, preprocessor, features)
 
+    monitor = None
+    if log:
+        from ..logs import start as start_log
+
+        typer.echo(f"log -> {start_log('teleop')}")
+    if telemetry:
+        from datetime import datetime
+
+        from ..telemetry import DEFAULT_TELEMETRY_DIR, Telemetry
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        monitor = Telemetry(
+            DEFAULT_TELEMETRY_DIR / f"{stamp}-teleop.jsonl",
+            context={"command": "teleop", "fps": fps, "cameras": cameras, "profile": profile},
+        )
+        monitor.start()
+        typer.echo(f"telemetry -> {monitor.path} (PSU, CPU, GPU, once a second)")
+
     typer.secho("\nCtrl-C to stop. Stopping does not move the arms.\n", fg=typer.colors.GREEN)
-    run(
-        leader,
-        follower,
-        fps=fps,
-        display=display,
-        duration_s=duration_s,
-        model_view=model_view,
-    )
+    try:
+        run(
+            leader,
+            follower,
+            fps=fps,
+            display=display,
+            duration_s=duration_s,
+            model_view=model_view,
+        )
+    finally:
+        if monitor is not None:
+            monitor.stop()
+            typer.echo(f"telemetry written to {monitor.path}")
     if model_view is not None and model_view.failed:
         typer.secho(
             f"\nthe model-input view stopped after an error: {model_view.failed}",

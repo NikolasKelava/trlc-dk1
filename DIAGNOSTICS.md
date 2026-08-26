@@ -1034,3 +1034,140 @@ Three changes, all from the two numbers that were wrong above:
 
 The plain-sync path (`--no-fifo`) also had the stale-timer bug and now clears
 `_pre_ms` / `_post_ms` per tick alongside `_model_ms`.
+
+---
+
+## Recording: the crash that ate seven episodes
+
+**2026-08-26.** The machine froze during A0's eighth attempt, at about 17:58 on
+2026-08-25, with seven attempts recorded and scored. The journal for that boot
+simply stops — no OOM kill, no panic, no shutdown — so the freeze itself has no
+software cause on record. What it exposed is entirely ours to fix.
+
+### What survived, and what did not
+
+| | |
+| --- | --- |
+| `study/scores/A0.csv` | **intact.** Seven rows, written as each attempt ended |
+| the three `.mp4` streams | **intact and readable.** 24 878 frames, exactly the frame count in `info.json` |
+| `data/chunk-000/file-000.parquet` — the 14-D state and action of every frame | **unreadable.** `Parquet magic bytes not found in footer` |
+| `meta/episodes/` — the per-episode index | **absent** |
+| `images/observation.images.*/episode-000007/` | 4.6 GB of PNGs of the attempt that was in progress |
+
+Without `meta/episodes/` the dataset cannot even be opened: `LeRobotDataset`
+falls back to downloading the metadata from the Hub, and there is no such repo.
+
+### The mechanism, and it is two mechanisms
+
+**The data file.** `DatasetWriter` opens **one** `pq.ParquetWriter` and keeps it
+across episodes, appending a row group per episode. A parquet file's schema and
+row-group offsets live in the **footer**, and the footer is written by
+`close()`, which happens in `finalize()`. A process that never reaches
+`finalize` leaves a file whose bytes are all there and whose index is not.
+
+**The episode metadata.** `LeRobotDatasetMetadata` buffers episode records and
+flushes them every `metadata_buffer_size` — **ten** by default. Seven episodes
+never reached the buffer's threshold, so `meta/episodes/` was never created.
+
+### The fix, and the trap inside it
+
+`DatasetSession` now does three things, and the third is not optional:
+
+1. `update_chunk_settings(data_files_size_in_mb=0.001)` — a data file per
+   episode, because a **rotation** is what closes the previous writer;
+2. `_metadata_buffer_size = 1` — episode metadata written with its episode;
+3. `_seal()` after every commit — both parquet writers closed, so the footer is
+   on disk before the next attempt begins.
+
+The trap: **(3) without (1) destroys data.** `_save_episode_data` reopens a
+`ParquetWriter` at the *same path* when the size limit has not been reached,
+which truncates the file it was appending to. The first version of this fix did
+exactly that and lost the earlier episodes;
+`test_a_second_episode_does_not_overwrite_the_first` is that bug, kept.
+
+`update_chunk_settings` also writes the number into `info.json`, so a resumed
+directory keeps rotating per episode without being told again.
+
+Two smaller things fixed alongside: an episode that was never written leaves its
+PNG cache behind, so `open()` deletes frame directories for episodes the
+metadata does not know about; and `close()` was already committing a pending
+episode, which is what keeps a *clean* Ctrl-C from losing one.
+
+### What it costs to recover, and why we did not
+
+The videos are readable and the scores are intact, so the attempts are not
+unwitnessed. Rebuilding the parquet footer means parsing page headers by hand
+and reconstructing Thrift metadata for 13 columns across 7 row groups — hours,
+with no guarantee — to recover a per-frame stream that A0 does not need: it is a
+scored zero-shot row, not training data. The row was re-run instead, against a
+recorder that cannot lose it the same way.
+
+---
+
+## Recording: the episode that took minutes to save
+
+**2026-08-26.** Keeping an episode printed SVT-AV1's configuration banner and
+then sat there, with the arms energised and the operator waiting.
+
+LeRobot v3.0 encodes with **SVT-AV1 on the CPU** by default (`crf 30`,
+`preset 12`, GOP 2). Three 1280x720 streams at 3 550 frames is a lot of AV1.
+
+Measured here, paired, 300 frames of all three cameras, extrapolated to a real
+3 550-frame episode:
+
+| | 300 frames | per episode |
+| --- | ---: | ---: |
+| SVT-AV1, noisy frames (worst case) | 11.1 s | ~131 s |
+| `h264_nvenc`, noisy frames | 8.3 s | ~98 s |
+| SVT-AV1, compressible frames | 4.1 s | ~49 s |
+| `h264_nvenc`, compressible frames | 4.0 s | ~47 s |
+| `h264_nvenc` + `--stream-video` | 0.5 s | **~6 s** |
+
+Two readings, and the second is the one that matters:
+
+- **The codec is worth taking, and it is free.** `--vcodec auto` resolves to
+  `h264_nvenc` on this machine. One trap: **NVENC refuses a GOP below 4** —
+  `avcodec_open2(h264_nvenc)` fails outright with LeRobot's default of 2, and
+  the error surfaces as "Video encoding failed" per camera, i.e. as *no video*.
+  `dk1lab.dataset` raises the GOP to 4 for hardware encoders.
+- **The codec is not the bottleneck.** Most of the wait is LeRobot writing every
+  frame to PNG during the rollout and reading it back to encode afterwards.
+  `--stream-video` (LeRobot's `streaming_encoding`) skips the PNG entirely and
+  encodes as the arms move: keeping an episode drops to seconds, and a crash
+  leaves no loose frames.
+
+`--stream-video` is **off by default** because it is not free where it counts.
+Paced at 30 Hz, 300 ticks:
+
+| | mean tick | p95 | max |
+| --- | ---: | ---: | ---: |
+| batch (default) | 1.4 ms | 1.8 ms | 2.9 ms |
+| `--stream-video` | 4.5 ms | 4.3 ms | **215 ms** |
+
+The mean is affordable in a 33.3 ms period; the one 215 ms stall at encoder
+start-up is the kind of thing that starves the chunk queue. Turn it on
+deliberately, and read the trace afterwards.
+
+---
+
+## The cameras talking over the prompt
+
+**2026-08-26.** `Corrupt JPEG data: 11 extraneous bytes before marker 0xd7`
+appeared in the middle of the line the operator was typing at the session
+prompt.
+
+It is libjpeg, decoding the cameras' MJPG stream: the UVC firmware pads a few
+bytes before a restart marker, the decoder skips them, the frame is fine. The
+message is written to **file descriptor 2 from C** — under no Python logger, and
+past `contextlib.redirect_stderr`.
+
+Fixed by silencing fd 2 for exactly as long as the session is waiting for a
+line: `_quiet_stderr()` in `dk1lab/cli/policy_cmds.py`, around the task prompt,
+the score prompt and the keep prompt. Nothing is commanded while the operator
+types, so nothing is missed; everything printed **during** a rollout still
+reaches the terminal.
+
+What would not have been a fix: treating the message as a fault. Two lines at
+start-up is normal. What matters is the recorder reporting **dropped frames**,
+or the message repeating every tick with visibly blocky images — that is USB
+bandwidth, and a different problem.

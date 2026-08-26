@@ -70,6 +70,26 @@ logger = logging.getLogger(__name__)
 #: the Hugging Face Hub.
 DEFAULT_DATASET_DIR = Path("study")
 
+#: The video codec. ``auto`` picks a hardware encoder when one is present, which
+#: on this machine is NVENC on the 5090 — and that is the whole point: LeRobot's
+#: default is SVT-AV1 on the CPU, which took **minutes** per episode for three
+#: 1280x720 streams, all of it after the arms had stopped, with the operator
+#: waiting. DIAGNOSTICS § *The episode that took minutes to save*.
+DEFAULT_VCODEC = "auto"
+
+#: NVENC refuses a GOP below 4 — `avcodec_open2` fails outright with LeRobot's
+#: default of 2, which is how a hardware encoder turns into a silent fall back
+#: to no video at all. Four keyframes' distance still seeks cheaply.
+NVENC_MIN_GOP = 4
+
+#: What one data file may hold before the writer rotates to the next one. Tiny,
+#: deliberately: LeRobot keeps ONE parquet writer open across episodes and the
+#: footer is written only when it closes, so a crash mid-session leaves every
+#: episode already recorded unreadable — which is exactly what happened on
+#: 2026-08-25. A rotation per episode means each episode's file is closed, and
+#: therefore readable, the moment the next one starts.
+PER_EPISODE_FILE_MB = 0.001
+
 #: The codebase version this module writes. Asserted at open rather than assumed:
 #: a v2.1 directory has a different layout on disk and reading it back with a
 #: v3.0 tool is the kind of failure that is discovered a week later.
@@ -222,6 +242,8 @@ class DatasetSession:
         keys: tuple[str, ...] = ACTION_KEYS,
         camera_names: tuple[str, ...] = CAMERA_NAMES,
         image_writer_threads: int = DEFAULT_IMAGE_WRITER_THREADS,
+        vcodec: str = DEFAULT_VCODEC,
+        streaming: bool = True,
     ) -> None:
         self.root = Path(root)
         self.repo_id = repo_id or default_repo_id(self.root)
@@ -233,11 +255,18 @@ class DatasetSession:
         self.keys = tuple(keys)
         self.camera_names = tuple(camera_names)
         self.image_writer_threads = int(image_writer_threads)
+        self.vcodec = vcodec
+        self.streaming = streaming
         self.dataset: Any = None
         #: The episode that has been recorded but not yet written. At most one:
         #: a rollout is finished before the next is asked for.
         self.pending: EpisodeDataset | None = None
         self._pending_notes: dict[str, Any] = {}
+        #: Every episode that could not be written, in order. Read by the CLI,
+        #: which says so loudly: a scored row that records nothing is worthless,
+        #: and the operator has to find that out during the session rather than
+        #: the next morning.
+        self.failures: list[str] = []
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -262,8 +291,9 @@ class DatasetSession:
             camera_names=self.camera_names,
         )
         threads = self.image_writer_threads * len(self.camera_names)
+        encoder = self._encoder()
         if self._exists():
-            self.dataset = self._resume(LeRobotDataset, threads)
+            self.dataset = self._resume(LeRobotDataset, threads, encoder)
         else:
             # The parent only: LeRobotDatasetMetadata.create makes `root` itself
             # with exist_ok=False, so pre-creating it fails with EEXIST — which is
@@ -277,17 +307,111 @@ class DatasetSession:
                 features=features,
                 use_videos=self.use_videos,
                 image_writer_threads=threads,
+                rgb_encoder=encoder,
+                streaming_encoding=self.streaming,
+                # One episode's metadata, written when that episode is written.
+                # The default buffers ten and flushes in batches.
+                metadata_buffer_size=1,
             )
             logger.info("created %s dataset at %s", CODEBASE_VERSION, self.root)
         self._check_version()
+        self._make_durable()
+        self._clear_stale_frames()
         return self.dataset
+
+    def _encoder(self) -> Any:
+        """The video encoder settings, or ``None`` to take LeRobot's."""
+        if not self.use_videos:
+            return None
+        from lerobot.configs.video import RGBEncoderConfig
+
+        encoder = RGBEncoderConfig(vcodec=self.vcodec)
+        if encoder.vcodec.endswith("_nvenc") and (encoder.g or 0) < NVENC_MIN_GOP:
+            encoder = RGBEncoderConfig(vcodec=encoder.vcodec, g=NVENC_MIN_GOP)
+        logger.info("encoding video with %s (gop %s)", encoder.vcodec, encoder.g)
+        return encoder
+
+    def _make_durable(self) -> None:
+        """Arrange for every episode to be readable the moment it is written.
+
+        Three knobs, all of them working around the same thing: v3.0 keeps its
+        parquet writers open across episodes and writes the footer only on
+        ``finalize``. A dataset whose process dies — the machine froze on
+        2026-08-25, mid-session, with seven episodes recorded — is then missing
+        the footer on the data file AND the whole of ``meta/episodes/``, and
+        cannot be opened at all. The frames are there; nothing can read them.
+
+        So: one file per episode (the size limit is what triggers a rotation,
+        and a rotation is what closes the previous writer), a metadata buffer of
+        one, and :meth:`_seal` after every commit.
+        """
+        meta = getattr(self.dataset, "meta", None)
+        if meta is None:  # pragma: no cover - a fake dataset in the tests
+            return
+        try:
+            # `update_chunk_settings` is the supported way in; it also writes the
+            # number into info.json, so a session that resumes this directory
+            # rotates per episode too, without being told again.
+            meta.update_chunk_settings(data_files_size_in_mb=PER_EPISODE_FILE_MB)
+            meta._metadata_buffer_size = 1
+        except Exception as exc:  # noqa: BLE001 - a changed internal must not stop a run
+            logger.warning("could not make %s crash-durable: %s", self.root, exc)
+
+    def _seal(self) -> None:
+        """Close both parquet writers so what is on disk is a readable file.
+
+        Called after every committed episode. The next episode opens a new file
+        rather than reopening this one — that is what :meth:`_make_durable`
+        arranges, and without it reopening would truncate the file it appends to.
+        """
+        for owner, name in ((getattr(self.dataset, "writer", None), "close_writer"),
+                            (getattr(self.dataset, "meta", None), "_close_writer")):
+            close = getattr(owner, name, None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001 - the episode is already written
+                logger.warning("could not close a writer on %s: %s", self.root, exc)
+
+    def _clear_stale_frames(self) -> None:
+        """Delete the PNG cache of an episode that was never written.
+
+        A crash leaves one episode's frames — 4.6 GB, for three 720p cameras
+        over two minutes — under ``images/``, belonging to an episode the
+        metadata does not know about. Nothing will ever read them.
+        """
+        import shutil
+
+        images = self.root / "images"
+        if not images.is_dir():
+            return
+        known = self.episodes
+        for key_dir in images.iterdir():
+            for episode_dir in key_dir.iterdir() if key_dir.is_dir() else []:
+                if not episode_dir.name.startswith("episode-"):
+                    continue
+                try:
+                    index = int(episode_dir.name.removeprefix("episode-"))
+                except ValueError:  # pragma: no cover - not ours to judge
+                    continue
+                if index < known:
+                    continue
+                logger.warning("removing frames of unwritten episode %d in %s", index, key_dir)
+                shutil.rmtree(episode_dir, ignore_errors=True)
 
     def _exists(self) -> bool:
         return (self.root / "meta" / "info.json").is_file()
 
-    def _resume(self, cls: Any, threads: int) -> Any:
+    def _resume(self, cls: Any, threads: int, encoder: Any = None) -> Any:
         try:
-            dataset = cls.resume(self.repo_id, root=self.root, image_writer_threads=threads)
+            dataset = cls.resume(
+                self.repo_id,
+                root=self.root,
+                image_writer_threads=threads,
+                rgb_encoder=encoder,
+                streaming_encoding=self.streaming,
+            )
         except Exception as exc:  # noqa: BLE001 - the reason is what the operator needs
             raise DatasetError(
                 f"{self.root} already holds a dataset that could not be resumed: {exc}. "
@@ -326,12 +450,32 @@ class DatasetSession:
         try:
             self.dataset.save_episode()
         except Exception as exc:  # noqa: BLE001 - a failed encode must not raise here
-            logger.warning("could not write episode %d: %s", episode.index, exc)
+            # The whole traceback, to the log file: on 2026-08-26 this failure
+            # happened once, printed one line nobody read, and the session went
+            # on to score five more attempts that recorded nothing.
+            logger.exception("could not write episode %d", episode.index)
+            self.failures.append(f"episode {episode.index}: {type(exc).__name__}: {exc}")
+            self._recover()
             return False
         finally:
             self.pending = None
+        self._seal()
         self._write_notes(episode)
         return True
+
+    def _recover(self) -> None:
+        """Put the writer back in a state the next episode can use.
+
+        A ``save_episode`` that raises part-way leaves the episode buffer
+        populated, and the next episode's first frame then fails on a frame
+        index that does not follow — which is how one failed encode turned into
+        a session that recorded nothing at all. Clearing the buffer costs the
+        episode that already failed and saves every one after it.
+        """
+        try:
+            self.dataset.clear_episode_buffer()
+        except Exception as exc:  # noqa: BLE001 - recovery must not raise
+            logger.warning("could not clear the buffer after a failed write: %s", exc)
 
     def drop(self) -> bool:
         """Throw the pending episode away. Returns whether there was one."""

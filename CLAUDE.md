@@ -16,6 +16,12 @@ cameras) with LeRobot, and to evaluate and fine-tune the **MolmoAct2** VLA polic
 on it. Origin is `NikolasKelava/trlc-dk1`; upstream is the hardware repo and we
 want to keep pulling its updates.
 
+> **OPEN FAULT, read before running anything on the cell: the machine freezes.**
+> Two scored sessions (2026-08-25, 2026-08-26) and at least one teleoperation run
+> have taken the whole machine down — hard reset, nothing in the journal.
+> **Unresolved.** `CRASH.md` is the account and the brief. Do not record the
+> ~100 teleoperation demonstrations until it is understood.
+
 ## Hard rules
 
 - **Never open a PR, never push.** Commit locally on a branch; Nikolas publishes.
@@ -91,6 +97,8 @@ dk1lab/                 everything this fork adds; the only Python we own
   pi05.py               pi0.5: 32-D padding, renamed cameras, borrowed norm stats
   dataset.py            the LeRobot v3.0 recorder — alongside record.py, not instead
   study.py              the score sheet: scenes, attempts, the CSV  (no lerobot import)
+  logs.py               a session log file, fsynced per record       (no lerobot import)
+  telemetry.py          PSU, CPU and GPU once a second, fsynced      (no lerobot import)
   scene.py              the bimanual MuJoCo scene, generated from urdf/  (no lerobot)
   sim.py                SimRobot — the MuJoCo cell behind the real robot interface
   cli/                  Typer app; `dk1` entry point
@@ -371,6 +379,8 @@ it open, so a finger resting in a trigger gets pushed.
 | `dk1 policy home` | the home sweep alone, no model | both arms move |
 | `dk1 study photo` | one still of a scene layout | a video device, nothing else |
 | `dk1 study scores` | reads a scored row's CSV back | none — a text file |
+| `dk1 doctor watch` | samples PSU, CPU and GPU once a second | none — sysfs and nvidia-smi |
+| `dk1 doctor report` | reads the last telemetry file back | none — a text file |
 
 `dk1lab/policy.py` is the single implementation; `dk1lab/checkpoint.py` is the
 JSON-only reader behind `check`; `dk1lab/session.py` holds the loaded policy
@@ -519,8 +529,10 @@ interrupted row resumes where it stopped. Three things it must keep doing:
 video device only, no motor — and `dk1 study scores <row>` reads a row back with
 its per-scene grid. Under `--study`, `.rrd` recordings default to
 `study/rrd/<row>/`, so a scored row's recordings never mix into `recordings/`.
-**R0 was dropped on 2026-08-25**: the `optimized` configuration is not captured
-again and sits outside the comparison, so every row that runs is `common`.
+**R0 is in the study again** (dropped 2026-08-25, restored 2026-08-26): it is
+the tuned rig — crop, 1.0 rad/s — and it is what says whether the fine-tune was
+worth more than tuning the rig. It is scored but goes to `.rrd` only, never a
+dataset: its lens differs from every other row's.
 
 **`dk1lab/dataset.py`** — a LeRobot **v3.0** recorder, `--record-dataset` on both
 `run` and `session`. Alongside `record.py`, which is untouched: the `.rrd` keeps
@@ -528,6 +540,39 @@ the policy's own plan, which no dataset format has a slot for. Same four-call
 instrument shape, so `dk1lab.dataset.one()` drives both at once and the operator
 is asked **once**. One dataset per directory, episodes appended, an existing
 directory resumed.
+**A crashed session must not take its recorded episodes with it** (2026-08-26).
+LeRobot v3.0 keeps one parquet writer open across episodes and writes the footer
+on `finalize`, and buffers episode metadata ten at a time — so the freeze during
+A0 on 2026-08-25 left seven recorded episodes that nothing can open, videos
+intact, per-frame state gone. `DatasetSession` now rotates a data file per
+episode (`update_chunk_settings(data_files_size_in_mb=…)`), sets the metadata
+buffer to one, and closes both writers after every commit. Closing without the
+rotation would be worse than nothing: the next episode reopens the same path and
+truncates it — `tests/test_dataset.py` covers exactly that.
+
+**Video is encoded on the GPU.** `--vcodec auto` resolves to `h264_nvenc` here;
+LeRobot's default SVT-AV1 costs minutes per episode on the CPU. NVENC refuses
+LeRobot's GOP of 2 — `avcodec_open2` fails — so `dk1lab.dataset` raises it to 4
+for hardware encoders. `--stream-video` encodes during the rollout instead of
+from a PNG cache (keeping an episode: ~1 min -> seconds) at ~3 ms a tick plus a
+one-off stall; **off by default**.
+
+**Every run that touches the arms writes two files** (2026-08-26), because the
+machine has frozen hard three times and a terminal does not survive a reset:
+`logs/<time>-<what>.log` — `dk1lab` at DEBUG, `lerobot` at INFO, tracebacks,
+**fsynced per record** — and `logs/<time>-<what>.jsonl`, one sample a second of
+PSU power and the +12 V rail, CPU and GPU temperature and power, memory and IO
+stall, also fsynced, so the **last line is the state the machine froze in**.
+`--no-log` / `--no-telemetry` opt out. `dk1 doctor watch` runs the sampler alone;
+`dk1 doctor report` reads it back and says whether the file ends with a `stop`
+event or with the machine. `CRASH.md`.
+
+**A failed write is now loud.** On 2026-08-26 one episode's encode raised, the
+failure was a single log line, and the session scored five more attempts into a
+dataset that stayed empty. A failure now prints in red after that attempt, the
+traceback goes to the log, and the episode buffer is cleared so one bad encode
+does not poison every episode after it.
+
 **An episode is not written until it is kept.** `stop()` leaves it in the buffer;
 `keep()` calls `save_episode`, `discard()` clears it. The first version saved in
 `stop()` and had a `discard` that reported success and changed nothing —
@@ -600,6 +645,8 @@ re-measuring anything.
 | re-run the simulator, or quote the sim result | § *The sim run* |
 | run, change or quote the two-policy comparison | `STUDY.md` — the protocol, not `DIAGNOSTICS.md` |
 | wonder what a past rollout on the arms actually showed | § *The rollouts on the arms* |
+| chase the machine freezing, or add to that investigation | `CRASH.md` — the open fault, and what has already been eliminated |
+| touch the dataset recorder, the codec, or anything about saving an episode | § *Recording: the crash that ate seven episodes*, § *Recording: the episode that took minutes to save* |
 | benchmark anything | § *The 27.7 Hz loop* — a flat-out loop and a paced one disagree about the same function, and separate processes drift by more than the effect you are chasing |
 
 ## Environment

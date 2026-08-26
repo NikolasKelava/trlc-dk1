@@ -333,3 +333,76 @@ def test_one_decision_covers_every_recorder_on_the_episode():
     both.attach(None)
     both.start()
     assert both.stop().discard() is True
+
+
+# --------------------------------------------------------------------------- #
+# Surviving a crash — a REAL LeRobot dataset, not the fake one
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def real(tmp_path):
+    """A real v3.0 dataset on disk, small and image-only so it is quick."""
+    live = ds.DatasetSession(
+        tmp_path / "row", fps=30, width=8, height=6, use_videos=False,
+        camera_names=("top",),
+    )
+    live.open()
+    yield live
+    live.close()
+
+
+def test_an_episode_is_readable_before_the_session_ends(real, ctx, robot):
+    """The crash of 2026-08-25 left seven recorded episodes that nothing can open.
+
+    LeRobot keeps one parquet writer open for the whole session and writes the
+    footer on finalize, so a process that dies takes every episode with it. What
+    is asserted here is the opposite: one committed episode, and the files on
+    disk are complete — no finalize, no close.
+    """
+    import pyarrow.parquet as pq
+
+    robot.height, robot.width = 6, 8
+    report = record(real, ctx, robot, ticks=4)
+    report.keep()
+
+    data = sorted((real.root / "data").rglob("*.parquet"))
+    assert data, "no data file was written"
+    assert pq.read_table(data[-1]).num_rows == 4
+
+    episodes = sorted((real.root / "meta" / "episodes").rglob("*.parquet"))
+    assert episodes, "no episode metadata was written"
+    assert pq.read_table(episodes[-1]).num_rows == 1
+
+
+def test_a_second_episode_does_not_overwrite_the_first(real, ctx, robot):
+    """Closing a writer per episode is only safe if the next one rotates files."""
+    import pyarrow.parquet as pq
+
+    robot.height, robot.width = 6, 8
+    record(real, ctx, robot, ticks=4).keep()
+    record(real, ctx, robot, ticks=3).keep()
+
+    rows = sum(pq.read_table(p).num_rows for p in (real.root / "data").rglob("*.parquet"))
+    assert rows == 7
+    episodes = sum(
+        pq.read_table(p).num_rows for p in (real.root / "meta" / "episodes").rglob("*.parquet")
+    )
+    assert episodes == 2
+
+
+def test_the_frames_of_an_episode_that_was_never_written_are_cleared_on_open(tmp_path):
+    """A crash leaves gigabytes of PNGs belonging to an episode nothing knows about."""
+    root = tmp_path / "row"
+    live = ds.DatasetSession(root, fps=30, width=8, height=6, use_videos=False,
+                             camera_names=("top",))
+    live.open()
+    live.close()
+
+    stale = root / "images" / "observation.images.top" / "episode-000000"
+    stale.mkdir(parents=True)
+    (stale / "frame-000000.png").write_bytes(b"not really a png")
+
+    ds.DatasetSession(root, fps=30, width=8, height=6, use_videos=False,
+                      camera_names=("top",)).open()
+    assert not stale.exists()

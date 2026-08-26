@@ -1,0 +1,7 @@
+scene,attempt,episode,score,seconds,arm,note
+1,1,0,2,,left,would not grasp
+1,2,0,2,,left,no grasp
+1,3,0,3,,left,short grasp
+2,1,0,0,,right,did not move much
+2,2,0,3,,right,
+2,3,0,2,,right,

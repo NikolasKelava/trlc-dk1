@@ -297,3 +297,30 @@ def test_study_photo_opens_a_camera_and_nothing_else(runner, config_file, tmp_pa
     assert result.exit_code == 0, result.output
     assert (tmp_path / "2.jpg").is_file()
     assert grabbed["rotation"] == 180
+
+
+# --------------------------------------------------------------------------- #
+# The prompt, and the cameras talking over it
+# --------------------------------------------------------------------------- #
+
+
+def test_the_cameras_jpeg_chatter_does_not_land_in_the_typed_line(capfd):
+    """libjpeg writes to fd 2 from C, mid-word, while the operator is typing."""
+    import os
+
+    with policy_cmds._quiet_stderr():
+        os.write(2, b"Corrupt JPEG data: 11 extraneous bytes before marker 0xd7\n")
+    os.write(2, b"this one is not swallowed\n")
+
+    err = capfd.readouterr().err
+    assert "Corrupt JPEG" not in err
+    assert "not swallowed" in err
+
+
+def test_stderr_comes_back_even_if_the_prompt_raises(capfd):
+    import os
+
+    with pytest.raises(KeyboardInterrupt), policy_cmds._quiet_stderr():
+        raise KeyboardInterrupt
+    os.write(2, b"still here\n")
+    assert "still here" in capfd.readouterr().err

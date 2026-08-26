@@ -71,7 +71,7 @@ single lucky grasp from carrying a layout.
 
 Two words that are easy to confuse, so they are fixed here:
 
-- a **configuration** (or **row**) is A0 / A1 / B0 / B1 — a policy under a
+- a **configuration** (or **row**) is R0 / A0 / A1 / B0 / B1 — a policy under a
   profile, one line of the results table;
 - a **scene configuration** (**scene 1, 2, 3**) is where the dice and the bowl
   sit. The same three scenes are used by every row.
@@ -151,21 +151,21 @@ before spending nine attempts.
 
 ---
 
-## The configurations
+## The five configurations
 
 **N = 9 scored attempts each** — three scene configurations, three attempts
-apiece — one task string, 36 attempts across the four rows that will be run.
+apiece — one task string, 45 attempts across the five rows.
 
-**R0 is not one of them.** The `optimized` configuration is what this cell
-already ran before the study, and it is not being captured again: it sits
-outside the comparison rather than as its first row. Everything the study
-compares now runs under one profile — `common` — which is what the level playing
-field was for. What is lost is the price of that playing field, measured; that
-was R0's only job, and it is not worth a session on the arms.
+**R0 is back in** (2026-08-26). It is the tuned configuration this cell already
+runs — the wrist crop, the 1.0 rad/s cap — and it answers a question the other
+four cannot: *how much of what fine-tuning buys could have been had by tuning
+the rig instead?* A1 beating A0 says the LoRA worked. A1 beating **R0** says the
+LoRA was worth more than a crop and a speed cap, and that is the comparison
+worth having, because the crop is free and the fine-tune is not.
 
 | # | configuration | profile | tuning | phase |
 | --- | --- | --- | --- | --- |
-| ~~R0~~ | ~~MolmoAct2 optimized~~ | — | — | **dropped 2026-08-25** |
+| R0 | MolmoAct2 optimized | `optimized` | none — the tuned rig, frozen | 9 |
 | A0 | MolmoAct2 zero-shot | `common` | none | 2 |
 | A1 | MolmoAct2 + LoRA | `common` | LoRA | 5 |
 | B0 | π0.5 zero-shot | `common` | none | 6 |
@@ -180,11 +180,16 @@ demonstrations are what both fine-tunes need, so nothing is learned by pushing
 changes: every configuration still runs the same task from the same three scenes
 under the same profile, and B0 is still zero-shot weights.
 
-`--duration` drops from the 180 s default to **60 s**: 180 was chosen for a
-multi-object sim task, and dice-in-bowl is a single pick and place.
+`--duration` drops from the 180 s default to **120 s**, and that number is fixed
+for every scored row: 180 was chosen for a multi-object sim task, and 60 — the
+figure this protocol carried until A0 was about to start — was an estimate made
+before anyone had watched this policy attempt this task on these arms. Nikolas
+set it to 120 at the cell. What matters more than the value is that it is the
+same for all four rows; an attempt that runs out of clock is a 3 that might have
+been a 5.
 
 The action-expert-only fine-tune is an **optional extra** (see *Fine-tuning*),
-not one of the four.
+not one of the five.
 
 ---
 
@@ -245,9 +250,21 @@ scene 2" is a conclusion that nine attempts at one layout cannot reach at all.
 **LeRobot dataset v3.0** for the demonstrations and every scored rollout;
 viewable with `lerobot-dataset-viz` and the Hub's dataset viewer.
 
-Every row that is run goes under `--profile common`, so one dataset per row and
-no lens ever mixes. (This is what R0 could not have done, and one of the reasons
-it is not being captured.)
+**R0 is scored but not recorded to a dataset.** It runs under `optimized`, so
+its frames carry the wrist crop and the offset — a different lens from every
+other row's, and mixing them into one dataset would give a fine-tune two
+geometries and no way to tell them apart. It records `.rrd` instead, into
+`study/rrd/R0/`, and every one is kept: that is the visual record of the tuned
+rig, and it carries the policy's own plan, which no dataset format has a slot
+for. Every other row goes to its own LeRobot dataset under `--profile common`.
+
+**Video is encoded with the GPU** (`--vcodec auto`, NVENC here) rather than
+LeRobot's SVT-AV1 on the CPU, which spent minutes per episode with the operator
+waiting and the arms energised. Most of what is left is LeRobot writing every
+frame to PNG and reading it back to encode; `--stream-video` encodes as the arms
+move instead, which takes keeping an episode from about a minute to a few
+seconds — at about 3 ms a tick on the control loop, and one longer stall when
+the encoder starts. **Off by default: the loop is the experiment.**
 
 `dk1lab/record.py` and its `.rrd` output are unchanged and stay available behind
 `--record`, for an attempt worth diagnosing against the policy's own plan — the
@@ -395,8 +412,11 @@ ends, and appends to `study/scores/<row>.csv`.
 
 ```
 # A0 / A1 / B0 / B1 — the level playing field, recorded as a LeRobot dataset.
-dk1 policy session --study A0 --profile common --duration 60 \
+dk1 policy session --study A0 --profile common --duration 120 \
   --record-dataset --dataset-dir study/rollouts/A0
+
+# R0 — the tuned rig. Scored, and recorded as .rrd only (a different lens).
+dk1 policy session --study R0 --profile optimized --duration 120 --record
 ```
 
 Add `--record` to also write the `.rrd` with the policy's own plan, into
@@ -460,7 +480,7 @@ common`** — that is the invariant above.
 | --- | --- | --- |
 | **0** | Setup | **done 2026-08-25.** Both policies load and infer; `--profile common` exists; the LeRobot recorder writes a readable dataset; the MuJoCo scene runs |
 | **1** | Sim check — nothing recorded | **done 2026-08-25.** Both policies drove the sim arms through the unmodified pipeline at ~29.9 Hz, no starved ticks. The scene itself is poor — see *The simulator* |
-| **2** | Zero-shot on the arms — A0, N=9 (3 scenes x 3) | 9 scored attempts, one row |
+| **2** | Zero-shot on the arms — A0 then R0, N=9 each | 18 scored attempts, two rows. **Attempted twice on 2026-08-25 and 2026-08-26; both sessions ended in a machine freeze and neither left a usable dataset. Blocked on `CRASH.md`** |
 | **3** | Collect ~100 demonstrations | a LeRobot v3.0 dataset recorded under `--profile common` |
 | **4** | MolmoAct2 + LoRA — the training run | a checkpoint, its loss curve, and the run directory recorded |
 | **5** | A1 on the arms, N=9 | 9 scored attempts, one row |
@@ -478,8 +498,9 @@ clone and stays untouched. All code stays in `trlc-dk1-niko`. Fetch
 `lerobot/pi05_base`, verify with `dk1 policy check` / `smoke`. Build
 `--profile common`, the LeRobot recorder, and the MuJoCo scene.
 
-**Phase 2.** A0, one session of nine attempts: scenes 1 to 3 in order, three
-attempts apiece, scored into the CSV as they happen.
+**Phase 2.** A0 then R0, one session each of nine attempts: scenes 1 to 3 in
+order, three attempts apiece, scored into the CSV as they happen. R0 is the same
+policy on the tuned rig, so it needs no new escalation once A0 has run.
 Escalate as `CLAUDE.md` prescribes — `check`, `smoke`, `dryrun`, then `run`.
 Photograph the three layouts with `dk1 study photo --scene N` when the marks are
 set. π0.5 has never commanded these
@@ -512,6 +533,25 @@ to a claim about generalisation.
 ---
 
 ## Known risks, stated before they bite
+
+**The machine itself freezes, and that is not solved.** Twice mid-session and at
+least once during teleoperation, with nothing in the kernel log either time.
+A0 has been attempted twice and scored twice and has **no usable dataset behind
+either attempt**. `CRASH.md` is the account, the instrumentation and the plan.
+**Phase 3 — the ~100 demonstrations — must not start until it is understood**:
+those episodes cost a day of somebody's hands and a freeze in the middle of them
+loses that day.
+
+**A crashed session used to lose every episode it had recorded, and did.**
+On 2026-08-25 the machine froze during A0's eighth attempt. Seven episodes were
+on disk and none of them can be opened: LeRobot v3.0 keeps one parquet writer
+open for the whole session and writes the footer only on `finalize`, and it
+buffers per-episode metadata ten at a time. The videos survived; the per-frame
+state and action, and the whole of `meta/episodes/`, did not. **Fixed
+2026-08-26** — one data file per episode, a metadata buffer of one, and both
+writers closed after every committed episode, so what is on disk is readable
+before the next attempt starts. Do not undo that for tidiness: it is the reason
+an interrupted row can be resumed at all.
 
 **The sim scene is not usable for anything but a pipeline check.** The arms are
 on pedestals and cannot reach the table, and the bowl is a round base with square
@@ -558,3 +598,5 @@ A protocol that moves silently is not a protocol.
 | 2026-08-25 | In a scored session every recording is kept **without asking** | `keep this episode?` is one keypress away from deleting an attempt that cannot be repeated, and in a scored row a 0 is exactly as much evidence as a 5. The score prompt replaces it |
 | 2026-08-25 | The phases split: fine-tuning and scoring are separate phases (4/5 for MolmoAct2, 7/8 for π0.5), and π0.5 zero-shot gets its own phase 6 | A fine-tune that trains is not a fine-tune that works. Keeping them in one phase is how a bad checkpoint reaches the arms before anyone has read its loss curve, and it hides which half a slipped schedule is stuck in. Nothing about the rows, the task, the scenes or the rubric moves |
 | 2026-08-25 | Time-to-success is **derived from the episode**, not typed | The episode ends when the operator stops it, which is at the success; asking for a number they would read off the same clock added a prompt and a chance to mistype. A time can still be typed inline to override it |
+| 2026-08-25 | `--duration` for a scored row goes from 60 s to **120 s** | Nikolas's call, made at the cell before A0's first attempt. The 60 s was an estimate written before anyone had watched this policy attempt this task on these arms. It applies to every scored row, A0 included, so the rows stay comparable |
+| 2026-08-26 | **R0 is back in**, after being dropped the day before | It answers what the other four cannot: how much of what fine-tuning buys could have been had by tuning the rig instead. A1 against A0 says the LoRA worked; A1 against R0 says it was worth more than a crop and a speed cap |

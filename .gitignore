@@ -248,3 +248,7 @@ study/*
 !study/scores/
 !study/scene/
 !study/results.md
+
+# Session logs and machine telemetry: machine-local, and one jsonl per session
+# is a few hundred KB of numbers nobody else needs. CRASH.md says what they are.
+logs/

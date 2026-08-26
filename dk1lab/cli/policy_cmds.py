@@ -12,7 +12,10 @@ with the arms live.
 
 from __future__ import annotations
 
+import logging
+import os
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Annotated
@@ -25,7 +28,7 @@ from ..config import DEFAULT_CONFIG_PATH, load
 from ..layout import ACTION_KEYS, CAMERA_NAMES, GRIPPER_INDICES, IMAGE_KEYS
 from ..fifo import DEFAULT_BLEND_STEPS, DEFAULT_REPLAN_AT
 from ..record import DEFAULT_RECORD_DIR
-from ..dataset import DEFAULT_DATASET_DIR, one
+from ..dataset import DEFAULT_DATASET_DIR, DEFAULT_VCODEC, one
 from ..policy import DEFAULT_EXECUTION_HORIZON, DEFAULT_FPS, HOME_AT_START_POSE
 from ..runprofile import DEFAULT_PROFILE, ProfileError
 from ..study import (
@@ -44,6 +47,8 @@ from ..runprofile import resolve as resolve_profile
 from .safety import ENERGISE_HELP, MOTION_HELP, confirm_motion
 
 app = typer.Typer(no_args_is_help=True, help=__doc__)
+
+logger = logging.getLogger(__name__)
 
 ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Path to dk1.toml.")]
 CheckpointOpt = Annotated[
@@ -184,6 +189,56 @@ DatasetDirOpt = Annotated[
         ),
     ),
 ]
+LogOpt = Annotated[
+    bool,
+    typer.Option(
+        "--log/--no-log",
+        help=(
+            "Write everything this run does to logs/<time>-<what>.log, fsynced "
+            "line by line. ON by default: this machine has frozen hard twice "
+            "mid-session and the terminal does not survive a reset."
+        ),
+    ),
+]
+TelemetryOpt = Annotated[
+    bool,
+    typer.Option(
+        "--telemetry/--no-telemetry",
+        help=(
+            "Sample PSU power and the +12 V rail, CPU and GPU temperature, GPU "
+            "power and memory once a second into logs/<time>-<what>.jsonl, each "
+            "line fsynced. ON by default, for the same reason: the last line is "
+            "the state the machine was in when it stopped."
+        ),
+    ),
+]
+
+VcodecOpt = Annotated[
+    str,
+    typer.Option(
+        "--vcodec",
+        help=(
+            "Video codec for --record-dataset. `auto` (the default) takes the "
+            "hardware encoder when there is one — NVENC here — instead of "
+            "LeRobot's SVT-AV1 on the CPU, which spends minutes per episode with "
+            "the operator waiting. `libsvtav1` is the old behaviour."
+        ),
+    ),
+]
+StreamVideoOpt = Annotated[
+    bool,
+    typer.Option(
+        "--stream-video/--no-stream-video",
+        help=(
+            "Encode the cameras AS THE ARMS MOVE rather than from a cache of PNG "
+            "frames when the episode is kept. Keeping then takes seconds instead "
+            "of about a minute, and a crash leaves no gigabytes of loose frames — "
+            "but it costs the control loop about 3 ms a tick and one longer stall "
+            "when the encoder starts. OFF by default: the loop is the experiment."
+        ),
+    ),
+]
+
 WatchInputOpt = Annotated[
     bool,
     typer.Option(
@@ -819,7 +874,35 @@ def _make_recorder(enabled: bool, directory, *, task: str, notes: dict):
     )
 
 
-def _make_dataset(enabled: bool, directory, *, capture, fps: int, profile: str):
+def _start_recording_the_machine(what: str, *, log: bool, telemetry: bool, context: dict):
+    """The session log and the machine telemetry. Returns the telemetry, or None.
+
+    Both exist because of the two hard freezes — 2026-08-25 and 2026-08-26 —
+    that left nothing behind: the terminal died with the machine, and the kernel
+    journal simply stops. `CRASH.md` is what they are for.
+    """
+    if log:
+        from ..logs import start as start_log
+
+        path = start_log(what)
+        typer.echo(f"  log -> {path}")
+    if not telemetry:
+        return None
+    from ..telemetry import DEFAULT_TELEMETRY_DIR, Telemetry
+
+    from datetime import datetime
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    monitor = Telemetry(DEFAULT_TELEMETRY_DIR / f"{stamp}-{what}.jsonl", context=context)
+    monitor.start()
+    typer.echo(f"  telemetry -> {monitor.path} (PSU, CPU, GPU, once a second)")
+    return monitor
+
+
+def _make_dataset(
+    enabled: bool, directory, *, capture, fps: int, profile: str,
+    vcodec: str = DEFAULT_VCODEC, streaming: bool = False,
+):
     """A :class:`~dk1lab.dataset.DatasetSession`, or ``None``.
 
     Opened here, before anything is connected, so an unwritable directory or a
@@ -836,6 +919,8 @@ def _make_dataset(enabled: bool, directory, *, capture, fps: int, profile: str):
         fps=fps,
         width=capture.width,
         height=capture.height,
+        vcodec=vcodec,
+        streaming=streaming,
     )
     try:
         session.open()
@@ -846,6 +931,12 @@ def _make_dataset(enabled: bool, directory, *, capture, fps: int, profile: str):
     typer.echo(f"  LeRobot v3.0 -> {session.root}  ({session.repo_id})")
     typer.echo(f"  {session.episodes} episode(s) already there; this run appends")
     typer.echo(f"  frames {capture.width}x{capture.height} at {fps} Hz, profile {profile}")
+    encoder = session._encoder()
+    if encoder is not None:
+        typer.echo(
+            f"  video {encoder.vcodec}"
+            + (", encoded AS THE ARMS MOVE (--stream-video)" if streaming else ", encoded when the episode is kept")
+        )
     return session
 
 
@@ -869,7 +960,8 @@ def _keep_recording(recording, *, ask: bool = True) -> bool:
     typer.secho(recording.summary(), fg=typer.colors.GREEN)
     keep = True
     if ask and sys.stdin.isatty():
-        keep = typer.confirm("  keep this episode?", default=True)
+        with _quiet_stderr():
+            keep = typer.confirm("  keep this episode?", default=True)
     if keep:
         # An .rrd is already on disk and needs nothing; a LeRobot episode is
         # buffered until it is written, which is what lets declining one work at
@@ -1121,6 +1213,10 @@ def run(
     record_dir: RecordDirOpt = DEFAULT_RECORD_DIR,
     record_dataset: DatasetOpt = False,
     dataset_dir: DatasetDirOpt = DEFAULT_DATASET_DIR,
+    vcodec: VcodecOpt = DEFAULT_VCODEC,
+    stream_video: StreamVideoOpt = False,
+    log: LogOpt = True,
+    telemetry: TelemetryOpt = True,
     sim: SimOpt = False,
     realtime: SimRealtimeOpt = True,
     view: SimViewOpt = True,
@@ -1205,7 +1301,7 @@ def run(
 
     dataset = _make_dataset(
         record_dataset, dataset_dir, capture=settings.profile("policy"),
-        fps=cfg.fps, profile=chosen.name,
+        fps=cfg.fps, profile=chosen.name, vcodec=vcodec, streaming=stream_video,
     ) if not dry_run else None
 
     if dry_run:
@@ -1247,6 +1343,12 @@ def run(
             "a second Ctrl-C stops the sweep.\n",
             fg=typer.colors.YELLOW,
         )
+    typer.secho("\nthe machine itself", bold=True)
+    monitor = _start_recording_the_machine(
+        "run", log=log, telemetry=telemetry,
+        context={"command": "run", "profile": chosen.name, "checkpoint": spec,
+                 "task": task, "fps": cfg.fps},
+    )
     tracer = _make_trace(
         fps=cfg.fps, enabled=trace, display_policy_input=display_policy_input
     )
@@ -1261,18 +1363,22 @@ def run(
         _make_recorder(record, record_dir, task=task, notes=notes_for_recording),
         dataset.episode(task, notes=notes_for_recording) if dataset is not None else None,
     )
-    report = run_rollout(
-        cfg,
-        display=display,
-        home=home_pose,
-        invert_gripper=invert_gripper,
-        trace=tracer,
-        fifo=fifo,
-        asynchronous=asynchronous,
-        replan_at=replan_at,
-        blend=blend,
-        recorder=recorder,
-    )
+    try:
+        report = run_rollout(
+            cfg,
+            display=display,
+            home=home_pose,
+            invert_gripper=invert_gripper,
+            trace=tracer,
+            fifo=fifo,
+            asynchronous=asynchronous,
+            replan_at=replan_at,
+            blend=blend,
+            recorder=recorder,
+        )
+    finally:
+        if monitor is not None:
+            monitor.stop()
     typer.secho("\nrollout ended; the robot is disconnected.", fg=typer.colors.GREEN)
     _echo_trace_summary(tracer)
     if recorder is not None:
@@ -1387,6 +1493,10 @@ def session(
     ] = None,
     record_dataset: DatasetOpt = False,
     dataset_dir: DatasetDirOpt = DEFAULT_DATASET_DIR,
+    vcodec: VcodecOpt = DEFAULT_VCODEC,
+    stream_video: StreamVideoOpt = False,
+    log: LogOpt = True,
+    telemetry: TelemetryOpt = True,
     study: StudyOpt = None,
     scenes: ScenesOpt = DEFAULT_SCENES,
     attempts: AttemptsOpt = DEFAULT_ATTEMPTS,
@@ -1538,6 +1648,16 @@ def session(
             notes=notes,
         )
 
+    typer.secho("\nthe machine itself", bold=True)
+    monitor = _start_recording_the_machine(
+        f"session-{study}" if study else "session",
+        log=log,
+        telemetry=telemetry,
+        context={
+            "command": "session", "profile": chosen.name, "study": study,
+            "checkpoint": spec, "duration_s": duration_s, "fps": cfg.fps,
+        },
+    )
     tracer = _make_trace(fps=cfg.fps, enabled=trace, display_policy_input=display_policy_input)
     dataset = _make_dataset(
         record_dataset and not dry_run,
@@ -1545,6 +1665,8 @@ def session(
         capture=settings.profile("policy"),
         fps=cfg.fps,
         profile=chosen.name,
+        vcodec=vcodec,
+        streaming=stream_video,
     )
     live = PolicySession(
         cfg,
@@ -1574,10 +1696,20 @@ def session(
         live.set_task(task)
     typer.secho("\nready. `:help` lists the commands, `:quit` leaves.\n", fg=typer.colors.GREEN)
     try:
-        _session_loop(live, tracer, home=home_pose, study=scored)
+        _session_loop(live, tracer, home=home_pose, study=scored, monitor=monitor)
     finally:
         typer.secho("\nclosing the session...", fg=typer.colors.YELLOW)
         live.close()
+        if monitor is not None:
+            monitor.stop()
+            typer.echo(f"telemetry written to {monitor.path}")
+        if dataset is not None and dataset.failures:
+            typer.secho(
+                f"\n{len(dataset.failures)} EPISODE(S) WERE NOT WRITTEN:", fg=typer.colors.RED,
+                bold=True, err=True,
+            )
+            for line in dataset.failures:
+                typer.secho(f"  {line}", fg=typer.colors.RED, err=True)
         typer.secho(
             "disconnected. The motors are now disabled — support anything held up.",
             fg=typer.colors.GREEN,
@@ -1675,7 +1807,7 @@ def _score_attempt(scored: StudyRun, outcome) -> None:
 
     while True:
         try:
-            text = input("  score> ").strip()
+            text = _ask("  score> ").strip()
         except EOFError:
             typer.secho("\n  not scored.", fg=typer.colors.YELLOW)
             return
@@ -1738,7 +1870,38 @@ SESSION_HELP_LINES = (
 )
 
 
-def _session_loop(live, tracer, *, home=None, study=None) -> None:
+@contextmanager
+def _quiet_stderr():
+    """Silence file descriptor 2 for as long as the block runs.
+
+    The three cameras stream MJPG, and their firmware pads a few bytes before a
+    restart marker, so libjpeg prints `Corrupt JPEG data: N extraneous bytes` on
+    a good frame. It goes to fd 2 from C, under no logger and past any Python
+    redirect — and while the operator is typing at the prompt it lands in the
+    middle of the line they are typing. Nothing is commanded here and the arms
+    are idle, so there is nothing to miss; everything printed during a rollout,
+    where it matters, still goes to the terminal.
+    """
+    saved = None
+    try:
+        sys.stderr.flush()
+        saved = os.dup(2)
+        with open(os.devnull, "wb") as sink:
+            os.dup2(sink.fileno(), 2)
+        yield
+    finally:
+        if saved is not None:
+            os.dup2(saved, 2)
+            os.close(saved)
+
+
+def _ask(prompt: str) -> str:
+    """Read one line with the cameras' JPEG chatter kept off the line."""
+    with _quiet_stderr():
+        return input(prompt)
+
+
+def _session_loop(live, tracer, *, home=None, study=None, monitor=None) -> None:
     """Read a line, run an episode, print what it did. Until `:quit` or EOF.
 
     The reading is here and the deciding is in
@@ -1753,7 +1916,7 @@ def _session_loop(live, tracer, *, home=None, study=None) -> None:
         if study is not None:
             _study_banner(study)
         try:
-            line = input(_prompt(live, study))
+            line = _ask(_prompt(live, study))
         except EOFError:
             typer.echo()
             return
@@ -1819,7 +1982,7 @@ def _session_loop(live, tracer, *, home=None, study=None) -> None:
             _run_home(live)
             continue
         if command.kind == RUN:
-            _run_episode(live, tracer, command.task, home=home, study=study)
+            _run_episode(live, tracer, command.task, home=home, study=study, monitor=monitor)
 
 
 def _episode_number(live) -> int:
@@ -1850,15 +2013,22 @@ def _prompt(live, study=None) -> str:
     return f"\n[{flags}] task> "
 
 
-def _run_episode(live, tracer, task: str, *, home=None, study=None) -> None:
+def _run_episode(live, tracer, task: str, *, home=None, study=None, monitor=None) -> None:
     """One rollout, with everything it produced printed after it."""
     typer.secho(
         f"\n>>> episode {_episode_number(live)}: {task!r} — Ctrl-C stops it\n",
         fg=typer.colors.YELLOW,
     )
+    if monitor is not None:
+        # An event line in the telemetry, so a freeze can be placed against what
+        # the operator was doing: mid-rollout, encoding, or sitting at the prompt.
+        monitor.mark(event="episode_start", episode=_episode_number(live), task=task)
+    logger.info("episode %d starting: %r", _episode_number(live), task)
     try:
         outcome = live.rollout(task, home=home)
-    except Exception as exc:  # noqa: BLE001 - one bad episode must not end the session
+    except Exception:  # noqa: BLE001 - one bad episode must not end the session
+        logger.exception("episode failed")
+        exc = sys.exc_info()[1]
         typer.secho(f"\nepisode failed: {exc}", fg=typer.colors.RED, err=True)
         typer.secho(
             "the arms are still connected and energised; `:quit` to disconnect.",
@@ -1866,12 +2036,42 @@ def _run_episode(live, tracer, task: str, *, home=None, study=None) -> None:
         )
         return
     typer.secho(f"\n{outcome.summary()}", fg=typer.colors.GREEN)
+    logger.info("%s", outcome.summary())
     _echo_trace_summary(tracer)
-    _keep_recording(outcome.recording, ask=study is None)
+    written = _keep_recording(outcome.recording, ask=study is None)
+    if monitor is not None:
+        monitor.mark(event="episode_end", seconds=round(outcome.seconds, 1), kept=written)
+    _warn_if_nothing_was_written(live, outcome, written)
     if study is not None:
         _score_attempt(study, outcome)
     if outcome.home is not None:
         _echo_home_report(outcome.home)
+
+
+def _warn_if_nothing_was_written(live, outcome, written: bool) -> None:
+    """Say it in red, immediately, when an attempt produced no file.
+
+    On 2026-08-26 a scored session recorded nothing at all: the first episode's
+    video encode failed, the failure was one log line among many, and five more
+    attempts were run and scored against a dataset that stayed empty. The
+    operator has to learn this while the arms are still warm.
+    """
+    dataset = getattr(live, "dataset", None)
+    failures = list(getattr(dataset, "failures", ()) or ())
+    if written and not failures:
+        return
+    if outcome.recording is None and not live.record and not live.record_dataset:
+        return  # nothing was asked for; nothing missing
+    typer.secho(
+        "\n  !! THIS ATTEMPT WAS NOT WRITTEN. The score will have no frames behind it.",
+        fg=typer.colors.RED, bold=True, err=True,
+    )
+    if failures:
+        typer.secho(f"  !! {failures[-1]}", fg=typer.colors.RED, err=True)
+    typer.secho(
+        "  !! the log file has the traceback. Stop and fix this before scoring more.",
+        fg=typer.colors.RED, err=True,
+    )
 
 
 def _run_home(live) -> None:
