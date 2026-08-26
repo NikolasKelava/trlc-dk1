@@ -18,19 +18,24 @@ is evidence, so nothing gets re-measured.
 You are picking up an unsolved hard-freeze on the machine that runs this cell.
 Read `CLAUDE.md` for the project, then this file. Then:
 
-1. **Do not run anything that moves the arms without asking Nikolas.** The
+1. **First message of the session: ask Nikolas to enable the kernel traces**
+   in § *Make it leave a trace* — Magic SysRq above all. They need `sudo`, they
+   are his to run, and he has asked to be prompted. Without SysRq the next
+   freeze answers nothing; with it, one keystroke says whether the kernel was
+   still alive.
+2. **Do not run anything that moves the arms without asking Nikolas.** The
    investigation below is designed so that most of it needs no motor at all.
-2. **Work by elimination, cheapest first** (§ *The plan*). The point is to find
+3. **Work by elimination, cheapest first** (§ *The plan*). The point is to find
    which subsystem is involved — GPU, USB cameras, CAN adapters, or none of
    them — not to guess at a fix.
-3. **Make the next freeze leave evidence** before provoking one (§ *Make it
+4. **Make the next freeze leave evidence** before provoking one (§ *Make it
    leave a trace*). Everything in that section except `sysrq` and `kdump` is
    already implemented and on by default; the kernel-side parts need `sudo` and
    are Nikolas's to run — hand him the commands.
-4. When a run does freeze, the first thing to read is
+5. When a run does freeze, the first thing to read is
    `uv run dk1 doctor report`, which prints the last second the machine was
    alive, followed by `journalctl -b -1 -k -n 200`.
-5. Write what you find **into this file**, dated, including the hypotheses that
+6. Write what you find **into this file**, dated, including the hypotheses that
    turned out wrong. Half of the value here is not re-testing them.
 
 Two things Nikolas suspects and neither is ruled out: **something in LeRobot**,
@@ -51,7 +56,8 @@ way to answer it is to run each of them without the others.
 | --- | --- | --- |
 | 2026-08-25 ~17:58 | `dk1 policy session --study A0`, 8th attempt, dataset recording, SVT-AV1 on the CPU | machine dead, hard reset |
 | 2026-08-26 ~11:23 | `dk1 policy session --study A0`, scene 3 attempt 1, dataset recording, NVENC | machine dead, hard reset |
-| earlier, once or twice | `dk1 teleop`, "after a few minutes" | machine dead |
+| earlier, once or twice | `dk1 teleop`, "after a few minutes", **Rerun viewer open** | machine dead |
+| 2026-08-26 | `dk1 teleop`, **no Rerun** | ran fine |
 
 The teleoperation cases matter more than their number suggests: **teleop loads no
 model and uses no CUDA**. If the freeze happens there too, the GPU compute path
@@ -59,6 +65,45 @@ is not necessary for it — cameras, CAN and the desktop are what the two
 workloads share. (Confirm this: was `--cameras` on? Nikolas, if you remember
 whether the teleop freezes had cameras attached, say so — it splits the search
 in half.)
+
+### What it looked like, and what that rules out (2026-08-26, from Nikolas)
+
+**The fans kept spinning. The screen updated once more — one warning line — and
+then nothing: mouse and keyboard moved nothing, and only the reset button
+worked.**
+
+That is not a power cut. Power was still being delivered and the machine was
+still executing something long enough to paint a line of text. It is the
+signature of a **GPU / display-driver wedge**: the last thing the console
+manages to print, then a desktop that never repaints. Whether the *kernel* was
+also dead is the next question, and Magic SysRq answers it — if Alt+SysRq+b
+reboots the machine, the kernel was alive and it was the GPU stack; if nothing
+happens at all, the kernel itself was gone.
+
+So: **the PSU theory is demoted** (keep the +12 V column, it is free, but stop
+leading with it) and **the GPU driver is promoted**.
+
+### Rerun was open, and a teleop run without it survived
+
+Nikolas ran teleoperation again on 2026-08-26 and **could not reproduce the
+crash** — and remembers that when teleop *did* freeze, **the Rerun viewer was
+open**.
+
+That matters because Rerun is a second, independent consumer of the same GPU: it
+renders through wgpu/Vulkan while CUDA and NVENC are in use, on a Plasma/KDE X11
+desktop. Teleoperation loads no model and touches no CUDA, so **Rerun is the
+only GPU load in the teleop case** — which is exactly the common factor the
+earlier reasoning was missing.
+
+Open question, and it decides where to look next: **was a Rerun window open
+during the two `dk1 policy session` crashes?** Neither session was started with
+`--display` or `--record`, so nothing in the run opened one — but a viewer left
+over from an earlier run would still have been holding a GPU context. Ask
+Nikolas before assuming either way.
+
+Until it is understood: **do not run `--display` or `--display-policy-input` on
+the cell**, and close any Rerun window before a session. That is a precaution,
+not a finding.
 
 ### What the logs say: nothing, and that is a finding
 
@@ -75,11 +120,10 @@ with no shutdown records after it. Checked and absent:
 average, memory 8%, IO 106 MB/s while the PNG cache was being written and near
 zero in the last interval.
 
-A journal that ends mid-line means the kernel never got to write anything —
-consistent with a **hard hang** (interrupts dead, or a CPU lock-up with no
-watchdog) or with **power being cut** (PSU protection tripping). Those two are
-distinguished by whether the machine's fans keep spinning; ask Nikolas, he
-watched it happen twice.
+A journal that ends mid-line means the kernel never got to write anything to
+disk. Combined with what Nikolas saw — fans still running, one last line painted
+— the reading is a **hard hang** rather than a power loss: something kept the
+kernel from ever reaching the journal again.
 
 ### The rig, for whoever is reading this cold
 
@@ -142,6 +186,13 @@ of the suspects: GPU compute, NVENC, the three cameras, the CAN adapters, the
 desktop. Run each until it either freezes or has survived comfortably longer than
 the ~20 minutes both real freezes took.
 
+0. **Rerun alone.** The newest lead and the cheapest test: open the Rerun viewer
+   and drive it — `dk1 teleop --display` needs the arms, but `dk1 policy run
+   --sim --display` does not, and neither does replaying one of the `.rrd` files
+   in `recordings/`. Leave it rendering for half an hour with
+   `dk1 doctor watch --label rerun`. *If this freezes, it is the GPU stack under
+   two consumers, and the answer may be as simple as never running the viewer
+   on this machine during a session.*
 1. **Cameras alone, no arms, no GPU.** Three 720p MJPG streams, read at 30 Hz,
    for an hour. `dk1 teleop --dry-run` will not do it; write a small script that
    opens the three `CroppedOpenCVCamera`s and reads them, or run
@@ -158,12 +209,28 @@ the ~20 minutes both real freezes took.
 5. **Only then the whole thing**, with the telemetry running, and read
    `dk1 doctor report` afterwards whatever happens.
 
+6. **A short row, to prove the recorder end to end on the real cell.** Before
+   another nine-attempt session, run **three** attempts and confirm they are on
+   disk and readable — `--duration 60`, `--attempts 1` so the three scenes make
+   three attempts, into a throwaway directory:
+
+   ```
+   dk1 policy session --study TEST --attempts 1 --profile common --duration 60 \
+     --record-dataset --dataset-dir study/rollouts/TEST --vcodec libsvtav1
+   ```
+
+   Then `uv run dk1 doctor report` and check the dataset opens:
+   `python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset as D; d=D.resume('dk1/test', root='study/rollouts/TEST'); print(d.num_episodes, d.num_frames)"`.
+   `--vcodec libsvtav1` is deliberate for this one: slow, and the only encoder
+   that has ever produced readable video on this cell.
+
 Cheap mitigations worth trying *as diagnostics*, one at a time:
 
-- **Cap the GPU:** `sudo nvidia-smi -pl 400`. The 5090's transient spikes are a
-  known cause of PSU protection trips on otherwise adequate supplies. If capping
-  makes the freezes stop, the answer is power, and the fix is a cable/PSU matter
-  rather than a software one.
+- **Keep Rerun shut.** No `--display`, no viewer window, for a whole session.
+  Given the teleop evidence this is the first thing to try and costs nothing.
+- **Cap the GPU:** `sudo nvidia-smi -pl 400`. Demoted by the fans-still-spinning
+  observation, but still cheap: if capping makes the freezes stop, the answer is
+  power after all.
 - **Disable USB autosuspend** for the camera hub, in case a suspend/resume race
   in `uvcvideo` is involved: `sudo sysctl -w kernel.printk=7` and check
   `/sys/bus/usb/devices/*/power/control`.
@@ -176,7 +243,8 @@ Things to *record* while doing all this: how long each ran, and what
 
 | date | experiment | duration | outcome |
 | --- | --- | --- | --- |
-| | | | |
+| 2026-08-26 | teleoperation, **no Rerun open** | "a few minutes" | no freeze. Duration not recorded — repeat it with `dk1 doctor watch` running and note the time |
+| 2026-08-26 | 3 episodes through the recorder, three 1280x720 cameras, NVENC, **10 GB held on the GPU** by torch to imitate a resident policy | 300 frames each | **saved clean**: 900 frames readable, 3 episodes in the metadata, no leftover frames, no failures. So the encode failure needs something this does not have — real cameras, a real inference load, or 120 s episodes |
 
 ---
 
@@ -243,6 +311,10 @@ Do not spend time on these again without a reason:
   side of the first crash is fixed and tested (`DIAGNOSTICS.md` § *Recording: the
   crash that ate seven episodes*).
 - **The codec settings.** The exact failing encode succeeds when re-run.
+- **A power cut / PSU shutdown**, as the *whole* story: the fans kept running
+  and the screen painted one more line. Something was still executing.
+- **The dataset recorder as a cause of the freeze** — three episodes with NVENC
+  and 10 GB of CUDA resident save cleanly (see the table).
 - **CPU thermal throttling**, as far as ten-minute `sar` averages can say: 4–8%
   average CPU. Not conclusive at one-second resolution, which is why the
   telemetry now exists.
