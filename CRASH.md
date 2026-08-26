@@ -42,29 +42,61 @@ Two things Nikolas suspects and neither is ruled out: **something in LeRobot**,
 and **a thread we share with the desktop (Plasma/KDE)**. Take both seriously,
 but note the shape of the problem: ordinary user-space code — Python threads,
 CPU load, a busy GUI — cannot normally take a Linux machine down. What can is a
-*kernel driver*, and this workload leans on three of them at once: `nvidia`
-(CUDA and NVENC), `uvcvideo` (three 1280x720 MJPG streams on one controller),
-and the USB-CAN adapters. A user-space bug that *triggers* a driver bug looks
-exactly like this. So the question to answer first is **which driver**, and the
-way to answer it is to run each of them without the others.
+*kernel driver*, and this workload leans on three at once: `nvidia`, `uvcvideo`
+(three 1280x720 MJPG streams), and the USB-CAN adapters — the last two on one
+xHCI controller. A user-space bug that *triggers* a driver bug looks exactly
+like this. The question to answer first is **which driver**, and the way to
+answer it is to run each without the others.
+
+**And ask rather than infer.** This file has already had to be corrected once
+because a session guessed at which conditions a crash happened under instead of
+asking Nikolas. He is at the machine and he remembers; the table above is only
+worth as much as its accuracy.
 
 ---
 
 ## What happened
 
-| when | what was running | how it ended |
-| --- | --- | --- |
-| 2026-08-25 ~17:58 | `dk1 policy session --study A0`, 8th attempt, dataset recording, SVT-AV1 on the CPU | machine dead, hard reset |
-| 2026-08-26 ~11:23 | `dk1 policy session --study A0`, scene 3 attempt 1, dataset recording, NVENC | machine dead, hard reset |
-| earlier, once or twice | `dk1 teleop`, "after a few minutes", **Rerun viewer open** | machine dead |
-| 2026-08-26 | `dk1 teleop`, **no Rerun** | ran fine |
+| when | what was running | Rerun | model / CUDA | how it ended |
+| --- | --- | --- | --- | --- |
+| 2026-08-25 ~17:58 | `dk1 policy session --study A0`, 8th attempt, dataset recording, SVT-AV1 on the CPU | **no** | yes | machine dead, hard reset |
+| 2026-08-26 ~11:23 | `dk1 policy session --study A0`, scene 3 attempt 1, dataset recording, NVENC | **no** | yes | machine dead, hard reset |
+| earlier, once or twice | `dk1 teleop`, "after a few minutes" | **yes** | no | machine dead |
+| 2026-08-26 | `dk1 teleop` with the Rerun viewer open | **yes** | no | froze within a few minutes: teleoperation never worked at all, everything down, the display showing a stale image |
 
-The teleoperation cases matter more than their number suggests: **teleop loads no
-model and uses no CUDA**. If the freeze happens there too, the GPU compute path
-is not necessary for it — cameras, CAN and the desktop are what the two
-workloads share. (Confirm this: was `--cameras` on? Nikolas, if you remember
-whether the teleop freezes had cameras attached, say so — it splits the search
-in half.)
+**Roughly twenty minutes into a session; a few minutes into teleoperation.**
+The teleop case is the cheaper reproducer of the two, and it is the one to use —
+once it can be reproduced without energising anything (see § *The plan*).
+
+### What is common to all four, and what is not
+
+This is the part to reason from, and an earlier version of this file got it
+wrong by guessing instead of asking.
+
+| | in the session crashes | in the teleop crashes | common? |
+| --- | --- | --- | --- |
+| the three USB cameras streaming 1280x720 MJPG | yes | yes (teleop attaches them by default) | **yes** |
+| the four USB-CAN adapters, arms energised | yes | yes | **yes** |
+| one xHCI controller carrying both | yes | yes | **yes** |
+| Plasma/KDE on X11, kernel 7.0.0-30, nvidia 580.173.02 | yes | yes | **yes** |
+| the Rerun viewer (wgpu/Vulkan) | **no** | yes | no |
+| CUDA, MolmoAct2 resident, NVENC | yes | **no** | no |
+| the dataset recorder, PNG cache, video encoding | yes | **no** | no |
+
+So **neither GPU consumer is common** — the sessions had CUDA and no Rerun, the
+teleop runs had Rerun and no CUDA. Either the GPU is involved through something
+both share (the display stack itself, the driver, the card), or it is not
+involved at all and the common factor is elsewhere. What *is* common to every
+freeze: **the USB tree** — three 720p MJPG streams and four CDC-ACM CAN adapters
+on one xHCI controller — **the desktop**, and **this kernel and driver pair**.
+
+A detail that points the same way: the cameras produce a steady trickle of
+`Corrupt JPEG data: N extraneous bytes before marker 0xd7`. That is benign in
+itself, and it also means the USB video stream is *marginal* rather than clean.
+
+**Ask Nikolas before building on this:** were the cameras attached in the teleop
+runs that froze (`--cameras` is on by default, so probably yes — but "probably"
+is what produced the last wrong turn in this file)?
 
 ### What it looked like, and what that rules out (2026-08-26, from Nikolas)
 
@@ -83,27 +115,24 @@ happens at all, the kernel itself was gone.
 So: **the PSU theory is demoted** (keep the +12 V column, it is free, but stop
 leading with it) and **the GPU driver is promoted**.
 
-### Rerun was open, and a teleop run without it survived
+### The USB tree, as it is wired today
 
-Nikolas ran teleoperation again on 2026-08-26 and **could not reproduce the
-crash** — and remembers that when teleop *did* freeze, **the Rerun viewer was
-open**.
+```
+Bus 002 (xhci, 5 Gbps)              Bus 001 (xhci, 480M/12M)
+  hub  -> camera, camera              hub -> CAN adapter, CAN adapter
+  hub  -> camera                      hub -> CAN adapter, CAN adapter
+```
 
-That matters because Rerun is a second, independent consumer of the same GPU: it
-renders through wgpu/Vulkan while CUDA and NVENC are in use, on a Plasma/KDE X11
-desktop. Teleoperation loads no model and touches no CUDA, so **Rerun is the
-only GPU load in the teleop case** — which is exactly the common factor the
-earlier reasoning was missing.
+Three Innomaker U30CAM (`0bda:5883`) behind two USB-3 hubs on bus 2; four
+CDC-ACM adapters (`1a86:55d3` leaders, `2e88:4603` followers) behind two hubs on
+bus 1. Both root hubs belong to the same xHCI controller. Every freeze so far
+had all seven devices active.
 
-Open question, and it decides where to look next: **was a Rerun window open
-during the two `dk1 policy session` crashes?** Neither session was started with
-`--display` or `--record`, so nothing in the run opened one — but a viewer left
-over from an earlier run would still have been holding a GPU context. Ask
-Nikolas before assuming either way.
-
-Until it is understood: **do not run `--display` or `--display-policy-input` on
-the cell**, and close any Rerun window before a session. That is a precaution,
-not a finding.
+Worth trying as a diagnostic, in this order: **cameras on a different
+controller** (a PCIe USB card, or the rear ports if these are front-panel),
+**cameras at 640x360** instead of 720p (a quarter of the bandwidth — it is
+`[capture.policy]` in `dk1.toml`, and it changes what the policy sees, so it is
+a test and not a setting to leave), and **USB autosuspend off**.
 
 ### What the logs say: nothing, and that is a finding
 
@@ -181,53 +210,53 @@ nvidia-smi --query-gpu=timestamp,temperature.gpu,power.draw,clocks.sm,utilizatio
 
 ## The plan
 
-Ordered so the cheap, no-motor experiments come first. Each step is a *bisection*
-of the suspects: GPU compute, NVENC, the three cameras, the CAN adapters, the
-desktop. Run each until it either freezes or has survived comfortably longer than
-the ~20 minutes both real freezes took.
+Ordered so the cheap, no-motor experiments come first, and led by what every
+freeze had in common rather than by what any one of them had. Each step is a
+*bisection*: the cameras, the display stack, GPU compute, NVENC, the CAN
+adapters.
 
-0. **Rerun alone.** The newest lead and the cheapest test: open the Rerun viewer
-   and drive it — `dk1 teleop --display` needs the arms, but `dk1 policy run
-   --sim --display` does not, and neither does replaying one of the `.rrd` files
-   in `recordings/`. Leave it rendering for half an hour with
-   `dk1 doctor watch --label rerun`. *If this freezes, it is the GPU stack under
-   two consumers, and the answer may be as simple as never running the viewer
-   on this machine during a session.*
-1. **Cameras alone, no arms, no GPU.** Three 720p MJPG streams, read at 30 Hz,
-   for an hour. `dk1 teleop --dry-run` will not do it; write a small script that
-   opens the three `CroppedOpenCVCamera`s and reads them, or run
-   `dk1 study photo` in a loop. Watch with `dk1 doctor watch --label cameras`.
-   *If this freezes, it is `uvcvideo`/`xhci` and nothing to do with the policy.*
-2. **The GPU alone.** `dk1 policy smoke --steps 500` in a loop, or the sim
-   (`dk1 policy run --sim --no-view --duration 600`): full inference, no camera,
-   no motor. *If this freezes, it is CUDA/NVENC or power.*
-3. **NVENC alone.** Encode the leftover PNG cache repeatedly
-   (`study/rollouts/A0-crashed/images/...`) with `h264_nvenc`. Ten minutes of
-   that is far more NVENC than a session does.
-4. **CAN alone.** Arms connected, energised, nothing commanded — this needs
-   Nikolas's permission and his hand on the e-stop.
-5. **Only then the whole thing**, with the telemetry running, and read
-   `dk1 doctor report` afterwards whatever happens.
+Every step below runs until it either freezes or has survived **comfortably
+longer than the workload it stands in for** — half an hour for a teleop
+substitute, an hour for a session substitute. Run `dk1 doctor watch --label
+<step>` alongside each one, in a second terminal, and read
+`dk1 doctor report` afterwards either way.
 
-6. **A short row, to prove the recorder end to end on the real cell.** Before
-   another nine-attempt session, run **three** attempts and confirm they are on
-   disk and readable — `--duration 60`, `--attempts 1` so the three scenes make
-   three attempts, into a throwaway directory:
+1. **The cameras, alone, with Rerun.** The safest thing that resembles the
+   fastest reproducer: three 720p MJPG streams read at 30 Hz and logged to a
+   Rerun viewer, with **no arms, no model, no CUDA**. If teleop-with-Rerun
+   freezes in minutes and this does too, the arms are out of it and the
+   reproducer costs nothing to run again. Write it as a small script against
+   `dk1lab.crop.CroppedOpenCVCamera` and `rr.log`; do not use `dk1 teleop`,
+   which needs the arms.
+2. **The cameras, alone, without Rerun.** Same script, no viewer. This is the
+   one that separates "USB video" from "USB video plus the display stack".
+3. **The cameras at 640x360**, if either of the above freezes: a quarter of the
+   USB bandwidth, same code path.
+4. **The GPU alone.** `dk1 policy run --sim --no-view --duration 1800`: full
+   inference at 30 Hz, no camera, no motor, no viewer.
+5. **NVENC alone.** Encode the leftover PNG cache in
+   `study/rollouts/A0-crashed/images/` in a loop with `h264_nvenc` — far more
+   NVENC in ten minutes than a session does in an hour.
+6. **The CAN adapters alone.** Arms connected and energised, nothing commanded.
+   **Needs Nikolas's permission and his hand near the e-stop.**
+7. **Teleoperation with Rerun**, the known reproducer, only if 1–6 all survive.
+8. **A short row on the real cell**, to prove the recorder end to end before
+   another nine-attempt session — three attempts, one per scene:
 
    ```
    dk1 policy session --study TEST --attempts 1 --profile common --duration 60 \
      --record-dataset --dataset-dir study/rollouts/TEST --vcodec libsvtav1
    ```
 
-   Then `uv run dk1 doctor report` and check the dataset opens:
+   Then `dk1 doctor report`, and check the dataset opens:
    `python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset as D; d=D.resume('dk1/test', root='study/rollouts/TEST'); print(d.num_episodes, d.num_frames)"`.
-   `--vcodec libsvtav1` is deliberate for this one: slow, and the only encoder
-   that has ever produced readable video on this cell.
+   `--vcodec libsvtav1` is deliberate here: slow, and the only encoder that has
+   ever produced readable video on this cell.
 
 Cheap mitigations worth trying *as diagnostics*, one at a time:
 
-- **Keep Rerun shut.** No `--display`, no viewer window, for a whole session.
-  Given the teleop evidence this is the first thing to try and costs nothing.
+- **Move the cameras to another USB controller**, or cut them to 640x360. The
+  USB tree is the one thing every freeze has in common.
 - **Cap the GPU:** `sudo nvidia-smi -pl 400`. Demoted by the fans-still-spinning
   observation, but still cheap: if capping makes the freezes stop, the answer is
   power after all.
@@ -243,7 +272,7 @@ Things to *record* while doing all this: how long each ran, and what
 
 | date | experiment | duration | outcome |
 | --- | --- | --- | --- |
-| 2026-08-26 | teleoperation, **no Rerun open** | "a few minutes" | no freeze. Duration not recorded — repeat it with `dk1 doctor watch` running and note the time |
+| 2026-08-26 | teleoperation **with the Rerun viewer open** | a few minutes | **froze.** Teleoperation never worked at all; everything down, display stale. The fastest known reproducer |
 | 2026-08-26 | 3 episodes through the recorder, three 1280x720 cameras, NVENC, **10 GB held on the GPU** by torch to imitate a resident policy | 300 frames each | **saved clean**: 900 frames readable, 3 episodes in the metadata, no leftover frames, no failures. So the encode failure needs something this does not have — real cameras, a real inference load, or 120 s episodes |
 
 ---
