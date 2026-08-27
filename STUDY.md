@@ -210,9 +210,10 @@ credit is what stops a table of zeros from being uninformative.
 Also per attempt: the scene configuration, the attempt number within it, time to
 success, **which arm was used**, and a one-line failure note. That arm column is
 not bookkeeping — `CLAUDE.md` carries an unexplained
-observation that *the right arm was reported not to pick anything up*, and this
-is the first thing that will produce enough labelled attempts to confirm or kill
-it. If both policies favour the left arm, that is a finding about the cell.
+observation that *the right arm was reported not to pick anything up* — since
+walked back, the arm has been seen picking things up (2026-08-27), which points
+at the policy on the day rather than the cell. This is still the first thing
+that will produce enough labelled attempts to confirm or kill it. If both policies favour the left arm, that is a finding about the cell.
 
 Written to `study/scores/<config>.csv` **during** the session, not reconstructed
 afterwards. One row per attempt, nine rows per file, in the order they were

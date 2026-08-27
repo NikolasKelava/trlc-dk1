@@ -319,7 +319,11 @@ What is not:
 
 - a **score** — labelled attempts with a success count, which is the input to
   the Phase 4 decision;
-- why **the right arm was reported not to pick anything up**;
+- why **the right arm was reported not to pick anything up** — and note that
+  it has since been seen picking things up (Nikolas, 2026-08-27), so the
+  original observation was most likely the policy behaving oddly on the day
+  rather than anything about that arm. Still unscored either way; the CSV's
+  `arm` column is what will settle it;
 - anything about the crop retune (inset 6, view lifted 40) or the 1280×720
   capture beyond "it ran".
 
@@ -396,7 +400,9 @@ image keys pinned, `inference_action_mode = continuous`, bf16 on cuda,
 
 **What remains for this phase is a score.** The next run is not a debugging run:
 it is labelled attempts with a success count. One thing still unexplained to
-watch while scoring: **the right arm was reported not to pick anything up**.
+watch while scoring: **the right arm was reported not to pick anything up** —
+though it has picked things up since (2026-08-27), which points at the policy
+on the day rather than the arm. The `arm` column is what settles it.
 
 **Phase 4** — record → LoRA from the same checkpoint → deploy → scored,
 labelled eval attempts.
@@ -556,12 +562,36 @@ buffer to one, and closes both writers after every commit. Closing without the
 rotation would be worse than nothing: the next episode reopens the same path and
 truncates it — `tests/test_dataset.py` covers exactly that.
 
-**Video is encoded on the GPU.** `--vcodec auto` resolves to `h264_nvenc` here;
-LeRobot's default SVT-AV1 costs minutes per episode on the CPU. NVENC refuses
-LeRobot's GOP of 2 — `avcodec_open2` fails — so `dk1lab.dataset` raises it to 4
-for hardware encoders. `--stream-video` encodes during the rollout instead of
-from a PNG cache (keeping an episode: ~1 min -> seconds) at ~3 ms a tick plus a
-one-off stall; **off by default**.
+**Video is encoded on the GPU, and never behind a fork** (the fork added
+2026-08-27). `--vcodec auto` resolves to `h264_nvenc` here; LeRobot's default
+SVT-AV1 costs minutes per episode on the CPU. Two things about NVENC, and both
+present as `avcodec_open2` failing with a bare `UNKNOWN`, i.e. as *no video*:
+it refuses LeRobot's GOP of 2, so `dk1lab.dataset` raises it to 4; and **it
+cannot start in a forked child**, because a CUDA context does not survive a
+fork and the policy holds one. LeRobot encodes the three cameras in a
+`ProcessPoolExecutor`, so `_parallel_encoding()` returns false for a GPU codec
+and the streams are encoded serially, in-process. It costs about a third more
+wall clock and the parallelism was never worth much — the wait is the PNG
+staging, not the encode. **Judge the *resolved* codec, never `self.vcodec`:**
+the default is `auto`, which is not a hardware encoder by name and would fork
+anyway. A CPU codec still forks. § *Recording: the encode that could not fork*.
+**Keeping an episode is slow, and that is the accepted price.** It was measured
+at **4 min 25 s** on A0's first 120 s attempt, with the arms energised and the
+operator waiting. It is not the codec — it is writing every frame to PNG and
+reading it back, about half the wait each; NVENC itself is a second of it.
+
+`--stream-video` skips the cache and encodes as the arms move, taking the save
+to seconds — and it is **OFF by default and stays off for anything scored**.
+Tried on the arms 2026-08-27 and reverted the same day at Nikolas's call: the
+bench said ~5 ms of a 33 ms tick, the cell said a **984 ms worst tick, six
+starved ticks and 29.2 Hz**. The queue running dry means the arms held their
+last target instead of executing a new one, which is a worse attempt, and a
+worse attempt costs more than a wait. **The loop is the experiment.**
+**The mode is recorded per episode in `dk1_notes.jsonl`** — it is the one
+recording setting that changes the control loop. Batch encoding costs the loop
+essentially nothing (0.12 ms a tick, 0.7 ms worst, measured paired), because the
+PNG writing is on the image-writer threads. § *Recording: four minutes to keep
+one episode*.
 
 **Every run that touches the arms writes two files** (2026-08-26), written while
 the machine was still freezing hard and a terminal could not survive the reset.
@@ -575,11 +605,29 @@ stall, also fsynced, so the **last line is the state the machine froze in**.
 `dk1 doctor report` reads it back and says whether the file ends with a `stop`
 event or with the machine. `docs/CRASH.md`.
 
+**Opening the log lowers the *root* logger, so it owns the console too.** The
+file handler filters, but `lerobot` leaves a bare `StreamHandler` on root at
+import time (`import_utils` calls module-level `logging.debug`, which calls
+`basicConfig`), and dropping root to DEBUG made that handler print every
+library's DEBUG — thousands of `PIL.PngImagePlugin` lines over the operator's
+screen. `logs.start` now applies the same policy to handlers it did not attach,
+at `CONSOLE_LEVEL` (INFO). Never lower the root level without taming them.
+
+**Prompts are written to stdout, never handed to `input()`.** `input()` puts its
+prompt on **fd 2**, and `_quiet_stderr` points fd 2 at `/dev/null` while the
+operator types so the cameras' libjpeg chatter cannot land in the typed line —
+so passing the prompt through deleted it. That silently removed the session's
+`task>` line (which names the live scene and attempt), `score>`, and
+`keep this episode?`. `_ask` writes the prompt itself; `_confirm` replaces
+`typer.confirm` for the same reason. § *The session console*.
+
 **A failed write is now loud.** On 2026-08-26 one episode's encode raised, the
 failure was a single log line, and the session scored five more attempts into a
 dataset that stayed empty. A failure now prints in red after that attempt, the
 traceback goes to the log, and the episode buffer is cleared so one bad encode
-does not poison every episode after it.
+does not poison every episode after it. That episode was the fork bug above,
+found for certain when it took A0's first attempt on 2026-08-27; the loudness is
+what caught it the second time.
 
 **An episode is not written until it is kept.** `stop()` leaves it in the buffer;
 `keep()` calls `save_episode`, `discard()` clears it. The first version saved in
@@ -654,7 +702,8 @@ re-measuring anything.
 | run, change or quote the two-policy comparison | `STUDY.md` — the protocol, not `docs/DIAGNOSTICS.md` |
 | wonder what a past rollout on the arms actually showed | § *The rollouts on the arms* |
 | chase a machine freeze, if one ever returns | `docs/CRASH.md` § *How it was found* — closed 2026-08-27, a BIOS update. Do not re-run the investigation from the top |
-| touch the dataset recorder, the codec, or anything about saving an episode | § *Recording: the crash that ate seven episodes*, § *Recording: the episode that took minutes to save* |
+| touch the dataset recorder, the codec, or anything about saving an episode | § *Recording: the crash that ate seven episodes*, § *Recording: the episode that took minutes to save*, § *Recording: the encode that could not fork*, § *Recording: four minutes to keep one episode* |
+| touch the session log, the console output, or any prompt the operator types at | § *The session console: a silenced prompt and a shouted decoder* |
 | benchmark anything | § *The 27.7 Hz loop* — a flat-out loop and a paced one disagree about the same function, and separate processes drift by more than the effect you are chasing |
 
 ## Environment

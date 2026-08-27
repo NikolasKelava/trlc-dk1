@@ -1150,6 +1150,246 @@ deliberately, and read the trace afterwards.
 
 ---
 
+## Recording: the encode that could not fork
+
+**2026-08-27.** The first attempt of A0 — the first scored row this cell has ever
+run — recorded no video. Three lines, once per camera:
+
+```
+ERROR:lerobot.datasets.dataset_writer:Video encoding failed for observation.images.left:
+  [Errno 1313558101] Unknown error occurred: 'avcodec_open2(h264_nvenc)'
+ERROR:dk1lab.dataset:could not write episode 0
+```
+
+`1313558101` is `UNKN` read as a FOURCC — libav's way of saying the encoder
+refused to open and declined to say why.
+
+### It is not the codec, and not the GOP
+
+The obvious suspect was the one already in this file: **NVENC refuses a GOP below
+4**, and that failure looks exactly like this. It was not that — `dk1lab.dataset`
+has raised the GOP to 4 since 2026-08-26 and `_encoder()` logs `gop 4`. Nor is it
+a session limit: three concurrent NVENC encodes open fine.
+
+The encoder is not broken at all. **The same encoder, in the same process, at the
+same moment, works.** What it cannot survive is a `fork`.
+
+LeRobot encodes the cameras concurrently:
+
+```python
+with concurrent.futures.ProcessPoolExecutor(max_workers=num_cameras) as executor:
+```
+
+`ProcessPoolExecutor` takes the default start method, which on Linux and Python
+3.12 is **fork**. NVENC needs CUDA, and **a CUDA context cannot survive a fork** —
+the child inherits driver state it is not allowed to use, `cuInit` fails inside
+libav, and `avcodec_open2` returns a bare `UNKNOWN`. The rollout process holds a
+CUDA context from the moment the policy's weights reach the GPU, so by the time
+the operator is asked to keep an episode, every forked child is already doomed.
+
+Two triggers, independently sufficient, and both are the same root cause —
+`libcuda` initialised in the parent before the fork:
+
+| parent has | encode runs in | result |
+| --- | --- | --- |
+| nothing | forked child | **OK** |
+| a CUDA context (`torch.zeros(8, device="cuda")`) | forked child | **fails** |
+| an NVENC encoder opened once in-process | forked child | **fails** |
+| a CUDA context | spawned child | OK |
+| a CUDA context | the process itself | OK |
+| nothing | three forked children | OK — not a session limit |
+
+The second row is the rollout. The first row is why this was never seen on the
+bench: the 2026-08-26 codec measurements in § *The episode that took minutes to
+save* were taken by a script with no policy loaded, so the fork was legal and
+NVENC was fast. **A benchmark that does not hold the GPU the way the real run
+does is measuring a different program** — the same warning § *The 27.7 Hz loop*
+gives for a different reason.
+
+It also explains the loose end left in `CLAUDE.md`: the single episode whose
+encode raised on 2026-08-26, which is what made a failed write loud. Same bug.
+
+### The fix: do not fork a GPU encode
+
+`DatasetSession._parallel_encoding()` returns `False` when the resolved codec is
+NVENC, and `commit()` passes it to `save_episode`. The three streams are then
+encoded one after another **in the rollout process**, where CUDA is valid and
+NVENC works. A CPU codec forks perfectly well and gains most of a 3x from doing
+so, so it keeps the parallel path.
+
+`auto` is a request, not a codec, and it is the default. Judging `self.vcodec`
+would see the word `auto`, conclude it is not a hardware encoder and fork
+anyway — losing every episode on this machine, where `auto` **is** NVENC. So
+`_encoder()` now records what `auto` resolved to and the decision reads that.
+`tests/test_dataset.py` pins all four cases.
+
+### What it costs
+
+Paired, same process, 600 frames of three 1280x720 cameras through the batch
+path, extrapolated to a 3 600-frame (120 s) episode:
+
+| | 600 frames | per episode |
+| --- | ---: | ---: |
+| parallel fork, no CUDA in the parent (the old bench) | 18.7 s | ~112 s |
+| **serial in-process** | 25.1 s | **~150 s** |
+| serial in-process, CUDA live (what now runs) | 25.0 s | ~150 s |
+| parallel fork, CUDA live (the rollout) | **fails** | — |
+
+About a third more wall clock, and **the parallelism was never worth much
+anyway**: the difference is ~6 s of 25, because the wait is dominated by staging
+every frame through PNG and reading it back, not by the encode. NVENC does its
+part in about 3 s per stream. `--stream-video` is the lever that removes the
+staging — it encodes in-process as the arms move, so it is immune to this bug by
+construction, and it took the same measurement to **0.9 s**. It stays off by
+default for the reason already recorded: one 215 ms stall at encoder start-up,
+and the loop is the experiment.
+
+Verified end-to-end with a live CUDA context: two episodes committed, no
+failures, the dataset reads back 240 frames with all three camera streams
+decoding to real pixels.
+
+### One trap found on the way
+
+`DatasetSession.__init__` defaults `streaming=True`, while the CLI passes
+`streaming=stream_video`, which defaults **False**. The behaviour of `dk1` is
+correct — every caller is explicit — but a `DatasetSession` constructed directly,
+as a benchmark or a test does, silently takes the streaming path and never forks,
+which is why this bug hid from the first attempt to reproduce it. Left alone
+rather than changed: it is a default, and the defaults table in `CLAUDE.md` is
+not edited in passing.
+
+---
+
+## The session console: a silenced prompt and a shouted decoder
+
+**2026-08-27.** Two faults on the same screen, during A0's first attempt. The
+prompt that names the scene and the attempt —
+`[A0 scene 1/3, attempt 1/3 | episode 0 | 120s | dataset] task>` — had stopped
+appearing, so the operator was typing blind into a session that walks three
+scenes. And while the episode saved, thousands of lines of
+`DEBUG:PIL.PngImagePlugin:STREAM b'IHDR' 16 13` ran up the terminal.
+
+Unrelated causes. Both arrived with the 2026-08-26 work and neither is in the
+log file, which was clean throughout — that is the tell for both.
+
+### The prompt went to file descriptor 2
+
+`input()` writes its prompt to **fd 2**, not stdout. Verified in a pty: redirect
+fd 2 to a file and the prompt is *in the file*, not on the terminal.
+
+`_quiet_stderr()` points fd 2 at `/dev/null` for exactly the length of the read,
+because the cameras' MJPG stream makes libjpeg print `Corrupt JPEG data` from C,
+past any Python redirect, into the middle of the line being typed (§ *The
+cameras talking over the prompt*). That fix was right. Handing the prompt to
+`input()` inside it was not: the prompt went to `/dev/null` with the chatter.
+
+It took all three prompts — `task>`, `score>`, and `keep this episode?`, the
+last because click hands the whole prompt to `input()` on this platform too.
+
+`_ask` now writes the prompt to **stdout** itself and calls `input()` bare; the
+chatter is still silenced while the line is read. That is what click does on
+Windows, for the same reason. `typer.confirm` is replaced by `_confirm`, built
+on `_ask`, keeping click's rules — empty takes the default, `y`/`n` decide,
+anything else asks again, and **EOF takes the default rather than aborting**,
+since a non-interactive keep must not become a lost attempt.
+
+### The decoder shouted because we lowered the root logger
+
+Opening the session log calls `root.setLevel(DEBUG)`, and it has to: the root
+level gates every child *before* any handler sees a record, so our file handler
+cannot get DEBUG any other way. Our handler filters (`Interesting`), which is
+why the **file** stayed clean.
+
+But root already had a handler nobody here attached. Importing `lerobot` reaches
+`lerobot/utils/import_utils.py`, which calls the module-level `logging.debug()`
+while probing for optional packages — and the module-level convenience functions
+call `logging.basicConfig()` when root has no handlers yet. So a bare
+`StreamHandler` on stderr, at no level and with no filter, exists before any of
+our code runs. Lowering root to DEBUG turned it into a firehose: PIL on every
+PNG read, `httpcore` on every connection.
+
+`logs.start` now applies the same policy to every handler already on root, at
+`CONSOLE_LEVEL` (INFO): ours and LeRobot's at INFO, everybody else at WARNING.
+That is what the terminal showed before, minus the chatter — measured on a sim
+run, console DEBUG lines 42 -> 0, INFO lines kept.
+
+**The general rule, and it is the one to remember:** lowering the root level is
+never local. It changes what every handler in the process emits, including the
+ones a dependency installed at import time. Whoever lowers it owns the handlers
+they did not attach.
+
+---
+
+## Recording: four minutes to keep one episode
+
+**2026-08-27.** A0's first attempt was a 120 s rollout, and the operator then
+waited **4 minutes 25 seconds** before the score prompt — arms energised, the
+chain warning that nothing was commanding it. The log has both ends:
+`15:04:38 encoding episode 0 (3539 frames)` and the next line at `15:09:03`.
+
+Where it goes, measured paired at 900 frames of three 1280x720 cameras with a
+live CUDA context, split by instrumenting the writer:
+
+| phase | 900 frames | share |
+| --- | ---: | ---: |
+| waiting for the PNG cache to finish being written | 16.4 s | 45% |
+| reading those PNGs back and encoding | 17.0 s | 47% |
+| statistics, parquet, metadata | 3.0 s | 8% |
+
+**The encode is not the problem; the PNG round-trip is.** NVENC itself is about
+a second of that 17. Tripling the image-writer threads (4 -> 12 per camera) took
+the wait from 16.4 s to 10.2 s — real, and not the answer.
+
+`--stream-video` (LeRobot's `streaming_encoding`) skips the cache entirely and
+encodes as the arms move. Same measurement: **save 36.5 s -> 0.9 s**, which is
+~145 s -> ~3 s on a full episode, and two streamed episodes verified readable
+with a live CUDA context.
+
+**It was made the default, tried on the arms, and reverted the same day.** The
+bench had said ~2 ms a tick against ~30 ms of idle. The cell said otherwise:
+
+| | batch | `--stream-video`, on the arms |
+| --- | ---: | ---: |
+| worst tick | — | **983.7 ms** |
+| starved ticks | 0 | **6** |
+| loop rate | 29.9 Hz | 29.2 Hz |
+| keeping an episode | ~4 min | seconds |
+
+Paired on the bench, the tick cost of each mode, 600 ticks paced at 30 Hz with a
+GPU load standing in for the policy:
+
+| | mean | p95 | worst |
+| --- | ---: | ---: | ---: |
+| batch | 0.12 ms | 0.16 ms | **0.7 ms** |
+| `--stream-video` | 1.7 ms | 2.8 ms | **117 ms** |
+
+Batch is nearly free to the loop because the PNG writing is already on the
+image-writer threads; only the *waiting* is expensive, and it is all after the
+arms stop.
+
+The streaming stall is **ticks 1 and 2, and only those** — LeRobot's
+`_CameraEncoderThread` opens its container lazily, on the first frame, "to get
+width/height", so three NVENC encoders initialise inside the control loop.
+Pre-warming an encoder before the run halves it on an idle GPU (224 -> 106 ms)
+and does nothing under load. Opening them early would need the width and height
+pushed in ahead of the first frame, which is upstream's structure, not a flag.
+
+None of that was the deciding argument. **The queue running dry means the arms
+held their last commanded target instead of executing a new one**, six times, in
+an attempt that was being scored. A worse attempt costs more than a wait, so
+the wait is what we buy. Nikolas's call, and the right one: the loop is the
+experiment.
+
+**The mode is in `dk1_notes.jsonl` per episode**, because it is the one recording
+setting that changes the control loop, and a row whose episodes were not all
+recorded the same way is worth being able to find out about.
+
+> Before reaching for this again: it is not a tuning knob, it is a trade of
+> attempt quality for operator time. Read the starved-tick line of the trace
+> after any run that uses it.
+
+---
+
 ## The cameras talking over the prompt
 
 **2026-08-26.** `Corrupt JPEG data: 11 extraneous bytes before marker 0xd7`

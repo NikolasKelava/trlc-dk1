@@ -231,10 +231,12 @@ StreamVideoOpt = Annotated[
         "--stream-video/--no-stream-video",
         help=(
             "Encode the cameras AS THE ARMS MOVE rather than from a cache of PNG "
-            "frames when the episode is kept. Keeping then takes seconds instead "
-            "of about a minute, and a crash leaves no gigabytes of loose frames — "
-            "but it costs the control loop about 3 ms a tick and one longer stall "
-            "when the encoder starts. OFF by default: the loop is the experiment."
+            "frames when the episode is kept. Keeping an episode then takes "
+            "seconds instead of minutes — but it is paid for out of the CONTROL "
+            "LOOP, and on the arms that bill came to a 984 ms tick and six "
+            "starved ones. OFF by default, and it should stay off for anything "
+            "being scored: the loop is the experiment, and waiting is cheaper "
+            "than an attempt the arms stuttered through."
         ),
     ),
 ]
@@ -961,8 +963,7 @@ def _keep_recording(recording, *, ask: bool = True) -> bool:
     typer.secho(recording.summary(), fg=typer.colors.GREEN)
     keep = True
     if ask and sys.stdin.isatty():
-        with _quiet_stderr():
-            keep = typer.confirm("  keep this episode?", default=True)
+        keep = _confirm("  keep this episode?", default=True)
     if keep:
         # An .rrd is already on disk and needs nothing; a LeRobot episode is
         # buffered until it is written, which is what lets declining one work at
@@ -1359,6 +1360,8 @@ def run(
         "max_joint_rate": limits.max_joint_rate,
         "invert_gripper": invert_gripper,
         "fps": cfg.fps,
+        # As in `session`: the one setting here that changes the control loop.
+        "stream_video": stream_video,
     }
     recorder = one(
         _make_recorder(record, record_dir, task=task, notes=notes_for_recording),
@@ -1689,6 +1692,10 @@ def session(
             "max_joint_rate": limits.max_joint_rate,
             "invert_gripper": invert_gripper,
             "fps": cfg.fps,
+            # The encoding mode belongs in the record because it is the one
+            # setting here that changes the CONTROL LOOP, and a row whose
+            # episodes were not all recorded the same way is worth knowing about.
+            "stream_video": stream_video,
         },
     )
     typer.secho("\nloading the policy and connecting the cell...", fg=typer.colors.YELLOW)
@@ -1897,9 +1904,46 @@ def _quiet_stderr():
 
 
 def _ask(prompt: str) -> str:
-    """Read one line with the cameras' JPEG chatter kept off the line."""
+    """Read one line with the cameras' JPEG chatter kept off the line.
+
+    **The prompt is written here, to stdout, and not handed to ``input()``.**
+    ``input()`` writes its prompt to **file descriptor 2** — the one
+    :func:`_quiet_stderr` is pointing at ``/dev/null`` — so passing it through
+    sends the prompt to the void. That is what silently removed the session's
+    ``[A0 scene 1/3, attempt 1/3 | episode 0 | 120s | dataset] task>`` line and
+    the ``score>`` line with it: the operator was left typing at a blank screen,
+    with no way to see which scene and attempt were live. Found 2026-08-27.
+
+    Writing it ourselves is what click does on Windows, and for the same reason.
+    """
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
     with _quiet_stderr():
-        return input(prompt)
+        return input()
+
+
+def _confirm(question: str, *, default: bool = True) -> bool:
+    """``typer.confirm``, but with the question actually visible.
+
+    Click hands the whole prompt to ``input()`` on this platform, so it goes to
+    fd 2 and :func:`_quiet_stderr` eats it exactly as it ate the ``task>`` line.
+    The parsing is click's rules: empty accepts the default, ``y``/``n`` decide,
+    anything else asks again, and EOF takes the default rather than raising —
+    a non-interactive keep must not become an abort.
+    """
+    suffix = " [Y/n] " if default else " [y/N] "
+    while True:
+        try:
+            answer = _ask(question + suffix).strip().lower()
+        except EOFError:
+            return default
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        typer.secho("  answer y or n", fg=typer.colors.RED)
 
 
 def _session_loop(live, tracer, *, home=None, study=None, monitor=None) -> None:

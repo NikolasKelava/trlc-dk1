@@ -30,6 +30,8 @@ class FakeDataset:
         self.buffer: list[dict] = []
         self.episodes: list[list[dict]] = []
         self.finalized = False
+        #: What the last ``save_episode`` was asked to do about forking.
+        self.parallel_encoding: bool | None = None
 
     @property
     def num_episodes(self) -> int:
@@ -39,7 +41,8 @@ class FakeDataset:
         self.buffer.append(frame)
         self.frames.append(frame)
 
-    def save_episode(self) -> None:
+    def save_episode(self, parallel_encoding: bool = True) -> None:
+        self.parallel_encoding = parallel_encoding
         self.episodes.append(list(self.buffer))
         self.buffer.clear()
 
@@ -406,3 +409,50 @@ def test_the_frames_of_an_episode_that_was_never_written_are_cleared_on_open(tmp
     ds.DatasetSession(root, fps=30, width=8, height=6, use_videos=False,
                       camera_names=("top",)).open()
     assert not stale.exists()
+
+
+# -- the encode that could not fork ---------------------------------------- #
+#
+# LeRobot encodes the three cameras in a ProcessPoolExecutor, which forks. A
+# CUDA context cannot survive a fork, and the policy has one, so NVENC in the
+# child dies on ``avcodec_open2`` and the episode is lost — which is what
+# happened to A0's first attempt on 2026-08-27. Nothing is wrong with the
+# codec; only with encoding it behind a fork.
+
+
+def test_a_gpu_encode_is_not_forked(session, ctx, robot):
+    """NVENC cannot start in a child forked from a process holding CUDA."""
+    session.vcodec = "h264_nvenc"
+    session.resolved_vcodec = "h264_nvenc"
+    record(session, ctx, robot).keep()
+    assert session.dataset.parallel_encoding is False
+
+
+def test_a_cpu_encode_still_forks(session, ctx, robot):
+    """A CPU codec forks perfectly well and gains most of a 3x by doing so."""
+    session.vcodec = "libsvtav1"
+    session.resolved_vcodec = "libsvtav1"
+    record(session, ctx, robot).keep()
+    assert session.dataset.parallel_encoding is True
+
+
+def test_auto_is_resolved_before_it_is_judged(tmp_path):
+    """``auto`` is a request, not a codec.
+
+    Reading ``self.vcodec`` here would see the word "auto", conclude it is not a
+    hardware encoder, and fork anyway — losing every episode on this machine,
+    where ``auto`` is NVENC.
+    """
+    live = ds.DatasetSession(tmp_path / "run", vcodec="auto")
+    encoder = live._encoder()
+    assert live.resolved_vcodec == encoder.vcodec
+    assert live.resolved_vcodec != "auto"
+    if encoder.vcodec.endswith(ds.NVENC_SUFFIX):
+        assert live._parallel_encoding() is False
+
+
+def test_an_unopened_session_resolves_the_codec_rather_than_guessing(tmp_path):
+    """Deciding before ``_encoder`` has run must not default to forking."""
+    live = ds.DatasetSession(tmp_path / "run", vcodec="h264_nvenc")
+    assert live.resolved_vcodec is None
+    assert live._parallel_encoding() is False

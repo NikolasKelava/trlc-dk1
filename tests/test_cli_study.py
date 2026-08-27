@@ -47,13 +47,16 @@ def answers(monkeypatch, *lines):
     asked: list[str] = []
     queue = list(lines)
 
-    def fake_input(prompt: str = "") -> str:
+    def fake_ask(prompt: str = "") -> str:
         asked.append(prompt)
         if not queue:
             raise EOFError
         return queue.pop(0)
 
-    monkeypatch.setattr("builtins.input", fake_input)
+    # `_ask`, not `builtins.input`: the prompt no longer reaches `input()` at
+    # all — it is written to stdout first, because `input()` puts its prompt on
+    # fd 2 and that is the descriptor being silenced while the operator types.
+    monkeypatch.setattr(policy_cmds, "_ask", fake_ask)
     monkeypatch.setattr(policy_cmds.sys.stdin, "isatty", lambda: True, raising=False)
     return asked
 
@@ -191,7 +194,7 @@ def test_the_scene_banner_is_printed_once_per_scene(scored, capsys):
 def test_a_scored_row_keeps_every_recording_without_asking(monkeypatch):
     """A failure is evidence. The only prompt after an attempt is the score."""
     asked: list[str] = []
-    monkeypatch.setattr(policy_cmds.typer, "confirm", lambda *a, **kw: asked.append(a) or False)
+    monkeypatch.setattr(policy_cmds, "_ask", lambda *a, **kw: asked.append(a) or "n")
     monkeypatch.setattr(policy_cmds.sys.stdin, "isatty", lambda: True, raising=False)
 
     recording = SimpleNamespace(

@@ -595,7 +595,10 @@ def drive(monkeypatch, lines: list[str]) -> FakeSession:
 
     live = FakeSession()
     supply = iter(lines)
-    monkeypatch.setattr("builtins.input", lambda _prompt: next(supply))
+    # `_ask` is the single seam: it writes the prompt to stdout itself and
+    # reads with `input()`, which is what keeps the prompt off the silenced
+    # fd 2. Patching it here is patching the thing the loop actually calls.
+    monkeypatch.setattr(policy_cmds, "_ask", lambda _prompt: next(supply))
     policy_cmds._session_loop(live, None)
     return live
 
@@ -630,7 +633,7 @@ def test_end_of_input_leaves_the_session(monkeypatch):
     def eof(_prompt):
         raise EOFError
 
-    monkeypatch.setattr("builtins.input", eof)
+    monkeypatch.setattr(policy_cmds, "_ask", eof)
     policy_cmds._session_loop(live, None)
     assert live.rollouts == []
 
@@ -646,7 +649,7 @@ def test_a_failing_episode_does_not_end_the_session(monkeypatch):
 
     live.rollout = explode
     supply = iter(["one", "two", ":quit"])
-    monkeypatch.setattr("builtins.input", lambda _prompt: next(supply))
+    monkeypatch.setattr(policy_cmds, "_ask", lambda _prompt: next(supply))
     policy_cmds._session_loop(live, None)
     assert live.rollouts == ["one", "two"], "the second episode was still offered"
 
@@ -677,7 +680,7 @@ def keep_or_not(monkeypatch, answer: str, path="recordings/0001_dice.rrd"):
 
     recording = FakeRecording(path)
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-    monkeypatch.setattr(policy_cmds.typer, "confirm", lambda *a, **kw: answer == "y")
+    monkeypatch.setattr(policy_cmds, "_ask", lambda _prompt: answer)
     kept = policy_cmds._keep_recording(recording)
     return kept, recording
 
@@ -710,7 +713,7 @@ def test_nothing_is_asked_when_the_episode_was_not_recorded(monkeypatch):
     def asked(*_args, **_kwargs):
         pytest.fail("nothing was recorded, so there is nothing to keep")
 
-    monkeypatch.setattr(policy_cmds.typer, "confirm", asked)
+    monkeypatch.setattr(policy_cmds, "_ask", asked)
     assert policy_cmds._keep_recording(None) is False
 
 
@@ -751,3 +754,77 @@ def test_the_sim_server_does_not_invert(runner, config_file, checkpoint_dir, mon
     monkeypatch.setattr("dk1lab.serve.serve", lambda *a, **kw: served.update(kw))
     invoke(runner, config_file, "serve", "--checkpoint", str(checkpoint_dir), "--no-warmup")
     assert served["invert_gripper"] is False
+
+
+# -- the prompt that went to /dev/null -------------------------------------- #
+#
+# `input()` writes its prompt to file descriptor 2, and `_quiet_stderr` points
+# fd 2 at /dev/null so the cameras' JPEG chatter cannot land in the middle of
+# the line being typed. Together those two facts silently removed the session's
+# `[A0 scene 1/3, attempt 1/3 | ...] task>` line and the `score>` line, leaving
+# the operator typing at a blank screen. Found 2026-08-27.
+
+
+def test_the_prompt_is_written_to_stdout_and_not_handed_to_input(monkeypatch, capsys):
+    """If it reaches `input()`, it reaches fd 2, and fd 2 is the silenced one."""
+    from dk1lab.cli import policy_cmds
+
+    seen: list[tuple] = []
+
+    def fake_input(*args):
+        seen.append(args)
+        return "put the dice in the bowl"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    answer = policy_cmds._ask("\n[A0 scene 1/3 | episode 0 | 120s] task> ")
+
+    assert answer == "put the dice in the bowl"
+    assert seen == [()], "the prompt was passed to input(), which writes it to fd 2"
+    assert "[A0 scene 1/3 | episode 0 | 120s] task>" in capsys.readouterr().out
+
+
+def test_the_keep_question_is_visible_too(monkeypatch, capsys):
+    """Click hands the whole prompt to `input()` on this platform, so it vanished too."""
+    from dk1lab.cli import policy_cmds
+
+    monkeypatch.setattr("builtins.input", lambda *args: "n")
+    assert policy_cmds._confirm("  keep this episode?", default=True) is False
+    assert "keep this episode? [Y/n]" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("typed", "default", "expected"),
+    [
+        ("y", True, True),
+        ("yes", False, True),
+        ("n", True, False),
+        ("no", True, False),
+        ("", True, True),
+        ("", False, False),
+        ("  Y  ", False, True),
+    ],
+)
+def test_the_keep_question_reads_the_answer_click_would(monkeypatch, typed, default, expected):
+    from dk1lab.cli import policy_cmds
+
+    monkeypatch.setattr(policy_cmds, "_ask", lambda _prompt: typed)
+    assert policy_cmds._confirm("  keep this episode?", default=default) is expected
+
+
+def test_an_unreadable_answer_is_asked_again(monkeypatch):
+    from dk1lab.cli import policy_cmds
+
+    supply = iter(["maybe", "n"])
+    monkeypatch.setattr(policy_cmds, "_ask", lambda _prompt: next(supply))
+    assert policy_cmds._confirm("  keep this episode?", default=True) is False
+
+
+def test_end_of_input_keeps_the_episode_rather_than_aborting(monkeypatch):
+    """An attempt that cannot be repeated must not be lost to a closed stdin."""
+    from dk1lab.cli import policy_cmds
+
+    def eof(_prompt):
+        raise EOFError
+
+    monkeypatch.setattr(policy_cmds, "_ask", eof)
+    assert policy_cmds._confirm("  keep this episode?", default=True) is True

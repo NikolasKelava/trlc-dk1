@@ -82,6 +82,9 @@ DEFAULT_VCODEC = "auto"
 #: to no video at all. Four keyframes' distance still seeks cheaply.
 NVENC_MIN_GOP = 4
 
+#: The marker of a codec that runs on the GPU, and therefore needs CUDA.
+NVENC_SUFFIX = "_nvenc"
+
 #: What one data file may hold before the writer rotates to the next one. Tiny,
 #: deliberately: LeRobot keeps ONE parquet writer open across episodes and the
 #: footer is written only when it closes, so a crash mid-session leaves every
@@ -256,6 +259,9 @@ class DatasetSession:
         self.camera_names = tuple(camera_names)
         self.image_writer_threads = int(image_writer_threads)
         self.vcodec = vcodec
+        #: What ``vcodec`` resolved to once LeRobot had a look at the machine —
+        #: ``auto`` is a request, not a codec. Set by :meth:`_encoder`.
+        self.resolved_vcodec: str | None = None
         self.streaming = streaming
         self.dataset: Any = None
         #: The episode that has been recorded but not yet written. At most one:
@@ -326,10 +332,47 @@ class DatasetSession:
         from lerobot.configs.video import RGBEncoderConfig
 
         encoder = RGBEncoderConfig(vcodec=self.vcodec)
-        if encoder.vcodec.endswith("_nvenc") and (encoder.g or 0) < NVENC_MIN_GOP:
+        if encoder.vcodec.endswith(NVENC_SUFFIX) and (encoder.g or 0) < NVENC_MIN_GOP:
             encoder = RGBEncoderConfig(vcodec=encoder.vcodec, g=NVENC_MIN_GOP)
+        # What ``auto`` turned into. Every later decision about the codec has to
+        # read this rather than ``self.vcodec``, which is still the word "auto".
+        self.resolved_vcodec = encoder.vcodec
         logger.info("encoding video with %s (gop %s)", encoder.vcodec, encoder.g)
         return encoder
+
+    def _parallel_encoding(self) -> bool:
+        """Whether ``save_episode`` may encode the three cameras in parallel.
+
+        **It may not, when the codec runs on the GPU.** LeRobot encodes the
+        cameras concurrently in a :class:`~concurrent.futures.ProcessPoolExecutor`,
+        which on Linux **forks** — and a CUDA context cannot survive a fork. The
+        policy has one the moment its weights reach the GPU, so every child
+        process inherits an unusable driver state and NVENC cannot start in it:
+        ``avcodec_open2(h264_nvenc)`` fails with a bare `UNKNOWN`, once per
+        camera, and the episode is lost. That is what ate the first attempt of
+        A0 on 2026-08-27.
+
+        Nothing about the *codec* is wrong — the same encoder works in this
+        process, before and after. Only the fork is, so the fix is not to fork:
+        encoding the three streams one after another keeps NVENC and costs
+        about a third more wall clock at the end of an episode, because the
+        wait is dominated by staging frames through PNG rather than by the
+        encode. ``--stream-video`` is the lever that removes *that*.
+
+        A CPU codec forks perfectly well and gains most of a 3x from doing so,
+        so it keeps the parallel path.
+        DIAGNOSTICS § *Recording: the encode that could not fork*.
+        """
+        vcodec = self.resolved_vcodec
+        if vcodec is None:
+            # No episode has been opened, so nothing has resolved ``auto`` yet.
+            # Assume the hardware encoder: serialising a CPU encode is slow,
+            # losing a GPU one is fatal.
+            vcodec = self._encoder().vcodec if self.use_videos else ""
+        parallel = not str(vcodec).endswith(NVENC_SUFFIX)
+        if not parallel:
+            logger.debug("encoding cameras serially: %s cannot start after a fork", vcodec)
+        return parallel
 
     def _make_durable(self) -> None:
         """Arrange for every episode to be readable the moment it is written.
@@ -448,7 +491,7 @@ class DatasetSession:
             return False
         logger.info("encoding episode %d (%d frames) ...", episode.index, episode.ticks)
         try:
-            self.dataset.save_episode()
+            self.dataset.save_episode(parallel_encoding=self._parallel_encoding())
         except Exception as exc:  # noqa: BLE001 - a failed encode must not raise here
             # The whole traceback, to the log file: on 2026-08-26 this failure
             # happened once, printed one line nobody read, and the session went

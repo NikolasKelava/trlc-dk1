@@ -36,6 +36,16 @@ DEFAULT_LOG_DIR = Path("logs")
 FORMAT = "%(asctime)s.%(msecs)03d %(levelname)-7s %(threadName)-14s %(name)s: %(message)s"
 DATEFMT = "%H:%M:%S"
 
+#: What the **terminal** shows. The file wants DEBUG from us; the operator is
+#: reading the same screen they type into, and does not want a decoder's
+#: running commentary on it. See :func:`_tame` for why this is our business
+#: at all.
+CONSOLE_LEVEL = logging.INFO
+
+#: Marks a handler we have already filtered, so a second :func:`start` in one
+#: process does not stack filters on it.
+_TAMED = "_dk1lab_tamed"
+
 
 class Interesting(logging.Filter):
     """Keep the file readable: ours in full, LeRobot's at INFO, the rest at WARNING.
@@ -82,12 +92,44 @@ def log_path(what: str, directory: Path | str = DEFAULT_LOG_DIR) -> Path:
     return Path(directory) / f"{stamp}-{what}.log"
 
 
+def _tame(root: logging.Logger, level: int) -> None:
+    """Stop handlers we do not own from inheriting the DEBUG we are about to set.
+
+    Opening the log file means lowering the **root** logger to DEBUG, because
+    the root level gates every child before any handler sees a record. That is
+    fine for our handler, which filters. It is not fine for anybody else's:
+    every handler already attached to root starts emitting DEBUG from every
+    library in the process.
+
+    And there is always one attached. Importing ``lerobot`` reaches
+    ``lerobot.utils.import_utils``, which calls the module-level
+    ``logging.debug()`` while probing for optional packages — and the
+    module-level convenience functions call ``logging.basicConfig()`` when the
+    root logger has no handlers yet. So a bare ``StreamHandler`` on stderr, at
+    no level, exists before any of our code runs. On 2026-08-27 that turned an
+    episode save into thousands of lines of ``DEBUG:PIL.PngImagePlugin:STREAM``
+    across the operator's screen, mid-session.
+
+    So every foreign handler gets the same policy the file uses, at
+    :data:`CONSOLE_LEVEL`: ours and LeRobot's at INFO, everybody else's at
+    WARNING. That is what the terminal showed before, minus the chatter.
+    Handlers attached *after* this runs are not covered — nothing does that
+    here, because ``basicConfig`` is a no-op once root has a handler.
+    """
+    for handler in root.handlers:
+        if getattr(handler, _TAMED, False):
+            continue
+        handler.addFilter(Interesting(level))
+        setattr(handler, _TAMED, True)
+
+
 def start(
     what: str,
     *,
     directory: Path | str = DEFAULT_LOG_DIR,
     path: Path | str | None = None,
     level: int = logging.DEBUG,
+    console_level: int = CONSOLE_LEVEL,
 ) -> Path:
     """Attach the file handler to the root logger. Returns the file's path.
 
@@ -97,6 +139,9 @@ def start(
         level: what ``dk1lab`` logs at. ``lerobot`` is held at INFO and
             everything else at WARNING, because a DEBUG-level torch is noise
             that would bury the two lines that matter.
+        console_level: the same policy, applied to whatever handlers are
+            already on root — see :func:`_tame`. Writing the file must not
+            change what the terminal shows.
     """
     target = Path(path) if path is not None else log_path(what, directory)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -105,8 +150,12 @@ def start(
     handler.setFormatter(logging.Formatter(FORMAT, datefmt=DATEFMT))
     handler.setLevel(logging.DEBUG)
     handler.addFilter(Interesting(level))
+    setattr(handler, _TAMED, True)
 
     root = logging.getLogger()
+    # Before the level drops, not after: between the two the console would be
+    # showing everything.
+    _tame(root, console_level)
     # The root logger's own level gates every child, so it has to be the lowest
     # of the levels wanted; the per-logger levels below do the actual filtering.
     root.setLevel(min(root.level or logging.WARNING, level))
@@ -118,4 +167,11 @@ def start(
     return target
 
 
-__all__ = ["DEFAULT_LOG_DIR", "Interesting", "SyncingFileHandler", "log_path", "start"]
+__all__ = [
+    "CONSOLE_LEVEL",
+    "DEFAULT_LOG_DIR",
+    "Interesting",
+    "SyncingFileHandler",
+    "log_path",
+    "start",
+]
