@@ -101,3 +101,74 @@ def test_the_help_warns_about_motion_and_about_the_leader_grippers(runner):
     output = runner.invoke(app, ["teleop", "--help"]).output
     assert "CAUSES MOTION" in output
     assert "LEADERS" in output
+
+
+# --------------------------------------------------------------------------- #
+# --record-dataset: the demonstration recorder
+# --------------------------------------------------------------------------- #
+
+
+def test_the_run_profile_defaults_to_the_tuned_one_and_shows_the_crop(runner, config_file, no_run):
+    output = dry(runner, config_file).output
+    assert "profile optimized" in output
+    assert "crop" in output
+
+
+def test_recording_defaults_to_the_level_playing_field(runner, config_file, no_run):
+    """STUDY.md records the demonstrations uncropped and crops at training time."""
+    output = dry(runner, config_file, "--record-dataset").output
+    assert "profile common" in output
+    assert "crop" not in output.split("cameras", 1)[1]
+
+
+def test_recording_defaults_to_the_policy_capture_and_rate(runner, config_file, no_run):
+    """The dataset's frame size and fps are what the rollout will run at."""
+    output = dry(runner, config_file, "--record-dataset").output
+    assert "capture [policy]" in output
+    assert "target 30 Hz" in output
+
+
+def test_the_capture_profile_is_still_selectable_on_its_own(runner, config_file, no_run):
+    assert "capture [policy]" in dry(runner, config_file, "--capture", "policy").output
+
+
+def test_an_unknown_run_profile_is_refused_before_anything_is_built(runner, config_file, no_run):
+    result = dry(runner, config_file, "--profile", "levelled")
+    assert result.exit_code != 0
+    assert no_run == []
+
+
+def test_recording_says_where_the_dataset_goes(runner, config_file, no_run):
+    output = dry(runner, config_file, "--record-dataset").output
+    assert "study/demos" in output
+    assert "episodes are appended" in output
+
+
+def test_recording_streams_the_video_by_default(runner, config_file, no_run):
+    """Nowhere else: a human hand on a leader arm is not the experiment."""
+    assert "AS THE ARMS MOVE" in dry(runner, config_file, "--record-dataset").output
+
+
+def test_recording_without_cameras_is_refused(runner, config_file, no_run):
+    result = dry(runner, config_file, "--record-dataset", "--no-cameras")
+    assert result.exit_code != 0
+    assert no_run == []
+
+
+def test_recording_with_a_duration_is_refused(runner, config_file, no_run):
+    """An episode ends on a keypress; a duration would mean two ways to end one."""
+    result = dry(runner, config_file, "--record-dataset", "--duration", "60")
+    assert result.exit_code != 0
+    assert no_run == []
+
+
+def test_a_scene_below_one_is_refused(runner, config_file, no_run):
+    assert dry(runner, config_file, "--record-dataset", "--scene", "0").exit_code != 0
+
+
+def test_dry_run_opens_no_dataset(runner, config_file, no_run, tmp_path):
+    """--dry-run connects to nothing, and that includes not creating a dataset."""
+    target = tmp_path / "demos"
+    result = dry(runner, config_file, "--record-dataset", "--dataset-dir", str(target))
+    assert result.exit_code == 0
+    assert not target.exists()

@@ -101,6 +101,7 @@ dk1lab/                 everything this fork adds; the only Python we own
   runprofile.py         optimized vs common: what the policy sees, how fast (no lerobot)
   pi05.py               pi0.5: 32-D padding, renamed cameras, borrowed norm stats
   dataset.py            the LeRobot v3.0 recorder — alongside record.py, not instead
+  demos.py              teleop demonstrations: Enter starts, Enter stops, `again` deletes
   study.py              the score sheet: scenes, attempts, the CSV  (no lerobot import)
   logs.py               a session log file, fsynced per record       (no lerobot import)
   telemetry.py          PSU, CPU and GPU once a second, fsynced      (no lerobot import)
@@ -332,6 +333,7 @@ What *is* settled:
 | The policy uses the gripper channel | commanded +0.033 .. +1.000 on the arms |
 | The gripper inversion is right | confirmed on the arms by Nikolas, 2026-08-21. It is now the default |
 | The session and the recorder work on the arms | eight episodes recorded 2026-08-21, four tasks, all four streams present in every file |
+| The teleop dataset recorder works on the arms | one throwaway episode, 2026-08-27: 628 frames at 30 Hz under `common`, read back as a LeRobot v3.0 dataset, then deleted. A crash mid-session keeps every committed episode and the directory resumes — verified by killing the process |
 | The home sweep works | run on the arms, including the eased profile. Now the default at the end of a run |
 
 What is not:
@@ -375,8 +377,8 @@ subsystem directory: `...-usb-0:4.3:1.0` names both a camera and a leader arm.
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
 | **3** | Zero-shot MolmoAct2 evaluation | **done, and scored** — six debugging rollouts, then A0's nine labelled attempts on 2026-08-27. Every timing and motion fault this fork could cause is closed; what is left is the policy's own output, and it is 0/9 with a ceiling of grasp |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **done: 3/3** |
-| **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
-| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=9 per row (3 scene configurations x 3 attempts) | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0, 1 and 2 are done: A0 is scored, 0/9.** R0 is next, then the fine-tune |
+| **4** | Record + LoRA fine-tune | **recording works on the arms** — `dk1 teleop --record-dataset`, `dk1lab/demos.py`, one episode recorded 2026-08-27. The fine-tune is gated on reviewing Phase 3 together |
+| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=9 per row (3 scene configurations x 3 attempts) | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0, 1 and 2 are done: A0 is scored, 0/9.** Its Phase 3 — the demonstrations — is next, and its recorder is built |
 
 **Phase 1** built `dk1 find cameras`, `dk1 find arms --inspect` (read-only USB
 identity) and `dk1 config check --formats`. That last one matters: OpenCV
@@ -387,6 +389,11 @@ has, which would hand the policy a different aspect ratio than training used.
 single implementation, and the loop is LeRobot's `teleop_loop` imported rather
 than reimplemented — because recording and rollout run that same loop, and a
 bespoke one here could work while the one every later phase depends on does not.
+**`--record-dataset` is the one exception in this fork**, and `dk1lab/demos.py`
+says why in its docstring: `teleop_loop` takes a duration and nothing else, so it
+cannot be ended on a keypress, and it prints a line per tick over what the
+operator is typing. `demos.tick` is the six calls it makes, in its order, kept as
+its own function so the copy is short enough to read beside the original.
 **Teleoperation runs with no speed cap** (`[limits.teleop] max_joint_rate =
 false`): that is upstream's native behaviour, it is what Nikolas asked for after
 the first run felt sluggish, and it is right for the activity, since the
@@ -611,6 +618,58 @@ recording setting that changes the control loop. Batch encoding costs the loop
 essentially nothing (0.12 ms a tick, 0.7 ms worst, measured paired), because the
 PNG writing is on the image-writer threads. § *Recording: four minutes to keep
 one episode*.
+
+### Recording demonstrations by hand (2026-08-27)
+
+`dk1 teleop --record-dataset` is `STUDY.md` Phase 3's recorder — 45 teleoperated
+episodes into one LeRobot v3.0 dataset, and the one thing in this study that
+cannot be bought back once the day is spent. `dk1lab/demos.py`. **It has run on
+the arms** — one throwaway episode on 2026-08-27, 628 frames over 20.9 s,
+`common` / `[capture.policy]` / 30 Hz / uncapped, video streamed through NVENC,
+read back as a v3.0 dataset and then deleted. That is the path working end to
+end, not a recording session: **`study/demos` is empty and Phase 3 has not
+started.**
+
+The operator's whole vocabulary is four things, read from stdin *while the arms
+are live*: **Enter** starts an episode and Enter ends it, **`again`** throws the
+last one away, **`scene <n>`** labels the ones that follow, **`done`** finishes.
+Four things it must keep doing:
+
+- **The teleoperation loop never stops** — not between episodes, not while the
+  operator types. That is safety, not convenience: teleop is uncapped, so a loop
+  that paused would let the passive leaders sag while the followers held their
+  last target, and the first tick after the pause would command the sagged pose
+  at full speed. The price is that stdin is polled per tick rather than read
+  (`demos.TerminalConsole`), and fd 2 is silenced between episodes for the same
+  reason the session silences it — the cameras' libjpeg chatter lands in the
+  middle of the line being typed.
+- **An episode is committed one episode late.** `stop` leaves it in the dataset's
+  buffer and the *next* start writes it, which is what makes `again` a real
+  deletion: `save_episode` cannot be undone and v3.0 has no way to take an
+  episode back out. What it costs is bounded — everything before the held one is
+  sealed and readable, so a crash costs at most the attempt just made. Chosen
+  with Nikolas over deleting a written episode off disk, which is surgery on the
+  dataset both fine-tunes are built from.
+- **Three defaults move with `--record-dataset`**, and all three are printed
+  before anything is energised: `--profile common` (the full lens — the crop is
+  applied at *training* time, so one dataset serves both the cropped and the
+  uncropped row), `--capture policy` (1280x720) and `--fps 30` (the policy's
+  rate, which is what gives every action chunk its time scale). The profile's
+  `[limits.*]` table is deliberately **not** read: teleop stays uncapped.
+- **`--stream-video` is ON here and nowhere else.** No policy is holding the GPU,
+  and the wait is what would cost a day of hands. It must stay off for anything
+  scored — § *Recording: four minutes to keep one episode*.
+
+The scene is a column, never the prompt: the task string is byte-identical on
+every frame, and the scene goes to `dk1_notes.jsonl` with the profile, the
+capture, the rate and the codec. `DatasetEpisodeRecorder.attach_robot` is new —
+the same wrapping as `attach`, without a rollout context to reach the robot
+through.
+
+**`dk1 teleop --profile` changed meaning** (2026-08-27). It is now
+`optimized`/`common`, as on `dk1 policy run`; the `[capture.*]` table it used to
+name is `--capture`. One word had two meanings on the command line that records
+the dataset the fine-tunes are built from.
 
 **Every run that touches the arms writes two files** (2026-08-26), written while
 the machine was still freezing hard and a terminal could not survive the reset.

@@ -744,7 +744,18 @@ class DatasetEpisodeRecorder:
             logger.warning("no robot wrapper: nothing to record into a dataset")
             self._fail(RuntimeError("no robot wrapper on the rollout context"))
             return
+        self.attach_robot(robot)
 
+    def attach_robot(self, robot: Any) -> None:
+        """Wrap a robot directly, with no rollout context around it.
+
+        :meth:`attach` is the policy path, where the robot is reached through the
+        context LeRobot's rollout builds. **Teleoperation has no such context** —
+        :mod:`dk1lab.demos` drives the leader and the follower itself — and the
+        two calls this recorder needs are the robot's own, so the context was
+        never the thing actually being depended on. Same wrapping, same
+        restoration, one object less to have to fake.
+        """
         inner_obs = robot.get_observation
 
         def get_observation(*args: Any, **kwargs: Any) -> Any:

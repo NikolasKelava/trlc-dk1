@@ -274,7 +274,14 @@ uv run dk1 teleop --display-policy-input   # ...and what the POLICY would be han
 uv run dk1 teleop --fps 30              # slower loop
 uv run dk1 teleop --max-joint-rate 0.6  # impose a cap for this run
 uv run dk1 teleop --duration 20         # stop by itself after 20 s
+uv run dk1 teleop --capture policy      # cameras at [capture.policy], not [capture.teleop]
+uv run dk1 teleop --profile common      # the full lens: no wrist crop (section 5)
+uv run dk1 teleop --record-dataset      # record demonstrations (section 5)
 ```
+
+**Two words that used to be one.** `--capture` is the `[capture.*]` table the
+cameras run at; `--profile` is `optimized` / `common`, meaning here exactly what
+it means on `dk1 policy run`. `--profile` used to name the first of those.
 
 **The speed cap is off.** Teleoperation runs with no slew limit, which is what
 the DK1 does natively — upstream has no rate limit in impedance mode at all. The
@@ -314,11 +321,86 @@ cannot work.
 Teleop is also the checkpoint that the ported LeRobot plugin and the DM4310 /
 DM4340 motor stack are intact. It runs LeRobot's own `teleop_loop` — the same loop
 recording and policy rollout use — rather than a bespoke one, so it exercises the
-path every later phase depends on.
+path every later phase depends on. `--record-dataset` is the one exception, and
+section 5 says why.
 
-## 5. Record a dataset
+## 5. Record demonstrations
 
-Not built yet — Phase 4.
+`dk1 teleop --record-dataset` writes what your hands do into a **LeRobot dataset
+v3.0** — the format `STUDY.md` fine-tunes from. This is Phase 3 of the study.
+
+```bash
+uv run dk1 teleop --record-dataset --dataset-dir study/demos
+```
+
+That command line is complete: recording moves three defaults to the ones the
+rollout will run under, and prints all three in the banner before anything is
+energised.
+
+| | recording | plain teleop |
+| --- | --- | --- |
+| `--profile` | `common` — the full lens, no wrist crop | `optimized` |
+| `--capture` | `policy` — 1280x720 | `teleop` |
+| `--fps` | 30 — the policy's rate, written into the dataset | 60 |
+
+**Why uncropped.** The demonstrations are captured through the whole 105 degree
+lens and the `optimized` crop is applied at *training* time. One dataset then
+serves both the cropped and the uncropped fine-tune. The other order cannot be
+undone: crop first and there is no uncropped dataset to be had.
+
+**Why 30 Hz.** The rate goes into the dataset's metadata and is what gives every
+action chunk its time scale. Recording at teleop's 60 and fine-tuning a 30 Hz
+policy on it would teach the model a cell that moves at half speed.
+
+### The session
+
+It asks for the task once, and then there are four things to type.
+
+```
+task (recorded on every frame of every episode)> put the dice in the bowl
+
+[scene 1 | next episode 0] Enter to record, `again`, `scene <n>`, `done`>
+  recording episode 0 — Enter to stop
+  recording    24.3 s    729 frames  30.0 Hz
+  stopped: 731 frames, 24.4 s (30.0 Hz)
+[scene 1 | next episode 1] Enter to record, `again`, `scene <n>`, `done`> again
+  dropped — nothing was written
+[scene 1 | next episode 1] Enter to record, `again`, `scene <n>`, `done`>
+  recording episode 1 — Enter to stop
+```
+
+| | |
+| --- | --- |
+| **Enter** | start an episode; press it again to end it |
+| **`again`** | throw the last episode away — or abort the one being recorded |
+| **`scene <n>`** | the episodes from here on are of scene layout *n* |
+| **`done`** | write what is held and finish (`quit` also works) |
+
+**The arms track the leaders the whole time**, including while you type and
+between episodes. That is deliberate: teleop is uncapped, and a loop that paused
+would let the passive leader arms sag while the followers held their last target
+— so the first tick of the next episode would command them to the sagged pose at
+full speed. Nothing is recorded between episodes.
+
+**`again` reaches exactly one episode back.** An episode is held in memory when
+you stop it and written when you start the next one, because LeRobot v3.0 has no
+way to take a written episode back out. Everything before the held one is already
+sealed on disk and readable, so a crash costs at most the attempt you had just
+made — the one you were still deciding about.
+
+**The scene is a column, never the prompt.** The task string is byte-identical on
+every frame of every episode; the scene number goes into
+`study/demos/dk1_notes.jsonl` alongside the profile, the capture, the rate and
+the codec. Ctrl-C ends the session the same way `done` does, keeping everything.
+
+**`--stream-video` is ON here and nowhere else.** The cameras are encoded as the
+arms move instead of from a cache of PNG frames, which takes writing an episode
+from minutes to seconds. It is paid for out of the control loop, which is why it
+must stay off for anything scored — but no policy is holding the GPU here, and
+the wait is what would cost a day of hands.
+
+An existing `--dataset-dir` is **resumed**, so a second day of recording continues
+the same dataset rather than starting a rival one.
 
 ## 6. Evaluate MolmoAct2 zero-shot
 
