@@ -1,0 +1,10 @@
+scene,attempt,episode,score,seconds,arm,note
+1,1,0,2,,left,no grasp
+1,2,1,2,,left,no grasp
+1,3,2,2,,left,no grasp
+2,1,3,3,,right,
+2,2,4,3,,right,
+2,3,5,3,,right,
+3,1,6,3,,right,
+3,2,7,1,,left,no grasp
+3,3,8,1,,left,

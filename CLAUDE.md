@@ -298,8 +298,27 @@ Checkpoint: `lerobot/MolmoAct2-BimanualYAM-LeRobot` (LeRobot format);
 
 ## Evidence status — keep this line sharp
 
-**Nothing on the real arms has been scored.** No dataset recorded, no fine-tune,
-no success rate. That is the one sentence to keep straight.
+**A0 is scored: nine attempts, zero successes, and the policy grasps.**
+2026-08-27, the first numbers this cell has ever produced on the arms. No
+fine-tune yet, and only one of the study's five rows. `study/scores/A0.csv` and
+the LeRobot dataset in `study/rollouts/A0` (9 episodes, 28 832 frames, not in
+git — it belongs on the Hub).
+
+| A0, MolmoAct2 zero-shot, `common` | scene 1 | scene 2 | scene 3 |
+| --- | --- | --- | --- |
+| highest step reached, three attempts each | 2, 2, 2 | 3, 3, 3 | 3, 1, 1 |
+
+**Success rate 0/9.** The ceiling is step 3 — it lifts the dice clear of the
+table and holds it — and it never carries it to the bowl. Read the rubric in
+`STUDY.md` before quoting those numbers.
+
+**The right arm is the better one**, which settles the oldest open question here
+the other way round: it scored 3 in all four attempts it was used for, and the
+left scored 2, 2, 2, 1, 1 in five. That is nine attempts, not a study of arms,
+but it is the end of "the right arm does not pick anything up".
+
+`study/results.md` is still empty on purpose: one row cannot be compared to
+anything, and the file is for the comparison.
 
 What *is* settled:
 
@@ -354,10 +373,10 @@ subsystem directory: `...-usb-0:4.3:1.0` names both a camera and a leader arm.
 | **0** | Foundation — package, config, CLI, limiter, tests | **done**, branch `phase0-foundation` |
 | **1** | Device discovery on the hardware | **done** |
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
-| **3** | Zero-shot MolmoAct2 evaluation | **six debugging rollouts plus a first recorded session of eight episodes.** Every timing and motion fault this fork could cause is closed; what is left is the policy's own output. **Still not scored** |
+| **3** | Zero-shot MolmoAct2 evaluation | **done, and scored** — six debugging rollouts, then A0's nine labelled attempts on 2026-08-27. Every timing and motion fault this fork could cause is closed; what is left is the policy's own output, and it is 0/9 with a ceiling of grasp |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **done: 3/3** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
-| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=15 per row (5 scene configurations x 3 attempts) | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0 and 1 are done**; Phase 2 is the arms, twice attempted and twice lost to the machine freeze, and **unblocked since 2026-08-27** |
+| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=9 per row (3 scene configurations x 3 attempts) | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0, 1 and 2 are done: A0 is scored, 0/9.** R0 is next, then the fine-tune |
 
 **Phase 1** built `dk1 find cameras`, `dk1 find arms --inspect` (read-only USB
 identity) and `dk1 config check --formats`. That last one matters: OpenCV
@@ -398,11 +417,11 @@ across rollouts. Settings are decided in code, not left to a command line —
 image keys pinned, `inference_action_mode = continuous`, bf16 on cuda,
 `return_to_initial_position` forced false always, including under `--home`.
 
-**What remains for this phase is a score.** The next run is not a debugging run:
-it is labelled attempts with a success count. One thing still unexplained to
-watch while scoring: **the right arm was reported not to pick anything up** —
-though it has picked things up since (2026-08-27), which points at the policy
-on the day rather than the arm. The `arm` column is what settles it.
+**This phase has its score.** A0: nine labelled attempts, 0/9 successes, ceiling
+step 3 — it grasps the dice and never delivers it. The `arm` column also closed
+the oldest loose end here: **the right arm is the better one**, 3 in all four of
+its attempts against the left's 2, 2, 2, 1, 1. "The right arm does not pick
+anything up" was the policy on the day, and can be retired.
 
 **Phase 4** — record → LoRA from the same checkpoint → deploy → scored,
 labelled eval attempts.
