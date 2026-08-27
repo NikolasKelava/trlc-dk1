@@ -3,10 +3,12 @@
     dk1 doctor watch     sample the machine once a second until Ctrl-C
     dk1 doctor report    read the last telemetry file back, and the boot record
 
-This exists because the machine froze hard twice during scored sessions
-(2026-08-25 17:58, 2026-08-26 11:23) and both times the kernel journal simply
-ends — no OOM, no oops, no thermal message, nothing. `CRASH.md` is the standing
-account of that investigation. Nothing here touches a motor or a camera.
+This exists because the machine froze hard six times over 2026-08-25..26 and
+every time the kernel journal simply ended — no OOM, no oops, no thermal
+message, nothing. That fault was the platform firmware and was fixed by a BIOS
+update on 2026-08-27 (`docs/CRASH.md`, closed); these commands stay because they
+are what a future freeze would be diagnosed from. Nothing here touches a motor
+or a camera.
 """
 
 from __future__ import annotations

@@ -24,8 +24,10 @@ GPU, which goes through NVML when ``pynvml`` is importable and falls back to one
 millisecond that way and about 30 ms through the fallback, on a thread that is
 not the control loop.
 
-**This is an instrument, not a fix.** It records; it does not prevent. See
-`CRASH.md` for what is known about the freezes and what to do next.
+**This is an instrument, not a fix.** It records; it does not prevent. The
+freezes it was written for turned out to be platform firmware and were fixed by
+a BIOS update on 2026-08-27 (`docs/CRASH.md`, closed); it is kept for the next
+unexplained fault, not for that one.
 """
 
 from __future__ import annotations

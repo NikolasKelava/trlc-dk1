@@ -3,7 +3,7 @@
 Read this first. It is what is true now, and why the code is shaped the way it
 is. Three companions, none of which repeats this one: `GUIDE.md` is the
 operator-facing version, **`STUDY.md` is the protocol** for the two-policy
-comparison, and **`DIAGNOSTICS.md` is the record** — every
+comparison, and **`docs/DIAGNOSTICS.md` is the record** — every
 measurement, every fault chased to its cause, and the hypotheses that turned out
 wrong. Sections below point into it as `DIAGNOSTICS § name`. Read the section
 before re-measuring or undoing anything it covers.
@@ -16,11 +16,16 @@ cameras) with LeRobot, and to evaluate and fine-tune the **MolmoAct2** VLA polic
 on it. Origin is `NikolasKelava/trlc-dk1`; upstream is the hardware repo and we
 want to keep pulling its updates.
 
-> **OPEN FAULT, read before running anything on the cell: the machine freezes.**
-> Two scored sessions (2026-08-25, 2026-08-26) and at least one teleoperation run
-> have taken the whole machine down — hard reset, nothing in the journal.
-> **Unresolved.** `CRASH.md` is the account and the brief. Do not record the
-> ~100 teleoperation demonstrations until it is understood.
+> **The machine froze six times in three days. It is fixed and the file is
+> closed. Do not open `docs/CRASH.md`.** It was the platform firmware, not this
+> code: the BIOS went **F6 -> F8a** on 2026-08-27 and the machine has been stable
+> since. The firmware had recorded three FATAL Intel SoC internal error records
+> all along, which is why nothing ever reached the kernel log.
+>
+> Open it in exactly one case — **the machine freezes again** — and then read
+> only § *How it was found*, which is four steps long. Everything else in that
+> file is a superseded hypothesis. Reading it as background will cost you an hour
+> and teach you things that are no longer true.
 
 ## Hard rules
 
@@ -105,7 +110,8 @@ dk1lab/                 everything this fork adds; the only Python we own
 dk1.toml                THE device config. Tracked. Single source of truth.
 tests/                  the suite; none of it needs hardware
 GUIDE.md                operator docs
-DIAGNOSTICS.md          the record: measurements, faults, discarded hypotheses
+docs/DIAGNOSTICS.md     the record: measurements, faults, discarded hypotheses
+docs/CRASH.md           CLOSED. The machine freeze of 2026-08-25..27 — do not open it
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
 ```
@@ -347,7 +353,7 @@ subsystem directory: `...-usb-0:4.3:1.0` names both a camera and a leader arm.
 | **3** | Zero-shot MolmoAct2 evaluation | **six debugging rollouts plus a first recorded session of eight episodes.** Every timing and motion fault this fork could cause is closed; what is left is the policy's own output. **Still not scored** |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **done: 3/3** |
 | **4** | Record + LoRA fine-tune | gated on reviewing Phase 3 together |
-| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=15 per row (5 scene configurations x 3 attempts) | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0 and 1 are done**; Phase 2 is the arms — see below |
+| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=15 per row (5 scene configurations x 3 attempts) | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0 and 1 are done**; Phase 2 is the arms, twice attempted and twice lost to the machine freeze, and **unblocked since 2026-08-27** |
 
 **Phase 1** built `dk1 find cameras`, `dk1 find arms --inspect` (read-only USB
 identity) and `dk1 config check --formats`. That last one matters: OpenCV
@@ -557,15 +563,17 @@ for hardware encoders. `--stream-video` encodes during the rollout instead of
 from a PNG cache (keeping an episode: ~1 min -> seconds) at ~3 ms a tick plus a
 one-off stall; **off by default**.
 
-**Every run that touches the arms writes two files** (2026-08-26), because the
-machine has frozen hard three times and a terminal does not survive a reset:
+**Every run that touches the arms writes two files** (2026-08-26), written while
+the machine was still freezing hard and a terminal could not survive the reset.
+The freeze is fixed; keep the files, because they are what a future one would be
+diagnosed from:
 `logs/<time>-<what>.log` — `dk1lab` at DEBUG, `lerobot` at INFO, tracebacks,
 **fsynced per record** — and `logs/<time>-<what>.jsonl`, one sample a second of
 PSU power and the +12 V rail, CPU and GPU temperature and power, memory and IO
 stall, also fsynced, so the **last line is the state the machine froze in**.
 `--no-log` / `--no-telemetry` opt out. `dk1 doctor watch` runs the sampler alone;
 `dk1 doctor report` reads it back and says whether the file ends with a `stop`
-event or with the machine. `CRASH.md`.
+event or with the machine. `docs/CRASH.md`.
 
 **A failed write is now loud.** On 2026-08-26 one episode's encode raised, the
 failure was a single log line, and the session scored five more attempts into a
@@ -614,7 +622,7 @@ which would otherwise have failed silently:
 ## The defaults that were tuned, and why they are what they are
 
 Every one of these was moved from something else, on evidence. Change them only
-against the section of `DIAGNOSTICS.md` named in the last column.
+against the section of `docs/DIAGNOSTICS.md` named in the last column.
 
 | setting | value | why |
 | --- | --- | --- |
@@ -632,7 +640,7 @@ against the section of `DIAGNOSTICS.md` named in the last column.
 
 ## Where the detail lives
 
-`DIAGNOSTICS.md` is the record: every measurement, every fault chased to its
+`docs/DIAGNOSTICS.md` is the record: every measurement, every fault chased to its
 cause, and the hypotheses that turned out wrong. Read the section before
 re-measuring anything.
 
@@ -643,9 +651,9 @@ re-measuring anything.
 | touch the speed caps or the home sweep | § *What the caps were doing*, § *The home sweep speed* |
 | touch the trace, `--display` or `--display-policy-input` | § *The instruments* |
 | re-run the simulator, or quote the sim result | § *The sim run* |
-| run, change or quote the two-policy comparison | `STUDY.md` — the protocol, not `DIAGNOSTICS.md` |
+| run, change or quote the two-policy comparison | `STUDY.md` — the protocol, not `docs/DIAGNOSTICS.md` |
 | wonder what a past rollout on the arms actually showed | § *The rollouts on the arms* |
-| chase the machine freezing, or add to that investigation | `CRASH.md` — the open fault, and what has already been eliminated |
+| chase a machine freeze, if one ever returns | `docs/CRASH.md` § *How it was found* — closed 2026-08-27, a BIOS update. Do not re-run the investigation from the top |
 | touch the dataset recorder, the codec, or anything about saving an episode | § *Recording: the crash that ate seven episodes*, § *Recording: the episode that took minutes to save* |
 | benchmark anything | § *The 27.7 Hz loop* — a flat-out loop and a paced one disagree about the same function, and separate processes drift by more than the effect you are chasing |
 

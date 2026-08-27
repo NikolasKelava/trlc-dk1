@@ -3,7 +3,7 @@
 The protocol for comparing two policies on this cell, decided *before* the
 measurements so the measurements can be trusted.
 
-`CLAUDE.md` is what is true now about the code and the cell. `DIAGNOSTICS.md` is
+`CLAUDE.md` is what is true now about the code and the cell. `docs/DIAGNOSTICS.md` is
 the record of faults chased to their cause. This file is the experiment.
 Results land in `study/results.md`. Nothing here changes once Phase 2 starts,
 except via the *Amendments* log at the bottom.
@@ -480,7 +480,7 @@ common`** — that is the invariant above.
 | --- | --- | --- |
 | **0** | Setup | **done 2026-08-25.** Both policies load and infer; `--profile common` exists; the LeRobot recorder writes a readable dataset; the MuJoCo scene runs |
 | **1** | Sim check — nothing recorded | **done 2026-08-25.** Both policies drove the sim arms through the unmodified pipeline at ~29.9 Hz, no starved ticks. The scene itself is poor — see *The simulator* |
-| **2** | Zero-shot on the arms — A0 then R0, N=9 each | 18 scored attempts, two rows. **Attempted twice on 2026-08-25 and 2026-08-26; both sessions ended in a machine freeze and neither left a usable dataset. Blocked on `CRASH.md`** |
+| **2** | Zero-shot on the arms — A0 then R0, N=9 each | 18 scored attempts, two rows. Attempted twice on 2026-08-25 and 2026-08-26; both sessions ended in a machine freeze and neither left a usable dataset, so **both rows start from zero**. **Unblocked 2026-08-27** — `docs/CRASH.md` closed |
 | **3** | Collect ~100 demonstrations | a LeRobot v3.0 dataset recorded under `--profile common` |
 | **4** | MolmoAct2 + LoRA — the training run | a checkpoint, its loss curve, and the run directory recorded |
 | **5** | A1 on the arms, N=9 | 9 scored attempts, one row |
@@ -534,10 +534,12 @@ to a claim about generalisation.
 
 ## Known risks, stated before they bite
 
-**The machine itself freezes, and that is not solved.** Twice mid-session and at
-least once during teleoperation, with nothing in the kernel log either time.
-A0 has been attempted twice and scored twice and has **no usable dataset behind
-either attempt**. `CRASH.md` is the account, the instrumentation and the plan.
+**The machine froze six times in three days, and it is fixed.** It was the
+platform firmware — the BIOS went **F6 -> F8a** on 2026-08-27 and the machine has
+been stable since; `docs/CRASH.md` is the closed record. What it cost this study is
+still real: **A0 has been attempted twice and scored twice, and has no usable
+dataset behind either attempt.** Both rows must be re-run from scratch, and the
+earlier scores are not evidence.
 **Phase 3 — the ~100 demonstrations — must not start until it is understood**:
 those episodes cost a day of somebody's hands and a freeze in the middle of them
 loses that day.

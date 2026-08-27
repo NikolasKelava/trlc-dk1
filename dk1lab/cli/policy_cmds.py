@@ -877,9 +877,10 @@ def _make_recorder(enabled: bool, directory, *, task: str, notes: dict):
 def _start_recording_the_machine(what: str, *, log: bool, telemetry: bool, context: dict):
     """The session log and the machine telemetry. Returns the telemetry, or None.
 
-    Both exist because of the two hard freezes — 2026-08-25 and 2026-08-26 —
-    that left nothing behind: the terminal died with the machine, and the kernel
-    journal simply stops. `CRASH.md` is what they are for.
+    Both exist because of the hard freezes of 2026-08-25..26, which left nothing
+    behind: the terminal died with the machine and the kernel journal simply
+    stops. That fault was the platform firmware and is fixed (`docs/CRASH.md`,
+    closed); these files are kept for whatever is unexplained next.
     """
     if log:
         from ..logs import start as start_log
