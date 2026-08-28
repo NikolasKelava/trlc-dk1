@@ -1,0 +1,1 @@
+/home/nikolas/Documents/RobotLearning/trlc-dk1-niko/.venv/bin/dk1 policy finetune --row R1 --adapt vlm+expert

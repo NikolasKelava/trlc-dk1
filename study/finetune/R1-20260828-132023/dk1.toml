@@ -1,0 +1,362 @@
+# dk1.toml — the single source of truth for this DK1 cell's devices.
+#
+# Nothing else in this repo hardcodes a serial port or a /dev path. Edit here,
+# or let `dk1 find arms` / `dk1 find cameras` fill the sections in for you;
+# each of those rewrites only its own section and leaves the rest untouched.
+#
+# Check what is currently configured, and that it is all plugged in:
+#     dk1 config show
+#     dk1 config check
+
+version = 1
+
+# --- Arms --------------------------------------------------------------------
+#
+# One /dev/ttyACM* per arm (Damiao DM4310/DM4340 over CAN-to-USB for the
+# followers, Dynamixel for the leaders). ttyACM numbering is assigned in
+# enumeration order and can change across reboots or replugs, so re-run
+# `dk1 find arms` if an arm stops responding.
+#
+# The follower/leader split below is VERIFIED by USB identity (`dk1 find arms
+# --inspect` prints it, `udevadm info -n /dev/ttyACM*` shows it raw):
+#   * ttyACM1, ttyACM3  vid 2e88 pid 4603, "HDSC CDC Device"  -> the Damiao
+#     USB-to-CAN adapters, which is what follower.py opens as a raw 921600 baud
+#     serial port. Both report serial 00000000050C, so /dev/serial/by-id
+#     collapses to one entry for the pair, exactly as the cameras do.
+#   * ttyACM0, ttyACM2  vid 1a86 pid 55d3, "USB Single Serial" -> the Dynamixel
+#     adapters the leaders use via DynamixelMotorsBus. These have distinct
+#     serials (5A68010481, 5A68010285) and so are individually addressable.
+# That settles the old repo's contradiction: its untracked robot-ports.txt
+# claimed follower.left = /dev/ttyACM2, but ttyACM2 is a leader adapter. The
+# tracked ports.toml was right.
+#
+# UNVERIFIED: which side is left and which is right, within each pair. USB
+# identity cannot tell them apart — it is a physical fact. `dk1 find arms`
+# settles it by watching which node disappears when you unplug an arm.
+
+[arms.follower]
+left = "/dev/ttyACM1"
+right = "/dev/ttyACM3"
+
+[arms.leader]
+left = "/dev/ttyACM0"
+right = "/dev/ttyACM2"
+
+# --- Cameras -----------------------------------------------------------------
+#
+# Three Innomaker U30CAM-4K. They must be addressed by /dev/v4l/by-path:
+#   * /dev/videoN is assigned in enumeration order and is not stable.
+#   * /dev/v4l/by-id is unusable — all three share serial 20010101, so only one
+#     of them wins the by-id symlink (verified: by-id lists a single entry).
+# The by-path node encodes the physical USB hub port, so it is stable as long as
+# the camera stays in the same socket. Re-derive with `ls -l /dev/v4l/by-path/`.
+#
+# Do not compare these strings against /dev/serial/by-path: the by-path name
+# omits the root hub, and the cameras hang off usb2 while the arms hang off usb1,
+# so `...-usb-0:4.3:1.0` names *both* the left camera and a leader arm. The
+# strings are unique within each subsystem's directory, which is all that matters
+# here, but they are not unique across the machine.
+#
+# The names top / left / right are not free choices: the MolmoAct2 BimanualYAM
+# checkpoint's image keys are observation.images.{top,left,right}, and the robot's
+# camera keys must match them exactly.
+#
+# All three are currently mounted upside down, hence rotation 180 throughout.
+# VERIFIED on hardware: hub-port assignment, MJPG requirement, rotation, and the
+# top/left/right labels themselves (previewed via `dk1 find cameras`: 10.1 is the
+# overhead view of the mat; between 4.3 and 4.4 a fixed object shifts left, so
+# 4.4 is the further-right camera).
+
+# --- Field of view ---
+#
+# hfov         the lens's own horizontal field of view, degrees. Optional, and
+#              documentation unless target_hfov is also set.
+# target_hfov  crop every frame's centre out until it spans this angle, then
+#              stretch it back to the configured capture size. Optional; absent
+#              means no crop and an ordinary OpenCVCamera.
+#
+# OURS: 105 degrees horizontal (116 diagonal), from the Innomaker
+# U30CAM-4K-S1 user manual -- a 2.25 mm f/2.0 M12 lens on a 1/2.8" IMX415.
+# That is the manufacturer's figure, not a measurement here, and the same lens
+# is specified at TV distortion < -6.2%, i.e. visibly barrel. So the crop lands
+# us close to the trained geometry rather than exactly on it, and it matches
+# best at the centre of the frame.
+#
+# THEIRS: the MolmoAct2 BimanualYAM checkpoint was trained against pinhole
+# cameras whose intrinsics come straight from an HFOV
+# (sim_eval/robots/bimanual_yam.py, fx = (w/2)/tan(hfov/2), fy = fx):
+#     top    69.4 deg  -- RealSense D435i
+#     wrists 87.0 deg  -- RealSense D405
+#
+# Only the wrists are cropped here, by request. The field of view sets the size:
+#     scale = tan(87/2) / tan(105/2) = 0.7282
+# Every rounding takes the LARGER box, so the policy is never shown less of the
+# scene than training. dk1lab/fov.py does the arithmetic; dk1lab/crop.py moves
+# the pixels.
+#
+# --- The three hand-tuned adjustments -----------------------------------------
+#
+# crop_inset    extra pixels off the LEFT and RIGHT edges, beyond what the field
+#               of view asks for. Top and bottom follow in proportion so the box
+#               keeps the frame's aspect ratio -- a box that did not would be
+#               stretched anisotropically on the way back out, which is the exact
+#               distortion this whole section exists to remove. Positive narrows.
+# crop_shift_x  move the box right (+) or left (-).
+# crop_shift_y  move the box down (+) or UP (-). Up shows more of what is above
+#               the lens's centre line and drops the same amount off the bottom.
+#
+# ALL THREE ARE IN PIXELS AT 640 WIDE (dk1lab.fov.REFERENCE_WIDTH), scaled to
+# whatever the camera actually delivers. They are eyeballed on a picture, so
+# pixels are the natural unit -- but a pixel is a different angle at every
+# capture resolution and this cell runs two. Quoting them at one reference and
+# scaling keeps the geometry identical in teleop and rollout, which is the only
+# thing that makes "it looked right in teleop" evidence about what the policy
+# gets. Change the capture resolution and these numbers keep their meaning.
+#
+# Current values, tightened 2026-08-20 after the fourth rollout: inset 7, and
+# the view lifted 50 px. At [capture.policy] 1280x720 that is the box
+#     905x509 at (187,5) = 85.3 deg H / 54.8 deg V, sitting 100 px above centre
+# and at [capture.teleop] the same angles. `dk1 config show` prints it.
+#
+# NOTE the y of 5: that lift is 5 px off the top of the sensor, so -52 is about
+# the most this box can be raised. Past that the shift CLAMPS -- it will not
+# refuse to produce a picture mid-rollout -- and `dk1 config show` says CLAMPED
+# and prints what it actually achieved. To lift further, lower crop_inset (a
+# smaller box has more room to move) or widen target_hfov.
+#
+# It applies to EVERY image this cell produces -- teleop display, recording and
+# rollout alike -- because it is done in the camera, not in a policy processor.
+# `dk1 teleop --display` is therefore how you check it looks right, and
+# `dk1 policy dryrun --display-policy-input` shows the model's own 378x378.
+
+[cameras.top]
+path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:10.1:1.0-video-index0"
+rotation = 180
+hfov = 105.0
+# No target_hfov: the top view is left alone, by request. Note that at the
+# 1280x720 capture below there is now headroom to crop it to the trained 69.4
+# deg -- that would keep 683x384, still above the model's 378 rows -- so this is
+# a live experiment rather than an arithmetic impossibility. It was not at
+# 640x360, where the same crop kept only 341x192.
+
+[cameras.left]
+path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.3:1.0-video-index0"
+rotation = 180
+hfov = 105.0
+target_hfov = 87.0
+crop_inset = 6.0
+crop_shift_y = -40
+
+[cameras.right]
+path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.4:1.0-video-index0"
+rotation = 180
+hfov = 105.0
+target_hfov = 87.0
+crop_inset = 6.0
+crop_shift_y = -40
+
+# --- Capture profiles --------------------------------------------------------
+#
+# Device identity is shared; resolution is not. Teleop wants a big picture to
+# look at, the policy wants the aspect ratio it was trained on.
+#
+# MJPG is mandatory on these cameras. YUYV at 720p60 needs ~884 Mb/s and the
+# uvc driver fails to allocate the bandwidth — reads fail immediately.
+# VERIFIED on hardware.
+
+# What the policy sees. 16:9 is the aspect the BimanualYAM checkpoint was
+# trained on (sai-prasanna/molmoact2 @ sim-eval-dk1 renders its cameras at
+# 640x360), and a 4:3 capture would stretch the scene differently than training
+# did. Keep the ratio; the pixel count is a separate question, answered below.
+#
+# RAISED to 1280x720 on 2026-08-20. MolmoAct2 does NOT resize to 224x224 -- the
+# 224s in the checkpoint's normalizer are declared feature shapes under an
+# IDENTITY norm and never resize anything. The real resize is in the HF image
+# processor (processor_config.json: crop_mode "resize", size 378x378, patch 14),
+# and the packed tensor confirms it: pixel_values is [3, 729, 588] = 3 images of
+# 27x27 patches of 14x14x3 = 378x378.
+#
+# At 640x360 the wrist crop kept 455x256, so 256 real rows were being upsampled
+# 1.5x to fill a 378-row model input -- inventing detail the sensor never
+# captured. At 1280x720 the same crop keeps 909x511, and 511 -> 378 is a genuine
+# downscale. The top view goes 720 -> 378 likewise.
+#
+# It costs nothing on the control loop. MEASURED here: all three cameras sustain
+# 30.3 fps at 1280x720 MJPG, OpenCVCamera decodes on a per-camera background
+# thread rather than in the loop, and the crop-and-resize costs 1.6 ms per frame
+# on that thread (0.22 ms at 640x360). Read latency is frame-rate bound and
+# identical at both sizes.
+#
+# VERIFIED on hardware: all three cameras advertise both 640x360 and 1280x720
+# MJPG. Re-check any time with `dk1 config check --formats`, which reads the
+# advertised modes without opening a stream.
+[capture.policy]
+width = 1280
+height = 720
+fps = 30
+fourcc = "MJPG"
+
+# What you look at during teleoperation. Nothing downstream depends on it.
+[capture.teleop]
+width = 1280
+height = 720
+fps = 60
+fourcc = "MJPG"
+
+# --- Speed limits ------------------------------------------------------------
+#
+# How fast the followers are allowed to move, per activity. One table per
+# activity; `dk1 teleop` reads [limits.teleop].
+#
+# This is the limit that actually works. Upstream's `joint_velocity_scaling`
+# only reaches control_Pos_Vel, so it is a silent no-op in impedance mode —
+# which is the mode the bimanual follower runs by default. Do not treat it as a
+# safety knob. The real limiter lives in SafeBiDK1Follower
+# (`--robot.type=bi_dk1_follower_safe`) and applies in both modes.
+#
+# Keys, all optional:
+#   max_joint_rate    arm joint speed cap, rad/s. `false` = no limiting at all.
+#                     TOML has no null, so `false` is how "off" is spelled.
+#   max_gripper_rate  gripper speed cap, normalised units/s.
+#   max_lag           how far a command may lead the MEASURED position, rad.
+#                     Anti-windup: without it a blocked arm lets the setpoint
+#                     run away and then lunges when the obstruction clears.
+#   max_dt            longest elapsed time one command may claim, s, so a
+#                     stalled loop cannot come back entitled to a big step.
+#
+# When max_joint_rate is false the other three are inert, but they are kept so
+# that raising the cap later is a one-line edit.
+#
+# Delete this whole section and the built-in defaults apply.
+
+# Teleoperation runs UNCAPPED, which is what the DK1 does natively. The limiter
+# exists to bound a policy nobody trusts yet; in teleop the commands come from a
+# human hand, so a runaway is already bounded by the person holding the leader
+# arm. A cap tight enough to matter is tight enough to feel. It also costs a
+# serial round-trip per tick — the follower only reads the measured positions
+# when the limiter is enabled.
+#
+# Policy rollout is NOT covered by this table and stays tightly limited.
+[limits.teleop]
+max_joint_rate = false
+max_gripper_rate = 1.0
+max_lag = 0.15
+max_dt = 0.1
+
+# Policy rollout is the case the limiter was written for: a policy commanding
+# absolute joint targets at 30 Hz. Both numbers below were raised on 2026-08-20
+# after measuring what the policy actually asks for — see MEASURED, below.
+#
+# max_joint_rate 1.0 rad/s (~57 deg/s), up from 0.3.
+#   The policy's motion is BURSTY, not fast on average: over a recorded 120 s
+#   sim episode the median demand is 0.036 rad/s, but p95 is 0.31 and the peak
+#   is 4.56 rad/s. So a 0.3 cap does not slow everything evenly — it truncates
+#   exactly the reach and transit moves, which are the ones that matter.
+#   Pushing that recorded episode through the real SlewLimiter:
+#       cap 0.3 -> worst joint ends up 0.98 rad (56 deg) behind the policy's
+#                  intent; 26% of ticks have a joint >0.1 rad behind
+#       cap 1.0 -> worst 0.40 rad (23 deg);  3.3% of ticks
+#       cap 2.0 -> worst 0.10 rad;           0% — effectively transparent
+#   1.0 is the knee: most of the distortion gone, still slow enough to watch.
+#
+# max_lag 0.4 rad, up from 0.1.
+#   THIS IS A TORQUE LIMIT, not a position clamp, and that is why 0.1 was too
+#   tight. In impedance mode torque = arm_kp * (q_des - q), with arm_kp =
+#   [100,100,100,20,20,10] (trlc_dk1_control/config.py). Clamping the lead to
+#   0.1 rad therefore capped the PD torque at 10 Nm on j1-j3 (motor limit 28),
+#   2 Nm on j4/j5 (limit 10) and 1 Nm on j6 (limit 10) — a tenth of what the
+#   wrist can do, on the joints the policy drives fastest. Worse, limiter.py
+#   writes the CLAMPED value back into _prev_cmd, so the command can never
+#   build more lead: if 0.1 rad of error will not break stiction, the joint
+#   stalls there silently and forever. That is the same deadlock limiter.py's
+#   own docstring argues against when it explains why the ramp anchors to the
+#   previous command rather than the measurement.
+#   0.4 rad restores ~4 Nm at the wrist and ~40 Nm of authority at the
+#   shoulder (still clipped to joint_torque_limits downstream, which is the
+#   limit that should be doing this job).
+#
+# The gripper is NOT slowed to match: a gripper that closes over three seconds
+# fails every grasp, and a slow gripper is not the hazard here.
+[limits.policy]
+max_joint_rate = 1.0
+max_gripper_rate = 1.0
+max_lag = 0.4
+max_dt = 0.1
+
+# The two-policy comparison's LEVEL PLAYING FIELD, selected by `--profile common`
+# on `dk1 policy run` and `dk1 policy session`. STUDY.md is the protocol; this is
+# the one table it adds to this file, and it adds nothing else — [limits.policy]
+# above is untouched and stays the default.
+#
+# Only the rate drops, to 0.6 rad/s. It sits between two measured points: at 0.3
+# the worst joint ended 0.98 rad behind the policy's intent on 26% of ticks; at
+# 1.0, 0.40 rad on 3.3%. Expect it to cost both policies something and record
+# what it costs — both wear the same handicap, so the comparison survives while
+# the absolute numbers carry the caveat.
+#
+# max_lag is deliberately NOT tightened with it. It is a TORQUE clamp, not a
+# position one: tightening it once held j6 to a tenth of its authority and could
+# deadlock the setpoint. Lowering it would stall the arms, not make them safer.
+# See the [limits.policy] comment above.
+[limits.study]
+max_joint_rate = 0.6
+max_gripper_rate = 1.0
+max_lag = 0.4
+max_dt = 0.1
+
+# --- Policy checkpoint -------------------------------------------------------
+#
+# The MolmoAct2 BimanualYAM checkpoint this cell is evaluated against. `~` is
+# expanded. Override per run with `dk1 policy ... --checkpoint`.
+#
+# This points at the bfloat16 copy converted in the previous iteration of this
+# project (11 GB, converted from lerobot/MolmoAct2-BimanualYAM-LeRobot, whose
+# own model.safetensors is 21.8 GB of float32). Reusing it saves the conversion
+# and the ~20 s per-start cast; `dk1 policy check` verifies it is intact.
+#
+# Two things in that directory's config.json are wrong for us and are overridden
+# at load: "device": "cpu" (would silently run inference on the CPU) and a
+# "pretrained_path" pointing at the HF cache snapshot it was converted from.
+[policy]
+checkpoint = "~/Documents/RobotLearning/trlc-dk1/outputs/molmoact2_bimanual_yam_bf16"
+
+# --- Home pose ---------------------------------------------------------------
+#
+# Where the arms are sent when a policy run ends with `dk1 policy run --home`,
+# and where `dk1 policy home` drives them on demand. Seven numbers per arm, in
+# the order one arm contributes to the 14-D vector (dk1lab/layout.py):
+#
+#     joint_1, joint_2, joint_3, joint_4, joint_5, joint_6, gripper
+#
+# Joints in radians; the gripper is normalised, 0 = open and 1 = closed — the
+# DK1's own convention, not the checkpoint's inverted one.
+#
+# Do not type these by hand. Put the arms where you want home to be, then:
+#
+#     dk1 policy home --capture
+#
+# which reads both arms and rewrites only this section. Note that connecting
+# self-zeroes the grippers OPEN, so a captured home always has gripper 0 unless
+# something moved them in between.
+#
+# The section is OPTIONAL. It is filled in below, captured on 2026-08-19 with
+# both arms at their zero pose: every value is within 0.024 rad of zero and both
+# grippers read ~0, i.e. open. Were it absent, `--home` would fall back to the
+# pose the arms were in when the run connected — a pose, but not a chosen one —
+# and the banner would say so; `dk1 policy home` would refuse outright.
+#
+# The sweep is NOT LeRobot's return_to_initial_position, which is forced off:
+# it stops when the arms actually arrive rather than after a fixed 3 s, and says
+# so when they did not.
+#
+# It does NOT run at [limits.policy].max_joint_rate. That cap is an upper bound
+# on a policy nobody trusts yet, not a speed to aim for, and homing inheriting
+# it as one is what made the 2026-08-20 raise to 1.0 rad/s speed up homing as a
+# side effect. The sweep peaks at dk1lab.home.DEFAULT_HOME_RATE (0.3 rad/s), or
+# at the cap when that is tighter, and eases in and out of it — smoothstep up
+# over the first 0.75 s and down again over the last 0.25 rad, so the arms
+# neither snap into motion nor stop dead on the target.
+
+[home]
+left = [0.010872, -0.015068, 0.006294, 0.01545, -0.000191, -0.024224, 4.1e-05]
+right = [0.017739, -0.007057, 0.006294, 0.004768, -0.000191, 0.015068, 4.1e-05]

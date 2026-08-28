@@ -114,7 +114,9 @@ dk1.toml                THE device config. Tracked. Single source of truth.
 tests/                  the suite; none of it needs hardware
 GUIDE.md                operator docs
 docs/DIAGNOSTICS.md     the record: measurements, faults, discarded hypotheses
+docs/HUB.md             pushing the datasets, the .rrd and the checkpoints; and getting them back
 docs/CRASH.md           CLOSED. The machine freeze of 2026-08-25..27 — do not open it
+study/results.md        THE RESULTS: every scored attempt, its provenance, how to continue
 lerobot_robot_trlc_dk1/ UPSTREAM — LeRobot plugin classes
 trlc_dk1_control/       UPSTREAM — DM4310/DM4340 chain, impedance, MuJoCo grav-comp
 ```
@@ -301,27 +303,33 @@ Checkpoint: `lerobot/MolmoAct2-BimanualYAM-LeRobot` (LeRobot format);
 
 ## Evidence status — keep this line sharp
 
-**A0 is scored: nine attempts, zero successes, and the policy grasps.**
-2026-08-27, the first numbers this cell has ever produced on the arms. No
-fine-tune yet, and only one of the study's five rows. `study/scores/A0.csv` and
-the LeRobot dataset in `study/rollouts/A0` (9 episodes, 28 832 frames, not in
-git — it belongs on the Hub).
+**`study/results.md` is the record — read it before quoting any number.**
+It carries every scored attempt, where its frames are, and the provenance of
+each figure. **It carries no interpretation yet, on purpose**, and neither does
+this section: three of the study's six rows have numbers, one of those is a
+third of a row, and a comparison written now would be quoted long after the
+missing rows arrived. `docs/HUB.md` is where the data lives — the datasets, the
+`.rrd` and the checkpoints are far past what git can hold.
 
-| A0, MolmoAct2 zero-shot, `common` | scene 1 | scene 2 | scene 3 |
-| --- | --- | --- | --- |
-| highest step reached, three attempts each | 2, 2, 2 | 3, 3, 3 | 3, 1, 1 |
+**Two zero-shot rows are scored, and both are 0/9 with a ceiling of grasp. One
+fine-tuned row is a third scored.**
 
-**Success rate 0/9.** The ceiling is step 3 — it lifts the dice clear of the
-table and holds it — and it never carries it to the bowl. Read the rubric in
-`STUDY.md` before quoting those numbers.
+| highest step reached, three attempts per scene | scene 1 | scene 2 | scene 3 | success |
+| --- | --- | --- | --- | --- |
+| **R0** MolmoAct2 zero-shot, `optimized` (2026-08-28) | 3, 3, 3 | 3, 3, 3 | 2, 2, 2 | **0/9** |
+| **A0** MolmoAct2 zero-shot, `common` (2026-08-27) | 2, 2, 2 | 3, 3, 3 | 3, 1, 1 | **0/9** |
+| **R1** MolmoAct2 + LoRA @4 000, `optimized` (2026-08-28) | **5, 5, 2** | — | — | **partial, 3 of 9** |
 
-**The right arm is the better one**, which settles the oldest open question here
-the other way round: it scored 3 in all four attempts it was used for, and the
-left scored 2, 2, 2, 1, 1 in five. That is nine attempts, not a study of arms,
-but it is the end of "the right arm does not pick anything up".
+Read the rubric in `STUDY.md` before quoting any of that. **R1 is three
+attempts at one layout and is not a row**; do not set it against R0 or A0 until
+its other six exist. Its checkpoint is step 4 000 of an unfinished 8 000-step
+run, which is itself an open protocol question — `STUDY.md`'s amendment of
+2026-08-28.
 
-`study/results.md` is still empty on purpose: one row cannot be compared to
-anything, and the file is for the comparison.
+**The right arm is not the weak one.** Across A0's nine it scored 3 in all four
+attempts it was used for against the left's 2, 2, 2, 1, 1; R0 split evenly by
+scene and shows nothing either way. That is enough to retire "the right arm does
+not pick anything up" and not enough to be a study of arms.
 
 What *is* settled:
 
@@ -340,15 +348,19 @@ What *is* settled:
 
 What is not:
 
-- a **score** — labelled attempts with a success count, which is the input to
-  the Phase 4 decision;
-- why **the right arm was reported not to pick anything up** — and note that
-  it has since been seen picking things up (Nikolas, 2026-08-27), so the
-  original observation was most likely the policy behaving oddly on the day
-  rather than anything about that arm. Still unscored either way; the CSV's
-  `arm` column is what will settle it;
+- **what the fine-tune bought.** R1 has three attempts at one scene. Six more
+  are needed before it is a row, and A1 — the same LoRA recipe under `common` —
+  has not been trained at all;
+- **anything comparing the rows.** R0 and A0 differ by lens *and* speed cap and
+  both scored 0/9; R1 differs from R0 by the LoRA alone but is a third of a row.
+  The interpretation section of `study/results.md` is deliberately unwritten;
+- **π0.5 on these arms.** B0 and B1 are unrun and blocked on the gated
+  `google/paligemma-3b-pt-224` licence;
 - anything about the crop retune (inset 6, view lifted 40) or the 1280×720
-  capture beyond "it ran".
+  capture beyond "it ran";
+- **why all three cameras timed out at once** in one session on 2026-08-28
+  (`TimeoutError ... read failed (status=False)`), killing an episode. One
+  occurrence, no diagnosis.
 
 Verified on hardware earlier, and not to be re-derived: the LeRobot plugin
 classes; the motor/impedance/grav-comp stack; bimanual teleoperation with and
@@ -379,8 +391,8 @@ subsystem directory: `...-usb-0:4.3:1.0` names both a camera and a leader arm.
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
 | **3** | Zero-shot MolmoAct2 evaluation | **done, and scored** — six debugging rollouts, then A0's nine labelled attempts on 2026-08-27. Every timing and motion fault this fork could cause is closed; what is left is the policy's own output, and it is 0/9 with a ceiling of grasp |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **done: 3/3** |
-| **4** | Record + LoRA fine-tune | **recording works on the arms** — `dk1 teleop --record-dataset`, `dk1lab/demos.py`, one episode recorded 2026-08-27. The **fine-tune pipeline is built and tested; nothing has been trained** — `dk1 policy finetune`, `dk1 dataset check`/`crop`, `dk1 policy curve` |
-| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=9 per row (3 scene configurations x 3 attempts) | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0, 1 and 2 are done: A0 is scored, 0/9.** Its Phase 3 — the demonstrations — is next, and its recorder is built |
+| **4** | Record + LoRA fine-tune | **done, and deployed.** 26 demonstrations recorded 2026-08-28 (`study/demos`), the R1 LoRA trained to ~4 400 of 8 000 steps (`study/finetune/R1-20260828-132023`), and its 4 000-step checkpoint taken to the arms the same day |
+| **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=9 per row (3 scene configurations x 3 attempts) | **in progress**, protocol in `STUDY.md` and results in `study/results.md`, both of which carry their own phase numbering. Its Phases 0–4 are done: **A0 0/9, R0 0/9, 26 demonstrations recorded, the R1 LoRA trained and partly deployed (3 of 9)**. Next is finishing R1's other six attempts |
 
 **Phase 1** built `dk1 find cameras`, `dk1 find arms --inspect` (read-only USB
 identity) and `dk1 config check --formats`. That last one matters: OpenCV
@@ -922,7 +934,8 @@ re-measuring anything.
 | touch the speed caps or the home sweep | § *What the caps were doing*, § *The home sweep speed* |
 | touch the trace, `--display` or `--display-policy-input` | § *The instruments* |
 | re-run the simulator, or quote the sim result | § *The sim run* |
-| run, change or quote the two-policy comparison | `STUDY.md` — the protocol, not `docs/DIAGNOSTICS.md` |
+| run, change or quote the two-policy comparison | `STUDY.md` for the protocol and `study/results.md` for what it scored — not `docs/DIAGNOSTICS.md` |
+| push or pull the datasets, the `.rrd` or a fine-tune checkpoint | `docs/HUB.md` — none of it is in git, and it says what is deliberately not pushed |
 | wonder what a past rollout on the arms actually showed | § *The rollouts on the arms* |
 | chase a machine freeze, if one ever returns | `docs/CRASH.md` § *How it was found* — closed 2026-08-27, a BIOS update. Do not re-run the investigation from the top |
 | touch the fine-tune, the crop applied at training time, or the hold-out | `STUDY.md` § *Fine-tuning* and its *Amendments*, then `dk1lab/finetune.py` and `dk1lab/recrop.py` — both carry their reasoning in their module docstrings |
