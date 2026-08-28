@@ -103,6 +103,8 @@ dk1lab/                 everything this fork adds; the only Python we own
   dataset.py            the LeRobot v3.0 recorder — alongside record.py, not instead
   demos.py              teleop demonstrations: Enter starts, Enter stops, `again` deletes
   study.py              the score sheet: scenes, attempts, the CSV  (no lerobot import)
+  finetune.py           the LoRA recipe, the hold-out, the run directory (no lerobot import)
+  recrop.py             the optimized crop, applied to a recorded dataset
   logs.py               a session log file, fsynced per record       (no lerobot import)
   telemetry.py          PSU, CPU and GPU once a second, fsynced      (no lerobot import)
   scene.py              the bimanual MuJoCo scene, generated from urdf/  (no lerobot)
@@ -377,7 +379,7 @@ subsystem directory: `...-usb-0:4.3:1.0` names both a camera and a leader arm.
 | **2** | Teleoperation | **done** — run on the arms, limits tuned |
 | **3** | Zero-shot MolmoAct2 evaluation | **done, and scored** — six debugging rollouts, then A0's nine labelled attempts on 2026-08-27. Every timing and motion fault this fork could cause is closed; what is left is the policy's own output, and it is 0/9 with a ceiling of grasp |
 | **3s** | The same policy in ManiSkill, via the colleague's `sim_eval` | **done: 3/3** |
-| **4** | Record + LoRA fine-tune | **recording works on the arms** — `dk1 teleop --record-dataset`, `dk1lab/demos.py`, one episode recorded 2026-08-27. The fine-tune is gated on reviewing Phase 3 together |
+| **4** | Record + LoRA fine-tune | **recording works on the arms** — `dk1 teleop --record-dataset`, `dk1lab/demos.py`, one episode recorded 2026-08-27. The **fine-tune pipeline is built and tested; nothing has been trained** — `dk1 policy finetune`, `dk1 dataset check`/`crop`, `dk1 policy curve` |
 | **5** | The two-policy comparison — MolmoAct2 vs π0.5, one task, N=9 per row (3 scene configurations x 3 attempts) | protocol in `STUDY.md`, which carries its own phase numbering. **Its Phases 0, 1 and 2 are done: A0 is scored, 0/9.** Its Phase 3 — the demonstrations — is next, and its recorder is built |
 
 **Phase 1** built `dk1 find cameras`, `dk1 find arms --inspect` (read-only USB
@@ -413,6 +415,10 @@ it open, so a finger resting in a trigger gets pushed.
 | `dk1 policy run` | the rollout | the policy drives the arms |
 | `dk1 policy session` | load once, then rollout after rollout, task by task | the policy drives the arms |
 | `dk1 policy home` | the home sweep alone, no model | both arms move |
+| `dk1 policy finetune` | the LoRA training run | GPU only, nothing connected |
+| `dk1 policy curve` | which checkpoint to deploy, off the log | none — two text files |
+| `dk1 dataset check` | is the recorded dataset what we meant? | none — metadata only |
+| `dk1 dataset crop` | the optimized crop, into a copy of a dataset | the video encoder, nothing else |
 | `dk1 study photo` | one still of a scene layout | a video device, nothing else |
 | `dk1 study scores` | reads a scored row's CSV back | none — a text file |
 | `dk1 doctor watch` | samples PSU, CPU and GPU once a second | none — sysfs and nvidia-smi |
@@ -666,6 +672,83 @@ capture, the rate and the codec. `DatasetEpisodeRecorder.attach_robot` is new �
 the same wrapping as `attach`, without a rollout context to reach the robot
 through.
 
+### The LoRA fine-tune (2026-08-27)
+
+`STUDY.md` Phase 4, and **nothing has been trained yet** — every item here is code
+and its tests. `dk1lab/finetune.py` is the recipe and the bookkeeping (no lerobot
+import); `dk1lab/recrop.py` is the crop applied to a dataset; the training itself
+is LeRobot's, run through its own entry point so the recorded command line is the
+one that ran.
+
+```
+dk1 dataset check study/demos                        # is it what we meant?
+dk1 dataset crop  study/demos study/demos-optimized  # R1's lens, materialised
+dk1 policy finetune --row R1                         # the run
+dk1 policy curve study/finetune/R1-<stamp>           # which checkpoint to deploy
+```
+
+Six things it must keep doing:
+
+- **The lens gate.** `finetune` refuses a dataset whose lens does not match the
+  row's profile — R1 on uncropped frames, A1 on cropped ones. That is `STUDY.md`'s
+  one invariant made mechanical, and it matters because the failure is invisible:
+  a checkpoint trained for a camera that does not exist looks exactly like the one
+  that was asked for. The lens comes from `dk1_lens.json` (written by `crop`) or,
+  failing that, from the episodes' own `profile` in `dk1_notes.jsonl`.
+- **The crop is materialised, not applied at load.** LeRobot's `image_transforms`
+  hook reaches the *training* dataset and not the evaluation one, and is called
+  per camera key **without the key** — so it can neither keep the held-out loss
+  honest nor leave the top view alone. `recrop` copies the dataset and rewrites
+  only the two wrist streams, through `dk1lab/crop.py`'s own box, cropping and
+  stretching back to the same size so every frame's count and timestamp survives
+  and the copy inherits the source's `meta/` unaltered. Its price is one encode
+  generation, stated in the module.
+- **The hold-out spans every scene.** LeRobot's `eval_split` takes the *last*
+  `ceil(n x split)` episodes, and the demonstrations are recorded grouped by
+  layout — so the last ten of 45 are all scene 3. `split_episodes` takes an even
+  spread from each scene and hands LeRobot the episode list in an order whose
+  **tail is the hold-out**, which needs no patch: `LeRobotDataset` stores
+  `episodes` verbatim and the split walks it in order.
+- **One repair is patched in, and it is not optional.** `lerobot_train` builds
+  `preprocessor_overrides` for `normalizer_processor` and
+  `postprocessor_overrides` for `unnormalizer_processor` whenever a policy loads
+  from a path, and the pipeline **raises** for an override naming no saved step.
+  MolmoAct2 has neither — it normalises through `molmoact2_masked_normalizer` —
+  so `lerobot-train` dies before step 1. Verified on the real checkpoint.
+  `finetune.patched` narrows the overrides to the steps that exist. Same class as
+  the two cherry-picks: worth upstreaming, do not do it.
+- **The run directory is written before training**, into
+  `study/finetune/<row>-<stamp>/`: `dk1_run.json` (row, recipe, budget, split,
+  checkpoint SHA-256, git SHA), a **copy** of `dk1.toml`, `command.txt`,
+  `dk1_command.txt`, and `train.log`. LeRobot owns `train/` beneath it, because
+  `TrainPipelineConfig.validate` refuses an `output_dir` that already exists.
+- **The gripper inversion goes OFF for every fine-tuned row.** The demonstrations
+  are in DK1 convention, so the weights end up speaking DK1. `curve` prints the
+  `dk1 policy session` line with `--no-invert-gripper` already in it.
+
+Two facts to carry with any number this produces:
+
+- **there is no early stop.** LeRobot 0.6.1 logs a held-out loss every
+  `eval_steps` and acts on none of it, so the budget runs to the end and
+  `dk1 policy curve` names the checkpoint with the lowest loss. `STUDY.md` said
+  *early-stop*; the amendment of 2026-08-27 is where the two were reconciled;
+- **what the adapter reaches differs between the two models.** π0.5's default
+  targets its action expert; **MolmoAct2's targets the VLM and leaves its 578 M
+  action expert frozen**, because LeRobot's generic PEFT path freezes every base
+  parameter first. `--adapt vlm+expert` extends MolmoAct2's *own* regex over the
+  action expert; the default is unchanged and the banner says which is in force.
+  `dk1lab.finetune.molmoact2_target_modules` is pinned against LeRobot's method
+  by a test, so it cannot drift.
+
+Defaults, all recorded and all movable by flag: **20 000 steps** (a budget, not
+epochs), batch 2, **lr 1e-4** — not the checkpoint's 1e-5, which is a full
+fine-tune's rate and barely moves a rank-32 adapter at scale 0.5 — warmup 200,
+decay over the budget rather than the preset's 100 000, an evaluation **and** a
+checkpoint every 1 000 steps (equal on purpose: otherwise the best loss belongs to
+a checkpoint nobody saved), 10 episodes held out, gradient checkpointing **on**.
+The recipe itself is `STUDY.md`'s and is not a flag: r=32, α=16, dropout 0.05,
+`modules_to_save=[]`.
+
 **`dk1 teleop --profile` changed meaning** (2026-08-27). It is now
 `optimized`/`common`, as on `dk1 policy run`; the `[capture.*]` table it used to
 name is `--capture`. One word had two meanings on the command line that records
@@ -780,6 +863,7 @@ re-measuring anything.
 | run, change or quote the two-policy comparison | `STUDY.md` — the protocol, not `docs/DIAGNOSTICS.md` |
 | wonder what a past rollout on the arms actually showed | § *The rollouts on the arms* |
 | chase a machine freeze, if one ever returns | `docs/CRASH.md` § *How it was found* — closed 2026-08-27, a BIOS update. Do not re-run the investigation from the top |
+| touch the fine-tune, the crop applied at training time, or the hold-out | `STUDY.md` § *Fine-tuning* and its *Amendments*, then `dk1lab/finetune.py` and `dk1lab/recrop.py` — both carry their reasoning in their module docstrings |
 | touch the dataset recorder, the codec, or anything about saving an episode | § *Recording: the crash that ate seven episodes*, § *Recording: the episode that took minutes to save*, § *Recording: the encode that could not fork*, § *Recording: four minutes to keep one episode* |
 | touch the session log, the console output, or any prompt the operator types at | § *The session console: a silenced prompt and a shouted decoder* |
 | benchmark anything | § *The 27.7 Hz loop* — a flat-out loop and a paced one disagree about the same function, and separate processes drift by more than the effect you are chasing |

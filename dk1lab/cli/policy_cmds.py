@@ -28,9 +28,10 @@ from ..config import DEFAULT_CONFIG_PATH, load
 from ..layout import ACTION_KEYS, CAMERA_NAMES, GRIPPER_INDICES, IMAGE_KEYS
 from ..fifo import DEFAULT_BLEND_STEPS, DEFAULT_REPLAN_AT
 from ..record import DEFAULT_RECORD_DIR
-from ..dataset import DEFAULT_DATASET_DIR, DEFAULT_VCODEC, one
+from ..dataset import DEFAULT_DATASET_DIR, DEFAULT_DEMO_DIR, DEFAULT_VCODEC, default_repo_id, one
 from ..policy import DEFAULT_EXECUTION_HORIZON, DEFAULT_FPS, HOME_AT_START_POSE
-from ..runprofile import DEFAULT_PROFILE, ProfileError
+from ..finetune import ADAPT_DEFAULT, DEFAULT_RUNS_DIR
+from ..runprofile import COMMON, DEFAULT_PROFILE, ProfileError
 from ..study import (
     DEFAULT_ATTEMPTS,
     DEFAULT_SCENE_DIR,
@@ -2340,6 +2341,369 @@ def home(
             fg=typer.colors.YELLOW,
         )
         raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------- #
+# The fine-tune
+# --------------------------------------------------------------------------- #
+
+HELP_FINETUNE = """LoRA fine-tune a policy on the recorded demonstrations. GPU only.
+
+STUDY.md Phase 4. Runs LeRobot's own trainer through its PEFT path, over the
+demonstrations recorded by `dk1 teleop --record-dataset`, and writes the run
+directory the protocol requires: the base checkpoint's hash, the dk1.toml in
+force, the command line, and the git SHA.
+
+    dk1 policy finetune --row R1        MolmoAct2 on the tuned rig  (the wrist crop)
+    dk1 policy finetune --row A1        MolmoAct2 on the level playing field
+    dk1 policy finetune --row B1        pi0.5, same recipe, same bytes
+
+The recipe is fixed by the protocol and is the same for every row: LoRA r=32,
+alpha=16, dropout=0.05, no fully-trained modules, a STEP budget rather than
+epochs, and ten episodes held out for validation. The hold-out is spread evenly
+across the three scene configurations, because the demonstrations are recorded
+grouped by scene and the last ten of them are all one layout.
+
+R1 trains on the CROPPED copy of the demonstrations — `dk1 dataset crop` makes
+it — and this command refuses to start if the dataset's lens does not match the
+row's profile. A1 and B1 train on the demonstrations as recorded.
+
+The arms are not involved and nothing is energised. It holds the GPU for hours."""
+
+
+@app.command("finetune", help=HELP_FINETUNE)
+def finetune(
+    row: Annotated[
+        str, typer.Option("--row", help="Which STUDY.md row to train: R1, A1 or B1.")
+    ] = "R1",
+    dataset_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--dataset-dir",
+            help="The demonstrations. Default: study/demos-optimized for R1, study/demos otherwise.",
+        ),
+    ] = None,
+    checkpoint: CheckpointOpt = None,
+    runs_dir: Annotated[
+        Path, typer.Option("--runs-dir", help="Where run directories go.")
+    ] = DEFAULT_RUNS_DIR,
+    steps: Annotated[int | None, typer.Option("--steps", help="Optimiser updates. NOT epochs.")] = None,
+    batch_size: Annotated[int | None, typer.Option("--batch-size", help="Frames per update.")] = None,
+    lr: Annotated[
+        float | None,
+        typer.Option("--lr", help="Peak learning rate. Default 1e-4, not the checkpoint's 1e-5."),
+    ] = None,
+    holdout: Annotated[
+        int | None, typer.Option("--holdout", help="Episodes reserved for validation.")
+    ] = None,
+    eval_every: Annotated[
+        int | None,
+        typer.Option(
+            "--eval-every",
+            help="Steps between held-out evaluations. A checkpoint is written at each one.",
+        ),
+    ] = None,
+    num_workers: Annotated[int | None, typer.Option("--num-workers", help="Dataloader workers.")] = None,
+    adapt: Annotated[
+        str,
+        typer.Option(
+            "--adapt",
+            help=(
+                "What the adapter attaches to. 'default' is each policy's own choice, "
+                "which for MolmoAct2 is the VLM ONLY and leaves its 578M action expert "
+                "frozen; 'vlm+expert' extends MolmoAct2's own regex over the action "
+                "expert, which is what pi0.5's default already covers."
+            ),
+        ),
+    ] = ADAPT_DEFAULT,
+    wandb_project: Annotated[
+        str | None, typer.Option("--wandb", help="Log to this Weights & Biases project.")
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Train even though the dataset check found problems."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Write the run directory and print the command line; train nothing.",
+        ),
+    ] = False,
+    log: Annotated[bool, typer.Option("--log/--no-log", help="Write train.log into the run dir.")] = True,
+    assume_yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation.")] = False,
+    config: ConfigOpt = DEFAULT_CONFIG_PATH,
+) -> None:
+    from dataclasses import replace as _replace
+
+    from ..dataset import DatasetError, summarise
+    from ..finetune import (
+        DEFAULT_BUDGET,
+        RECIPE,
+        FinetuneError,
+        describe_adapt,
+        run_name,
+        split_episodes,
+        target_modules,
+        train_argv,
+        train_dir,
+        write_run_dir,
+    )
+    from ..finetune import row as resolve_row
+    from ..finetune import run as run_training
+    from ..recrop import lens_profile
+
+    settings = load(config, require_devices=False)
+    try:
+        what = resolve_row(row)
+    except FinetuneError as exc:
+        typer.secho(f"\n{exc}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    directory = dataset_dir or (
+        DEFAULT_DEMO_DIR.with_name(DEFAULT_DEMO_DIR.name + "-optimized")
+        if what.cropped
+        else DEFAULT_DEMO_DIR
+    )
+    spec = ckpt.resolve(_checkpoint(settings, checkpoint))
+
+    budget = _replace(
+        DEFAULT_BUDGET,
+        **{
+            name: value
+            for name, value in (
+                ("steps", steps),
+                ("batch_size", batch_size),
+                ("lr", lr),
+                ("holdout", holdout),
+                ("eval_steps", eval_every),
+                ("save_freq", eval_every),
+                ("num_workers", num_workers),
+            )
+            if value is not None
+        },
+    )
+
+    try:
+        target_modules(what.family, adapt)  # a bad --adapt is a typo, not a run
+        summary = summarise(directory)
+        split = split_episodes(summary.scenes, budget.holdout)
+    except (DatasetError, FinetuneError) as exc:
+        typer.secho(f"\n{exc}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    # The lens is the invariant STUDY.md names as the one that will be violated
+    # if any is: train on frames the policy will never be shown again and the
+    # fine-tune is for a camera that does not exist.
+    lens = lens_profile(summary.root, summary.notes)
+    if lens != what.profile:
+        typer.secho(
+            f"\n{directory} carries the {lens or 'unknown'} lens, but {what.name} rolls out "
+            f"under {what.profile}.\n"
+            + (
+                "  Make the cropped copy first:\n"
+                f"    dk1 dataset crop {directory} {directory}-optimized\n"
+                if what.cropped and lens == COMMON
+                else "  Point --dataset-dir at the dataset recorded for this profile.\n"
+            ),
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    directory_name = run_name(what)
+    output = Path(runs_dir) / directory_name
+
+    typer.secho(f"\n{what.name} — {what.summary}", bold=True)
+    typer.echo(f"  checkpoint  {spec}")
+    typer.echo(f"  dataset     {directory} — {summary.episodes} episodes, {summary.frames} frames")
+    typer.echo(f"  lens        {lens}")
+    typer.echo(f"  split       {split.describe()}")
+    typer.echo(f"  recipe      {RECIPE.describe()}")
+    typer.echo(f"  adapting    {describe_adapt(what.family, adapt)}")
+    typer.echo(
+        f"  budget      {budget.steps} steps, batch {budget.batch_size}, lr {budget.lr:g}, "
+        f"warmup {budget.warmup}, eval+checkpoint every {budget.eval_steps}"
+    )
+    typer.echo(f"  run dir     {output}")
+
+    if summary.problems:
+        typer.secho(f"\n{len(summary.problems)} problem(s) with the dataset:", fg=typer.colors.RED)
+        for problem in summary.problems:
+            typer.secho(f"  - {problem}", fg=typer.colors.RED)
+        if not force:
+            typer.secho(
+                "\nrefusing to train. Run `dk1 dataset check` and fix them, or pass "
+                "--force if they are understood and acceptable.\n",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        typer.secho("--force: training anyway.\n", fg=typer.colors.YELLOW)
+
+    argv = train_argv(
+        dataset_root=directory,
+        repo_id=summary.repo_id or default_repo_id(directory),
+        checkpoint=spec,
+        output_dir=train_dir(output),
+        job_name=f"dk1-{what.name.lower()}",
+        split=split,
+        budget=budget,
+        recipe=RECIPE,
+        family=what.family,
+        adapt=adapt,
+        wandb_project=wandb_project,
+    )
+
+    typer.echo("\nlerobot-train \\\n  " + " \\\n  ".join(argv))
+
+    typer.secho(
+        f"\nafter this, {what.name} is rolled out with --no-invert-gripper: the "
+        f"demonstrations are in DK1 convention, so the fine-tuned weights speak DK1 "
+        f"and inverting would flip every grasp.",
+        fg=typer.colors.YELLOW,
+    )
+
+    typer.echo("\nhashing the base checkpoint ...")
+    write_run_dir(
+        output,
+        what=what,
+        argv=argv,
+        checkpoint=spec,
+        config_path=config,
+        dataset_root=directory,
+        split=split,
+        budget=budget,
+        recipe=RECIPE,
+        notes={
+            "dataset_episodes": summary.episodes,
+            "dataset_frames": summary.frames,
+            "dataset_lens": lens,
+            "dataset_settings": {name: values for name, values in summary.settings.items()},
+            "dataset_problems": summary.problems,
+            "adapt": adapt,
+            "adapting": describe_adapt(what.family, adapt),
+            "wandb_project": wandb_project,
+        },
+    )
+    typer.secho(f"wrote {output}/dk1_run.json, dk1.toml, command.txt", fg=typer.colors.GREEN)
+
+    if dry_run:
+        typer.secho("\n--dry-run: nothing was trained.\n", fg=typer.colors.GREEN)
+        return
+
+    if not assume_yes:
+        typer.secho(
+            f"\nThis loads {spec} onto the GPU and trains for {budget.steps} steps — hours. "
+            f"Nothing is energised and no arm moves.",
+            fg=typer.colors.YELLOW,
+        )
+        if not _confirm("start the training run?", default=False):
+            typer.secho("nothing was trained.", fg=typer.colors.YELLOW)
+            raise typer.Exit(code=1)
+
+    if log:
+        from ..logs import start as start_log
+
+        typer.echo(f"log -> {start_log('finetune', path=output / 'train.log')}")
+
+    typer.secho(f"\ntraining {what.name} ...\n", fg=typer.colors.GREEN)
+    run_training(argv, checkpoint=spec, say=typer.echo)
+
+    typer.secho(f"\n{what.name} trained. Read the curve back with:", fg=typer.colors.GREEN)
+    typer.echo(f"  dk1 policy curve {output}\n")
+
+
+HELP_CURVE = """Read a fine-tune's held-out loss back, and name the checkpoint to deploy.
+
+There is no early stop: LeRobot 0.6.1 measures a held-out loss every --eval-every
+steps and logs it, and nothing acts on it. So the budget runs to the end, a
+checkpoint is written at every evaluation, and this picks the one with the lowest
+held-out loss out of the ones that exist.
+
+Reads two text files — the training log and the checkpoint directory listing. No
+GPU, no model, no robot."""
+
+
+@app.command("curve", help=HELP_CURVE)
+def curve(
+    run_dir: Annotated[Path, typer.Argument(help="A run directory written by `dk1 policy finetune`.")],
+) -> None:
+    import json as _json
+
+    from ..finetune import best_checkpoint, checkpoint_steps, deployable, eval_losses
+
+    log_path = Path(run_dir) / "train.log"
+    record_path = Path(run_dir) / "dk1_run.json"
+    if not log_path.is_file():
+        typer.secho(
+            f"\n{log_path} does not exist — the run was started with --no-log, or "
+            f"{run_dir} is not a run directory.\n",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    record = _json.loads(record_path.read_text()) if record_path.is_file() else {}
+    total = int((record.get("budget") or {}).get("steps") or 0)
+    saved = checkpoint_steps(run_dir)
+    losses = eval_losses(log_path.read_text(encoding="utf-8", errors="replace"))
+
+    typer.secho(f"\n{run_dir}", bold=True)
+    if record:
+        typer.echo(f"  row {record.get('row')} — {record.get('summary')}")
+        typer.echo(f"  base {record.get('checkpoint')}")
+        typer.echo(f"  sha256 {record.get('checkpoint_sha256') or '(not hashed)'}")
+        typer.echo(f"  git {(record.get('git') or {}).get('sha') or '?'} "
+                   f"{'(clean)' if (record.get('git') or {}).get('clean') else '(DIRTY)'}")
+
+    if not losses:
+        typer.secho(
+            "\nno held-out loss was logged. Either --eval-every was never reached, or "
+            "the hold-out was empty.\n",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=1)
+
+    typer.secho("\nheld-out loss", bold=True)
+    for step, loss in losses:
+        mark = "  *" if step in set(saved) else "   "
+        typer.echo(f"  {step:>8} {loss:.5f}{mark}")
+    typer.echo("  * a checkpoint exists at this step")
+
+    best = best_checkpoint(log_path.read_text(encoding="utf-8", errors="replace"), available=saved)
+    if best is None:
+        typer.secho(
+            "\nno step has both a measured loss and a checkpoint on disk. Set "
+            "--eval-every equal to the checkpoint interval and run again.\n",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+
+    step, loss = best
+    where = deployable(run_dir, step, total or step)
+    typer.secho(f"\nbest: step {step}, held-out loss {loss:.5f}", fg=typer.colors.GREEN, bold=True)
+    typer.echo(f"  {where}")
+    if losses and best[0] == losses[-1][0]:
+        typer.secho(
+            "  the last evaluation is the best one — the curve was still improving, so "
+            "the budget may be short rather than the recipe wrong.",
+            fg=typer.colors.YELLOW,
+        )
+    row = str(record.get("row") or "A1")
+    profile = str(record.get("profile") or COMMON)
+    typer.secho("\nscore it with:", bold=True)
+    typer.echo(
+        f"  dk1 policy session --study {row} --profile {profile} --duration 120 \\\n"
+        f"    --checkpoint {where} --no-invert-gripper \\\n"
+        f"    --record-dataset --dataset-dir study/rollouts/{row}\n"
+    )
+    typer.secho(
+        "--no-invert-gripper is not optional: the fine-tune learned DK1 convention "
+        "from the demonstrations, and inverting it flips every grasp. Confirm it on "
+        "the FIRST episode before spending nine attempts.\n",
+        fg=typer.colors.YELLOW,
+    )
 
 
 __all__ = ["app"]

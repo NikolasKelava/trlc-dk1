@@ -7,6 +7,7 @@ import typer
 from ..config import ConfigError
 from . import (
     config_cmds,
+    dataset_cmds,
     doctor_cmds,
     find_cmds,
     policy_cmds,
@@ -46,6 +47,11 @@ app.add_typer(
     doctor_cmds.app,
     name="doctor",
     help="What the machine is doing, and what it was doing when it froze.",
+)
+app.add_typer(
+    dataset_cmds.app,
+    name="dataset",
+    help="Read a recorded dataset back, and derive the cropped copy for R1.",
 )
 app.add_typer(
     study_cmds.app,

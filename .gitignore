@@ -249,6 +249,22 @@ study/*
 !study/scene/
 !study/results.md
 
+# A training run's PROVENANCE is the study record — STUDY.md Phase 4 requires
+# the checkpoint hash, the dk1.toml in force, the command line and the git SHA —
+# and it is a handful of small text files. Its checkpoints and its optimiser state
+# are tens of GB and are not. So the run directory is re-included and everything
+# inside it is excluded again, file by file. The order matters and so does the
+# `!study/finetune/*/`: without it git never descends past the run directory and
+# the re-includes below are never looked at.
+!study/finetune/
+study/finetune/**
+!study/finetune/*/
+!study/finetune/*/dk1_run.json
+!study/finetune/*/dk1.toml
+!study/finetune/*/command.txt
+!study/finetune/*/dk1_command.txt
+!study/finetune/*/train.log
+
 # Session logs and machine telemetry: machine-local, and one jsonl per session
 # is a few hundred KB of numbers nobody else needs. CRASH.md says what they are.
 logs/

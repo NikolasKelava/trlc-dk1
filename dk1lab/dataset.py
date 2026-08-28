@@ -70,6 +70,12 @@ logger = logging.getLogger(__name__)
 #: the Hugging Face Hub.
 DEFAULT_DATASET_DIR = Path("study")
 
+#: Where the demonstrations go. ``STUDY.md`` names this directory. Defined here
+#: rather than in the command that writes it, because the command that *reads*
+#: it is a different one — ``dk1 policy finetune`` — and two spellings of one
+#: directory is how a fine-tune ends up trained on yesterday's recording.
+DEFAULT_DEMO_DIR = DEFAULT_DATASET_DIR / "demos"
+
 #: The video codec. ``auto`` picks a hardware encoder when one is present, which
 #: on this machine is NVENC on the 5090 — and that is the whole point: LeRobot's
 #: default is SVT-AV1 on the CPU, which took **minutes** per episode for three
@@ -916,3 +922,238 @@ def one(*recorders: Any) -> Any:
     if not present:
         return None
     return present[0] if len(present) == 1 else Recorders(*present)
+
+
+# --------------------------------------------------------------------------- #
+# Reading one back
+# --------------------------------------------------------------------------- #
+#
+# A recording session is the one thing in this study that a day cannot buy back,
+# so the question "is what is on disk the dataset we meant to record?" has to be
+# answerable before anything is trained on it — and answerable *cheaply*, with
+# nothing decoded and no GPU touched. Everything below reads `meta/` and this
+# fork's own `dk1_notes.jsonl`: JSON and parquet, no torch, no LeRobot, no video.
+#
+# It is deliberately not `LeRobotDatasetMetadata`. That class downloads from the
+# Hub when local metadata looks incomplete, which for a half-written local
+# dataset named `dk1/demos` means a network error instead of the diagnosis.
+
+
+@dataclass(frozen=True)
+class DatasetSummary:
+    """What a recorded dataset says about itself, and what looks wrong with it.
+
+    ``problems`` is the part that matters: a dataset that reads back clean is
+    worth one line, and one that does not has to say so before an overnight run
+    is spent on it.
+    """
+
+    root: Path
+    repo_id: str = ""
+    codebase_version: str = ""
+    robot_type: str = ""
+    fps: int = 0
+    episodes: int = 0
+    frames: int = 0
+    lengths: tuple[int, ...] = ()
+    tasks: tuple[str, ...] = ()
+    cameras: dict[str, tuple[int, int]] = field(default_factory=dict)
+    video_bytes: int = 0
+    #: The per-episode records of ``dk1_notes.jsonl``, in the order written.
+    notes: list[dict[str, Any]] = field(default_factory=list)
+    #: ``{episode: scene}``, from the notes. ``None`` for an episode with no note.
+    scenes: dict[int, Any] = field(default_factory=dict)
+    #: The distinct value of each recording setting across the episodes. More
+    #: than one value in any of them means the dataset is not one experiment.
+    settings: dict[str, list[Any]] = field(default_factory=dict)
+    problems: list[str] = field(default_factory=list)
+
+    @property
+    def seconds(self) -> float:
+        return self.frames / self.fps if self.fps else 0.0
+
+    @property
+    def by_scene(self) -> dict[Any, int]:
+        counts: dict[Any, int] = {}
+        for scene in self.scenes.values():
+            counts[scene] = counts.get(scene, 0) + 1
+        return dict(sorted(counts.items(), key=lambda item: (item[0] is None, item[0])))
+
+
+#: Settings whose value must be the same in every episode of one dataset. The
+#: profile and the capture decide what the policy will see; the rate decides what
+#: an action chunk's time scale means. A dataset mixing two of any of them is two
+#: datasets, and a fine-tune cannot tell them apart.
+ONE_VALUE_SETTINGS = ("profile", "capture", "fps", "vcodec")
+
+
+def summarise(root: Path | str) -> DatasetSummary:
+    """Read a recorded dataset's metadata and say whether it looks right.
+
+    Decodes no video and loads no model: ``meta/info.json``, the episode
+    parquet, and ``dk1_notes.jsonl``. Seconds, not minutes.
+
+    Raises:
+        DatasetError: if the directory is not a LeRobot dataset at all. Every
+            other fault is a line in :attr:`DatasetSummary.problems`, because
+            the operator wants the whole list at once rather than the first one.
+    """
+    import json
+
+    from .finetune import episode_scenes, read_notes
+
+    root = Path(root)
+    info_path = root / "meta" / "info.json"
+    if not info_path.is_file():
+        raise DatasetError(
+            f"{root} is not a LeRobot dataset — no meta/info.json. Point at the "
+            f"dataset directory itself, not its parent."
+        )
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise DatasetError(f"{info_path}: invalid JSON — {exc}") from exc
+
+    problems: list[str] = []
+    lengths, tasks = _episode_lengths(root, problems)
+    features = info.get("features") or {}
+    cameras = {}
+    for key, feature in features.items():
+        if not key.startswith("observation.images."):
+            continue
+        shape = feature.get("shape") or []
+        if len(shape) == 3:
+            cameras[key] = (int(shape[1]), int(shape[0]))
+
+    notes = read_notes(root)
+    episodes = len(lengths)
+    scenes = episode_scenes(notes, range(episodes))
+    settings = {
+        name: sorted(
+            {record[name] for record in notes if name in record}, key=lambda value: str(value)
+        )
+        for name in ONE_VALUE_SETTINGS
+    }
+
+    summary = DatasetSummary(
+        root=root,
+        repo_id=str(info.get("repo_id") or ""),
+        codebase_version=str(info.get("codebase_version") or ""),
+        robot_type=str(info.get("robot_type") or ""),
+        fps=int(info.get("fps") or 0),
+        episodes=episodes,
+        frames=sum(lengths),
+        lengths=tuple(lengths),
+        tasks=tuple(sorted(tasks)),
+        cameras=cameras,
+        video_bytes=_tree_bytes(root / "videos"),
+        notes=notes,
+        scenes=scenes,
+        settings=settings,
+        problems=problems,
+    )
+    problems.extend(_faults(summary, info))
+    return summary
+
+
+def _episode_lengths(root: Path, problems: list[str]) -> tuple[list[int], set[str]]:
+    """Every episode's frame count and task, from ``meta/episodes/``.
+
+    The episode metadata is what the 2026-08-25 freeze destroyed while leaving
+    the videos intact, so its absence is the fault this function exists to find:
+    a dataset whose ``videos/`` is full and whose ``meta/episodes/`` is empty has
+    no per-frame state and cannot be trained on.
+    """
+    import pyarrow.parquet as pq
+
+    directory = root / "meta" / "episodes"
+    if not directory.is_dir():
+        problems.append(
+            "meta/episodes/ is missing entirely — the videos may be intact but the "
+            "per-episode metadata is not, and nothing can read the frames back"
+        )
+        return [], set()
+
+    lengths: list[int] = []
+    tasks: set[str] = set()
+    for path in sorted(directory.rglob("*.parquet")):
+        try:
+            table = pq.read_table(path)
+        except Exception as exc:  # noqa: BLE001 - a bad file is a finding, not a crash
+            problems.append(f"{path.relative_to(root)} cannot be read: {exc}")
+            continue
+        columns = table.column_names
+        if "length" in columns:
+            lengths.extend(int(value) for value in table.column("length").to_pylist())
+        if "tasks" in columns:
+            for entry in table.column("tasks").to_pylist():
+                if isinstance(entry, list):
+                    tasks.update(str(task) for task in entry)
+                elif entry is not None:
+                    tasks.add(str(entry))
+    return lengths, tasks
+
+
+def _tree_bytes(directory: Path) -> int:
+    """Total size of a directory tree, or 0 if it is not there."""
+    if not directory.is_dir():
+        return 0
+    return sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
+
+
+def _faults(summary: DatasetSummary, info: dict[str, Any]) -> list[str]:
+    """Everything wrong with a dataset that its own metadata can reveal."""
+    found: list[str] = []
+
+    if summary.codebase_version != CODEBASE_VERSION:
+        found.append(
+            f"codebase_version is {summary.codebase_version!r}, not {CODEBASE_VERSION!r} — "
+            f"a v2.1 directory has a different layout and reading it with a v3.0 tool "
+            f"fails later rather than here"
+        )
+    if summary.episodes == 0:
+        found.append("no episodes: meta/episodes/ holds nothing")
+    if len(summary.tasks) > 1:
+        found.append(
+            f"{len(summary.tasks)} different task strings: {sorted(summary.tasks)}. The "
+            f"prompt has to be byte-identical on every frame — it is what both "
+            f"fine-tunes condition on"
+        )
+    if missing := [name for name in CAMERA_NAMES if f"observation.images.{name}" not in summary.cameras]:
+        found.append(f"missing camera stream(s): {missing}; this cell records {list(CAMERA_NAMES)}")
+    sizes = set(summary.cameras.values())
+    if len(sizes) > 1:
+        found.append(f"the cameras disagree about frame size: {sorted(sizes)}")
+    if summary.frames and summary.video_bytes == 0:
+        found.append("videos/ is empty although episodes were recorded — the encodes failed")
+
+    short = [index for index, length in enumerate(summary.lengths) if length < 2]
+    if short:
+        found.append(f"episode(s) {short} hold fewer than two frames")
+
+    for name in ONE_VALUE_SETTINGS:
+        values = summary.settings.get(name) or []
+        if len(values) > 1:
+            found.append(
+                f"the episodes disagree about {name}: {values}. One dataset is one "
+                f"observation path; two is two experiments mixed together"
+            )
+
+    if not summary.notes:
+        found.append(
+            "no dk1_notes.jsonl — the scene of each episode is unknown, so the "
+            "validation hold-out cannot be spread across the three layouts"
+        )
+    else:
+        unlabelled = [index for index, scene in summary.scenes.items() if scene is None]
+        if unlabelled:
+            found.append(f"episode(s) {unlabelled} carry no scene label")
+        noted = {record.get("episode") for record in summary.notes}
+        if summary.episodes and len(noted) != summary.episodes:
+            found.append(
+                f"{len(noted)} episode(s) have notes but {summary.episodes} are on disk"
+            )
+
+    if (info.get("fps") or 0) <= 0:
+        found.append("fps is missing or zero in meta/info.json")
+    return found

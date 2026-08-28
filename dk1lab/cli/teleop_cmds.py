@@ -25,16 +25,12 @@ import typer
 from ..cameras import crop_summary
 from ..modelview import DEFAULT_EVERY
 from ..config import DEFAULT_CONFIG_PATH, load
-from ..dataset import DEFAULT_DATASET_DIR, DEFAULT_VCODEC
+from ..dataset import DEFAULT_DEMO_DIR, DEFAULT_VCODEC
 from ..runprofile import COMMON, DEFAULT_PROFILE, ProfileError, resolve
 from ..teleop import DEFAULT_FPS, TELEOP_LIMITS, build, run
 from .safety import LEADER_HELP, MOTION_HELP, confirm_motion
 
 ConfigOpt = Annotated[Path, typer.Option("--config", "-c", help="Path to dk1.toml.")]
-
-#: Where the demonstrations go. ``STUDY.md`` names this directory; it is not in
-#: git — it is a LeRobot dataset and belongs on the Hugging Face Hub.
-DEFAULT_DEMO_DIR = DEFAULT_DATASET_DIR / "demos"
 
 #: The loop rate a recorded demonstration runs at. **The policy's rate, not
 #: teleoperation's.** It is written into the dataset's metadata and it is what

@@ -336,6 +336,48 @@ and reused verbatim in Phase 7. Hold out 10 of the ~100 episodes for validation 
 early-stop on it. Log the checkpoint hash, the `dk1.toml` in force, the command
 line and the git SHA into each run directory.
 
+### Running a training run
+
+`dk1 policy finetune` is the one command. It drives LeRobot's own trainer through
+its PEFT path and adds only what this study needs around it: the row, the lens
+gate, the stratified hold-out, and the run directory.
+
+```
+# R1 — MolmoAct2 on the tuned rig. Needs the CROPPED copy of the demonstrations.
+dk1 dataset check study/demos
+dk1 dataset crop  study/demos study/demos-optimized
+dk1 policy finetune --row R1
+
+# A1 — the level playing field, on the demonstrations exactly as recorded.
+dk1 policy finetune --row A1 --dataset-dir study/demos
+
+# afterwards: which checkpoint to deploy
+dk1 policy curve study/finetune/R1-<stamp>
+```
+
+`--dry-run` writes the run directory and prints the `lerobot-train` line without
+training. `--steps`, `--batch-size`, `--lr`, `--eval-every` and `--holdout` move
+the budget; whatever they are set to is recorded, and the same numbers are reused
+in Phase 7.
+
+**The command refuses to start if the dataset's lens does not match the row's
+profile** — R1 on uncropped frames, or A1 on cropped ones. That is the invariant
+in *What gets recorded, and where* made mechanical: a checkpoint trained for a
+camera that does not exist looks exactly like the one that was asked for.
+
+Three things about the recipe are worth knowing before reading a result:
+
+- **the normalisation is the checkpoint's, not the dataset's.** MolmoAct2
+  normalises through its own masked normalizer keyed by `norm_tag`, so the
+  fine-tune trains and deploys under the same statistics A0 ran under. Our
+  demonstrations are in DK1 convention and the YAM statistics are the units they
+  are expressed in; the adapter learns the rest. Changing that would make A1 and
+  A0 differ by more than the LoRA;
+- **what the adapter reaches is not the same for the two models** — see the
+  amendment of 2026-08-27 below, and `--adapt`;
+- **there is no early stop** — the budget runs to the end and `dk1 policy curve`
+  names the checkpoint with the lowest held-out loss. Also an amendment below.
+
 ---
 
 ## The simulator
@@ -607,3 +649,7 @@ A protocol that moves silently is not a protocol.
 | 2026-08-27 | **The demonstration set is 45 episodes, not ~100** — 15 at each of the three scene configurations | Nikolas's call, before the first hour of it is spent. 45 is what one session of hands can produce, and it is enough to say whether a LoRA on this cell moves the number at all; if it does, more demonstrations are the cheapest next thing to buy. The ~100 in *The question* and in *Fine-tuning* should be read as "our own demonstrations", and the count reported with the result |
 | 2026-08-27 | **Demonstrations are captured under `--profile common` — the full lens — and the `optimized` crop is applied at training time** for R1 | One dataset then serves both R1 and A1, which halves the hands and keeps the two rows trained on the same bytes. It does not weaken the invariant in *What gets recorded, and where*: the crop is a deterministic transform of a 1280x720 frame that `dk1lab/crop.py` already owns, so applying it to the recorded frames produces the same image the `optimized` camera would have delivered. Recording it the other way round — crop-first — cannot be undone and would leave A1 with no dataset at all |
 | 2026-08-27 | `dk1 teleop --record-dataset` is how Phase 3 is recorded, and its `--profile` means what it means everywhere else | Teleoperation had no recorder; the demonstrations are the one thing this study cannot buy back. The capture profile it already had is now `--capture`, so `--profile optimized\|common` has one meaning across the CLI and cannot be confused with `[capture.teleop]` on the command line that records the dataset the fine-tunes are built from |
+| 2026-08-27 | **The training-time crop is materialised, not applied at load.** `dk1 dataset crop` writes `study/demos-optimized`: a copy of the demonstrations whose two wrist video streams have been rewritten through `dk1lab/crop.py`'s own box. `dk1 policy finetune --row R1` refuses a dataset whose lens does not match the row | LeRobot's per-sample `image_transforms` hook cannot do it: `make_train_eval_datasets` passes it to the **training** dataset and `None` to the evaluation one, so the held-out loss would measure a different camera; and it is called per camera key without the key, so it cannot crop the wrists and leave the top view alone. Materialising also means the frames a row trained on can be opened and looked at. The price is one encode generation — the recorded frame is decoded, cropped and re-encoded, where the camera crops before its only encode — and a disk copy. Nothing else changes: the box is cropped and stretched back to 1280x720, so every frame's size, count and timestamp survives and the copy inherits the source's `meta/` unaltered |
+| 2026-08-27 | **Early stopping becomes checkpoint selection.** The budget runs to the end, a checkpoint is written at every evaluation, and `dk1 policy curve` names the one with the lowest held-out loss | LeRobot 0.6.1 has no early stop: it computes an eval loss every `eval_steps` and logs it, and nothing acts on it. Selection is also the better instrument for a run that gets one overnight attempt — a stop cannot be un-run, and the curve is worth having whole. What is given up is GPU hours, not evidence. The hold-out, its size and its purpose are unchanged |
+| 2026-08-27 | **The LoRA target modules are NOT the same in shape for the two models**, and `--adapt` is the lever. The default stays each policy's own | *Fine-tuning* above says both defaults are "the action expert's q/v projections plus the state and action IO projections". That is exactly pi0.5's default and **not** MolmoAct2's, whose default targets the vision-language model's linear leaves; and LeRobot's generic PEFT path freezes every base parameter first, so under the defaults R1 and A1 would adapt MolmoAct2's VLM with its 578 M action expert frozen solid while B1 adapts pi0.5's action expert. `--adapt vlm+expert` extends MolmoAct2's **own** regex over its action expert. Which to use is a decision, not a bug fix, so the default is unchanged and the banner says out loud what is being adapted |
+| 2026-08-27 | **The hold-out is spread evenly across the three scene configurations**, not taken as the last ten episodes | LeRobot's `eval_split` holds out the last `ceil(n x split)` episodes per task, and the demonstrations are recorded grouped by scene — so the last ten of 45 are all scene 3. A validation set that is one layout measures one layout. Within a scene the picks are evenly spaced rather than the last few, because a session of teleoperation drifts and the steadiest demonstrations are at the end of each block. No patch was needed: the episode list is handed to LeRobot in an order whose tail is exactly the hold-out |
