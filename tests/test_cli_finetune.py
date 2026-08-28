@@ -18,6 +18,7 @@ import json
 import pytest
 from typer.testing import CliRunner
 
+from dk1lab import finetune
 from dk1lab.cli.main import app
 from dk1lab.layout import CAMERA_NAMES
 
@@ -116,8 +117,8 @@ def test_the_check_previews_the_validation_split(runner, demos):
     """An unusable hold-out is a fact about the recording, and it is cheaper to
     find out while the cell is still set up than after it is packed away."""
     result = runner.invoke(app, ["dataset", "check", str(demos)])
-    assert "35 train, 10 held out" in result.output
-    assert "scene 1: 4" in result.output or "scene 1: 3" in result.output
+    assert "41 train, 4 held out" in result.output
+    assert "scene 1" in result.output and "scene 3" in result.output
 
 
 def test_a_dataset_with_problems_exits_non_zero(runner, demos):
@@ -281,8 +282,8 @@ def test_the_run_directory_names_the_dataset_and_its_split(run_dir):
     record = json.loads((run_dir / "dk1_run.json").read_text())
     assert record["dataset_episodes"] == 45
     assert record["dataset_lens"] == "common"
-    assert len(record["split"]["holdout"]) == 10
-    assert len(record["split"]["train"]) == 35
+    assert len(record["split"]["holdout"]) == finetune.DEFAULT_BUDGET.holdout
+    assert len(record["split"]["train"]) == 45 - finetune.DEFAULT_BUDGET.holdout
 
 
 def test_the_run_directory_is_named_for_its_row(run_dir):

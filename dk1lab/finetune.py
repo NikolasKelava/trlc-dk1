@@ -305,7 +305,10 @@ class TrainingBudget:
             moves at it. Change it against a loss curve, not against this line.
         warmup: steps of linear warmup before the cosine decay.
         holdout: episodes reserved for validation, taken evenly from every
-            scene. Ten, per ``STUDY.md``.
+            scene. **Four**, amended from ``STUDY.md``'s ten on 2026-08-28:
+            ten was set against 45 demonstrations and 26 were recorded, where it
+            would hold out 38% of them. Four is 15%, and the same number has to
+            be reused in Phase 7 for the two rows to be comparable.
         gradient_checkpointing: recompute activations instead of storing them.
             **On.** The alternative on this card is an out-of-memory error a few
             hundred steps in, which is the expensive way to find out.
@@ -317,7 +320,7 @@ class TrainingBudget:
     warmup: int = 200
     eval_steps: int = 1_000
     save_freq: int = 1_000
-    holdout: int = 10
+    holdout: int = 4
     num_workers: int = 4
     seed: int = 1000
     gradient_checkpointing: bool = True

@@ -58,6 +58,12 @@ def test_the_budget_is_steps_and_not_epochs():
     assert not hasattr(finetune.DEFAULT_BUDGET, "epochs")
 
 
+def test_the_holdout_is_the_amended_four():
+    """Ten was set against 45 demonstrations; 26 were recorded. STUDY.md amendment
+    of 2026-08-28 — and Phase 7 has to reuse whatever this is."""
+    assert finetune.DEFAULT_BUDGET.holdout == 4
+
+
 def test_a_checkpoint_exists_at_every_measured_loss():
     """Otherwise the best held-out loss belongs to a checkpoint nobody saved."""
     assert finetune.DEFAULT_BUDGET.eval_steps == finetune.DEFAULT_BUDGET.save_freq

@@ -757,7 +757,9 @@ epochs), batch 2, **lr 1e-4** — not the checkpoint's 1e-5, which is a full
 fine-tune's rate and barely moves a rank-32 adapter at scale 0.5 — warmup 200,
 decay over the budget rather than the preset's 100 000, an evaluation **and** a
 checkpoint every 1 000 steps (equal on purpose: otherwise the best loss belongs to
-a checkpoint nobody saved), 10 episodes held out, gradient checkpointing **on**.
+a checkpoint nobody saved), **4 episodes held out** (`STUDY.md` amendment of
+2026-08-28: its 10 was set against 45 demonstrations and 26 were recorded, where
+it would hold out 38% of them), gradient checkpointing **on**.
 The recipe itself is `STUDY.md`'s and is not a flag: r=32, α=16, dropout 0.05,
 `modules_to_save=[]`.
 

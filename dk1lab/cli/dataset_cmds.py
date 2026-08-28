@@ -23,6 +23,10 @@ from typing import Annotated
 import typer
 
 from ..config import DEFAULT_CONFIG_PATH, load
+from ..finetune import DEFAULT_BUDGET
+
+#: The protocol's hold-out, so `check` previews the split `finetune` will use.
+DEFAULT_HOLDOUT = DEFAULT_BUDGET.holdout
 
 
 app = typer.Typer(no_args_is_help=True, help=__doc__)
@@ -47,7 +51,7 @@ def check(
     holdout: Annotated[
         int,
         typer.Option("--holdout", help="Preview the validation split this many episodes wide."),
-    ] = 10,
+    ] = DEFAULT_HOLDOUT,
 ) -> None:
     from ..dataset import DatasetError, summarise
     from ..finetune import FinetuneError, split_episodes

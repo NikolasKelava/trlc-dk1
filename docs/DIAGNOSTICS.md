@@ -1492,3 +1492,50 @@ session, that is not a close call.
 `study/demos` as recorded on 2026-08-27 carries two of these: episodes 0 and 5,
 one frame each. v3.0 cannot take an episode back out, so they stay until the
 directory is re-recorded.
+
+## Recording: the demonstration set, and what the training-time crop costs
+
+2026-08-28. `STUDY.md` Phase 3 is done and Phase 4's input exists.
+
+**The set.** 26 episodes, 18 484 frames, 10.3 minutes, one continuous session
+10:47–11:08 under `--profile common` / `[capture.policy]` 1280x720 / 30 Hz /
+uncapped, NVENC, `--stream-video` on. One task string on every frame. Episode
+length 431–1040 frames, mean 711 (23.7 s), and it falls through the session —
+1040 frames for the first, ~500 for the twenties — which is the operator getting
+faster, not the task changing. Every video file decodes to exactly the frame
+count its episode metadata claims: 6098 + 12386 = 18 484 per camera, three
+cameras, no loss.
+
+**Not 45, and not three labels.** Time ran out at 26; the hold-out drops from 10
+to 4 accordingly (`STUDY.md` amendment of 2026-08-28) because 10 of 26 is 38% of
+the set. And every episode was written as `scene 1`: the layouts *were* varied but
+`scene <n>` was never typed, so the labels were all the session's opening value.
+Relabelled from the operator's own ranges — 0–7 scene 1, 8–14 scene 2, 15–25
+scene 3 — with `scene_source` on each corrected record saying so, and the file as
+written kept beside it as `dk1_notes.recorded.jsonl`. The hold-out then lands on
+episodes 4, 11, 15, 25, one from each of the first two scenes and two from the
+third, which is the proportion of 8/7/11.
+
+Worth noticing for the next session: **the scene label is sticky and silent.**
+Nothing prompts for it and nothing warns when a whole set carries one value, so
+the failure mode is not an error, it is a dataset that quietly says something
+untrue. `dk1 dataset check` prints the per-scene counts, which is what caught it.
+
+**What the training-time crop costs — 40 dB, and 203 s.**
+`dk1 dataset crop study/demos study/demos-optimized` rewrote the two wrist
+streams through the box `dk1 config show` reports (909x511 at (185,24), 85.6 deg
+H) and copied the top view byte-for-byte. Four files, 36 968 frames, **203 s**.
+It reused the source's own encoder settings off `meta/info.json` — h264, crf 30,
+GOP 4 — so the copy differs from the original in pixels and nothing else.
+
+The generation loss the module warns about was measured rather than assumed:
+against the *ideal* crop-and-resize of each recorded frame, ten sampled frames
+give **min 39.2 dB, mean 40.4 dB** PSNR. That is visually lossless. The copy is
+also **41% smaller** (289 MB against 487 MB), and that is not quality thrown
+away — an upscaled crop carries less high-frequency detail than the frame it came
+from, so it compresses harder at the same CRF. Do not read the size drop as a
+warning.
+
+What this does **not** measure: the crop against what the `optimized` *camera*
+delivers live, which is never encoded at all. The training frames are bounded by
+the recording's own NVENC pass, and that bound is the same one A1's frames carry.
