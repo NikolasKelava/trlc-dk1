@@ -1411,3 +1411,84 @@ What would not have been a fix: treating the message as a fault. Two lines at
 start-up is normal. What matters is the recorder reporting **dropped frames**,
 or the message repeating every tick with visibly blocky images — that is USB
 bandwidth, and a different problem.
+
+## Recording demonstrations: the Enter that stopped the episode it started
+
+**2026-08-28.** Recording the fine-tune dataset, some episodes ended the instant
+they began: **one frame written, and the session over.** Not every time, and no
+error anywhere — the log for such a session ends with an ordinary disconnect.
+
+### What the logs said
+
+Three sessions on 2026-08-27 (`logs/20260827-1920`, `-1923`, `-1924`) end the
+same way, and it is the same shape in all three:
+
+```
+19:21:45.663  encoding episode 1 (850 frames) ...      <- the operator's Enter
+19:21:46.766  recording this episode into study/demos  <- 1.1 s later, ep2 starts
+19:21:47.076  encoding episode 2 (1 frames) ...        <- 0.31 s later, it is over
+19:21:48.307  DK1Follower disconnected.
+```
+
+Two numbers carry it. The **1.1 s** between the Enter and the episode actually
+starting is `save_episode` on the *previous* episode: `start_episode` commits the
+held one before it opens the next, and the loop does not tick while it does.
+The **0.31 s** after is one tick and then the loop exiting — the follower's
+`No command for 0.64 s` warning fires at the same moment, so the loop stopped
+ticking immediately, and `dk1_notes.jsonl` records the episode as 1 frame.
+
+### The cause: what was typed while nothing was listening
+
+The loop is the only thing reading the keyboard, and it stops reading for as long
+as it is writing an episode. The terminal goes quiet mid-command, which is
+indistinguishable from a hung process, so the operator presses Enter again — and
+those keystrokes wait in the terminal's input queue. The loop resumes *after* the
+next episode has started and reads them back one per tick: the first is an empty
+line, which means stop, so the new episode ends after a single frame; the second
+is `done`, or another Enter followed by `done`, and the session is over. Every
+keystroke did exactly what it says. It just arrived at an episode that did not
+exist when it was typed.
+
+Reproduced off the hardware, in a pty, with a fake dataset whose `save_episode`
+sleeps 1.2 s: one Enter and one `done` written during that sleep produce a
+1-frame episode and an ended session, exactly as on the cell.
+
+The same queue explains the first session's version of it, where the 1-frame
+episode is the *first* one: connecting takes fifteen seconds and asks two
+questions, and anything typed over that is still queued when the loop starts.
+
+### The fix
+
+`TerminalConsole.drain()` — every complete line already typed is discarded, and
+the operator is told how many. It is called where the loop resumes after not
+listening: at the top of `DemoSession.loop`, and in `start_episode` immediately
+after `commit_held`. Only whole lines go; a half-typed word survives, because the
+terminal has already echoed it and deleting it silently is its own confusion.
+
+Second guard, because the first one cannot cover a stray keypress that is
+genuinely mistimed: an episode shorter than `demos.MIN_EPISODE_S` (0.5 s) is
+**dropped rather than written**, with a line saying so. Half a second of
+teleoperation cannot show a task being done, and `dk1 dataset check` already
+reports a sub-two-frame episode as a fault — writing one and then flagging it is
+the worse half of both options.
+
+Third, unrelated to the input and found beside it: `DatasetEpisodeRecorder._close_tick`
+caught only `KeyError` around `_frame`. Anything else — a bad dtype, a `TypeError`
+— left through `send_action`, i.e. through the teleoperation loop, with the arms
+live. It catches every exception now, which is what the module docstring already
+claimed.
+
+### What this does not explain, and what it costs
+
+Nothing here touches the freeze itself: writing an episode still blocks the loop
+(about a second with `--stream-video`, minutes without — § *Recording: four
+minutes to keep one episode*), and the arms are uncommanded for that long. The
+drain makes the freeze harmless to the *next* episode; it does not remove it.
+
+The price is that a `done` typed during a write is thrown away with everything
+else and has to be typed again. Against a ruined episode and a terminated
+session, that is not a close call.
+
+`study/demos` as recorded on 2026-08-27 carries two of these: episodes 0 and 5,
+one frame each. v3.0 cannot take an episode back out, so they stay until the
+directory is re-recorded.

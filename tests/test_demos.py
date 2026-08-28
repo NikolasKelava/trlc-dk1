@@ -87,6 +87,14 @@ class ScriptedConsole:
     def poll(self) -> str | None:
         return self.lines.pop(0) if self.lines else None
 
+    def drain(self) -> int:
+        """Everything queued, thrown away — as the terminal's queue is."""
+        dropped = 0
+        while self.lines and self.lines[0] is not None:
+            self.lines.pop(0)
+            dropped += 1
+        return dropped
+
     def mute(self) -> None:
         self.muted = True
 
@@ -135,7 +143,7 @@ def drive(robot, ticks: int) -> None:
 def test_an_episode_is_not_written_when_it_is_stopped(live, robot):
     demo = session(live, robot)
     demo.start_episode()
-    drive(robot, 5)
+    drive(robot, 20)
     demo.stop_episode()
     assert live.dataset.episodes == []
     assert live.pending is not None
@@ -144,7 +152,7 @@ def test_an_episode_is_not_written_when_it_is_stopped(live, robot):
 def test_the_held_episode_is_written_when_the_next_one_starts(live, robot):
     demo = session(live, robot)
     demo.start_episode()
-    drive(robot, 5)
+    drive(robot, 20)
     demo.stop_episode()
     demo.start_episode()
     assert len(live.dataset.episodes) == 1
@@ -154,7 +162,7 @@ def test_the_held_episode_is_written_when_the_next_one_starts(live, robot):
 def test_again_deletes_the_held_episode_and_writes_nothing(live, robot):
     demo = session(live, robot)
     demo.start_episode()
-    drive(robot, 5)
+    drive(robot, 20)
     demo.stop_episode()
     assert demo.drop()
     demo.start_episode()
@@ -164,7 +172,7 @@ def test_again_deletes_the_held_episode_and_writes_nothing(live, robot):
 def test_again_during_an_episode_stops_it_and_throws_it_away(live, robot):
     demo = session(live, robot)
     demo.start_episode()
-    drive(robot, 5)
+    drive(robot, 20)
     demo.handle("again")
     assert demo.recorder is None
     assert live.pending is None
@@ -176,10 +184,10 @@ def test_again_cannot_reach_an_episode_already_on_disk(live, robot):
     """The whole reason the commit is one episode late — and its limit."""
     demo = session(live, robot)
     demo.start_episode()
-    drive(robot, 5)
+    drive(robot, 20)
     demo.stop_episode()
     demo.start_episode()  # commits the first
-    drive(robot, 5)
+    drive(robot, 20)
     demo.stop_episode()
     demo.drop()  # only reaches the second
     assert len(live.dataset.episodes) == 1
@@ -190,7 +198,7 @@ def test_a_recorded_episode_carries_its_scene_in_the_notes(live, robot):
 
     demo = session(live, robot, scene=2)
     demo.start_episode()
-    drive(robot, 3)
+    drive(robot, 20)
     demo.stop_episode()
     demo.commit_held()
     notes = json.loads((live.root / "dk1_notes.jsonl").read_text().splitlines()[0])
@@ -201,7 +209,7 @@ def test_a_recorded_episode_carries_its_scene_in_the_notes(live, robot):
 def test_the_scene_never_reaches_the_task_string(live, robot):
     demo = session(live, robot, scene=3)
     demo.start_episode()
-    drive(robot, 2)
+    drive(robot, 20)
     demo.stop_episode()
     demo.commit_held()
     assert live.dataset.episodes[0][0]["task"] == "put the dice in the bowl"
@@ -223,11 +231,11 @@ def test_ticks_between_episodes_are_not_recorded(live, robot):
     demo = session(live, robot)
     drive(robot, 4)
     demo.start_episode()
-    drive(robot, 3)
+    drive(robot, 20)
     demo.stop_episode()
     drive(robot, 4)
     demo.commit_held()
-    assert len(live.dataset.episodes[0]) == 3
+    assert len(live.dataset.episodes[0]) == 20
 
 
 # --------------------------------------------------------------------------- #
@@ -245,7 +253,7 @@ def test_the_held_episode_counts_towards_the_next_index(live, robot):
     """It is not in the dataset yet, but it will be by the time the next is."""
     demo = session(live, robot)
     demo.start_episode()
-    drive(robot, 2)
+    drive(robot, 20)
     demo.stop_episode()
     assert demo.next_index() == 1
 
@@ -313,7 +321,7 @@ class Follower(FakeRobot):
 
 def test_the_loop_records_what_it_was_told_to_and_keeps_it(live):
     """Enter, ticks, Enter, done — and the episode is on disk at the end."""
-    robot = Follower(60)
+    robot = Follower(400)
     console = ScriptedConsole()
     demo = demos.DemoSession(
         leader=Leader(),
@@ -324,7 +332,7 @@ def test_the_loop_records_what_it_was_told_to_and_keeps_it(live):
         console=console,
     )
     # Stop the episode part way, then finish; the rest of the ticks are idle.
-    console.lines = [""] + [None] * 20 + [""] + [None] * 5 + ["done"]
+    console.lines = [None, ""] + [None] * 150 + [""] + [None] * 5 + ["done"]
     demo.loop()
     assert len(live.dataset.episodes) == 1
     assert demo.attempts == 1
@@ -332,8 +340,8 @@ def test_the_loop_records_what_it_was_told_to_and_keeps_it(live):
 
 def test_an_interrupt_keeps_what_was_recorded(live):
     """A day of demonstrations must not be lost to the way the session ended."""
-    robot = Follower(10)
-    console = ScriptedConsole([""])
+    robot = Follower(150)
+    console = ScriptedConsole([None, ""])
     demo = demos.DemoSession(
         leader=Leader(),
         follower=robot,
@@ -345,3 +353,87 @@ def test_an_interrupt_keeps_what_was_recorded(live):
     demo.loop()
     assert len(live.dataset.episodes) == 1
     assert live.pending is None
+
+
+# --------------------------------------------------------------------------- #
+# What was typed while the loop was not listening
+# --------------------------------------------------------------------------- #
+#
+# The fault of 2026-08-27, and the one that cost a recording session: writing the
+# held episode blocks the loop for a second or more, the quiet terminal looks
+# broken, the operator presses Enter again — and those keystrokes were read back
+# one per tick after the *next* episode had started. The first stopped it after a
+# single frame; the second ended the session.
+
+
+def test_typeahead_during_the_write_does_not_reach_the_new_episode(live, robot):
+    """The Enter pressed at a frozen terminal must not stop the episode it starts."""
+    console = ScriptedConsole()
+    demo = session(live, robot, console=console)
+    demo.start_episode()
+    drive(robot, 60)
+    demo.stop_episode()
+
+    # Two impatient lines, queued while the held episode is being written.
+    console.lines = ["", "done"]
+    demo.start_episode()
+
+    assert console.lines == []
+    assert demo.recorder is not None, "the new episode was stopped by a stale keystroke"
+    assert "ignored 2 line(s)" in console.output()
+
+
+def test_nothing_typed_means_nothing_ignored(live, robot):
+    console = ScriptedConsole()
+    demo = session(live, robot, console=console)
+    demo.start_episode()
+    assert "ignored" not in console.output()
+
+
+def test_what_was_typed_while_connecting_is_not_the_first_command(live):
+    """Fifteen seconds of connecting, two prompts: a stray Enter is impatience."""
+    robot = Follower(20)
+    console = ScriptedConsole(["", ""])
+    demo = demos.DemoSession(
+        leader=Leader(), follower=robot, dataset=live,
+        task="put the dice in the bowl", fps=200, console=console,
+    )
+    demo.loop()
+    assert demo.attempts == 0, "a queued keystroke started an episode nobody asked for"
+    assert len(live.dataset.episodes) == 0
+
+
+def test_an_episode_of_one_frame_is_a_slip_and_is_not_written(live, robot):
+    """A keypress that lands just after a start is not a demonstration."""
+    console = ScriptedConsole()
+    demo = session(live, robot, console=console)
+    demo.start_episode()
+    drive(robot, 1)
+    demo.stop_episode()
+    assert live.pending is None
+    assert "not a demonstration" in console.output()
+    demo.commit_held()
+    assert len(live.dataset.episodes) == 0
+
+
+def test_a_real_demonstration_is_long_enough_to_be_kept(live, robot):
+    demo = session(live, robot, fps=30)
+    demo.start_episode()
+    drive(robot, demo.min_frames)
+    demo.stop_episode()
+    assert live.pending is not None
+
+
+def test_the_minimum_is_half_a_second_of_the_rate_being_recorded(live, robot):
+    assert session(live, robot, fps=30).min_frames == 15
+    assert session(live, robot, fps=60).min_frames == 30
+
+
+def test_again_still_reports_a_drop_for_an_episode_already_too_short(live, robot):
+    """`again` on a one-frame slip says it dropped it, not that there was nothing."""
+    console = ScriptedConsole()
+    demo = session(live, robot, console=console)
+    demo.start_episode()
+    drive(robot, 1)
+    assert demo.drop()
+    assert "nothing to drop" not in console.output()

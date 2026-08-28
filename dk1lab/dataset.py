@@ -813,7 +813,10 @@ class DatasetEpisodeRecorder:
             return
         try:
             frame = self._frame(observation, action)
-        except KeyError as exc:
+        except Exception as exc:  # noqa: BLE001 - a recorder must never stop a rollout
+            # Every exception, not only the KeyError a missing channel raises:
+            # anything escaping here leaves through ``send_action`` and takes the
+            # teleoperation loop with it, with the arms live.
             self._fail(exc)
             return
         try:

@@ -639,7 +639,7 @@ started.**
 The operator's whole vocabulary is four things, read from stdin *while the arms
 are live*: **Enter** starts an episode and Enter ends it, **`again`** throws the
 last one away, **`scene <n>`** labels the ones that follow, **`done`** finishes.
-Four things it must keep doing:
+Five things it must keep doing:
 
 - **The teleoperation loop never stops** — not between episodes, not while the
   operator types. That is safety, not convenience: teleop is uncapped, so a loop
@@ -649,6 +649,18 @@ Four things it must keep doing:
   (`demos.TerminalConsole`), and fd 2 is silenced between episodes for the same
   reason the session silences it — the cameras' libjpeg chatter lands in the
   middle of the line being typed.
+- **What is typed while the loop is not listening is discarded** (2026-08-28).
+  The loop is the only thing reading the keyboard and it stops reading while it
+  writes the held episode — a second with `--stream-video`, minutes without. The
+  quiet terminal reads as a hung one, the operator presses Enter again, and those
+  keystrokes were then read back *after* the next episode had started: the first
+  stopped it after one frame and the second ended the session. That is what made
+  recording unreliable on 2026-08-27, and `study/demos` still carries two 1-frame
+  episodes from it. `TerminalConsole.drain` throws away every queued line where
+  the loop resumes — at the top of `loop` and after `commit_held` — and says how
+  many. An episode under `demos.MIN_EPISODE_S` (0.5 s) is **dropped, not
+  written**: it is a keystroke, not a demonstration.
+  § *Recording demonstrations: the Enter that stopped the episode it started*.
 - **An episode is committed one episode late.** `stop` leaves it in the dataset's
   buffer and the *next* start writes it, which is what makes `again` a real
   deletion: `save_episode` cannot be undone and v3.0 has no way to take an
@@ -864,7 +876,7 @@ re-measuring anything.
 | wonder what a past rollout on the arms actually showed | § *The rollouts on the arms* |
 | chase a machine freeze, if one ever returns | `docs/CRASH.md` § *How it was found* — closed 2026-08-27, a BIOS update. Do not re-run the investigation from the top |
 | touch the fine-tune, the crop applied at training time, or the hold-out | `STUDY.md` § *Fine-tuning* and its *Amendments*, then `dk1lab/finetune.py` and `dk1lab/recrop.py` — both carry their reasoning in their module docstrings |
-| touch the dataset recorder, the codec, or anything about saving an episode | § *Recording: the crash that ate seven episodes*, § *Recording: the episode that took minutes to save*, § *Recording: the encode that could not fork*, § *Recording: four minutes to keep one episode* |
+| touch the dataset recorder, the codec, or anything about saving an episode | § *Recording: the crash that ate seven episodes*, § *Recording: the episode that took minutes to save*, § *Recording: the encode that could not fork*, § *Recording: four minutes to keep one episode*, § *Recording demonstrations: the Enter that stopped the episode it started* |
 | touch the session log, the console output, or any prompt the operator types at | § *The session console: a silenced prompt and a shouted decoder* |
 | benchmark anything | § *The 27.7 Hz loop* — a flat-out loop and a paced one disagree about the same function, and separate processes drift by more than the effect you are chasing |
 

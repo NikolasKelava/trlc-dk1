@@ -33,6 +33,17 @@ operator is typing. What is reimplemented is six calls in tick order, and
 :func:`tick` is deliberately the whole of it, so the thing that could drift from
 ``teleop_loop`` is small enough to read side by side with it.
 
+**What is typed while the loop is blocked is not a command.** The one thing that
+blocks it is writing the held episode, which happens *inside* the next start —
+so a terminal that has gone quiet for a second looks broken, the operator presses
+Enter again, and those keystrokes are read back one per tick once the loop
+resumes: the first stops the episode that has just started, after a single frame,
+and the second ends the session. That is the failure of 2026-08-27, and
+:meth:`TerminalConsole.drain` is the fix — every line typed while nothing was
+listening is discarded, and the operator is told. An episode shorter than
+:data:`MIN_EPISODE_S` is dropped rather than written for the same reason: it is a
+keystroke, not a demonstration.
+
 **An episode is committed one episode late.** :meth:`stop` leaves the episode in
 the dataset's buffer; the *next* start commits it, and so does ``done`` and any
 exit. That is what makes ``again`` a real deletion rather than an apology —
@@ -72,6 +83,13 @@ NOTHING = "nothing"
 
 #: How often the recording status line is redrawn, seconds.
 STATUS_EVERY_S = 1.0
+
+#: Below this, an episode is not a demonstration — it is a keystroke that landed
+#: on the wrong side of a start. Half a second of teleoperation cannot show a
+#: task being done, and a one-frame episode in the dataset is a fault
+#: ``dk1 dataset check`` reports rather than something to train on. Such an
+#: episode is dropped, loudly, instead of being written.
+MIN_EPISODE_S = 0.5
 
 
 @dataclass(frozen=True)
@@ -173,6 +191,33 @@ class TerminalConsole:
         if line == "":  # EOF: the terminal went away
             raise EOFError
         return line
+
+    def drain(self) -> int:
+        """Discard every complete line already typed. Returns how many there were.
+
+        **What was typed while the loop was not listening is not a command.**
+        Writing the held episode blocks the loop for a second or more, and a
+        terminal that has stopped printing looks exactly like one that has
+        stopped working — so the operator presses Enter again. Those keystrokes
+        sit in the terminal's queue and are read back one per tick the moment the
+        loop resumes, which is *after* the next episode has started: the first
+        one stops it after a single frame and the second ends the session. That
+        is the fault this method exists to remove, and it cost a recording day.
+
+        Only whole lines are taken, so a half-typed word the operator is in the
+        middle of survives — it has been echoed to the screen and deleting it
+        silently would be its own confusion.
+        """
+        dropped = 0
+        while True:
+            try:
+                line = self.poll()
+            except EOFError:  # the terminal went away; the loop will find out
+                break
+            if line is None:
+                break
+            dropped += 1
+        return dropped
 
     # -- the JPEG chatter --------------------------------------------------- #
 
@@ -318,9 +363,20 @@ class DemoSession:
 
     # -- an episode --------------------------------------------------------- #
 
+    @property
+    def min_frames(self) -> int:
+        """How short an episode has to be before it is treated as a slip."""
+        return max(2, int(MIN_EPISODE_S * self.fps))
+
     def start_episode(self) -> None:
-        """Begin recording. Commits the episode held from last time first."""
+        """Begin recording. Commits the episode held from last time first.
+
+        The commit blocks the loop, so anything typed during it is discarded
+        before the new episode can be reached by it — see
+        :meth:`TerminalConsole.drain`.
+        """
         self.commit_held()
+        self.discard_typeahead("while the last episode was being written")
         self.attempts += 1
         self.recorder = self.dataset.episode(
             self.task,
@@ -359,7 +415,26 @@ class DemoSession:
         if report.failed:
             logger.error("episode %d recorded nothing usable: %s", report.index, report.failed)
         self.console.mute()
+        if report.ticks and report.ticks < self.min_frames and self.dataset.pending is report:
+            self.console.say(
+                f"  {report.ticks} frame(s) is not a demonstration — dropped. "
+                f"That is a keypress that landed just after the episode started."
+            )
+            self.dataset.drop()
         return report
+
+    def discard_typeahead(self, when: str) -> int:
+        """Throw away lines typed while the loop was blocked, and say so.
+
+        The loop is the only thing listening, and it stops listening whenever an
+        episode is being written. Reading those keystrokes afterwards is what
+        stopped a freshly started episode after one frame and then ended the
+        session.
+        """
+        dropped = getattr(self.console, "drain", lambda: 0)()
+        if dropped:
+            self.console.say(f"  ignored {dropped} line(s) typed {when} — type them again")
+        return dropped
 
     def commit_held(self) -> bool:
         """Write the episode held from the previous recording, if there is one."""
@@ -381,9 +456,12 @@ class DemoSession:
 
     def drop(self) -> bool:
         """Throw away the episode being recorded, or the one held. Nothing else."""
-        if self.recorder is not None:
+        stopped = self.recorder is not None
+        if stopped:
             self.stop_episode()
-        if self.dataset.drop():
+        # ``or stopped``: a too-short episode is already gone by the time
+        # :meth:`stop_episode` returns, and the operator asked for it to go.
+        if self.dataset.drop() or stopped:
             self.console.say("  dropped — nothing was written")
             return True
         self.console.say("  nothing to drop: the episodes before the last one are on disk")
@@ -429,6 +507,9 @@ class DemoSession:
         processors = make_default_processors()
         period = 1.0 / self.fps
         self.console.mute()
+        # Connecting takes fifteen seconds and asks two questions; anything typed
+        # over that is impatience, not the first command of the session.
+        self.discard_typeahead("while the cell was being connected")
         self.console.say(self.prompt())
         try:
             while True:
