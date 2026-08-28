@@ -47,6 +47,18 @@ CONSOLE_LEVEL = logging.INFO
 _TAMED = "_dk1lab_tamed"
 
 
+#: Logger names that mean *application code*, not a chatty dependency.
+#:
+#: ``lerobot/scripts/lerobot_train.py`` logs with bare ``logging.info(...)``, and
+#: a bare call goes to the **root** logger — so its records arrive named
+#: ``root``, not ``lerobot.scripts.lerobot_train``. Treating that as third-party
+#: noise cost the whole of a fine-tune's log, including the
+#: ``step N: eval_loss=...`` line that ``dk1 policy curve`` reads to pick a
+#: checkpoint. A library that spams uses ``logging.getLogger(__name__)`` and is
+#: still held at WARNING; ``root`` is where a program talks about itself.
+APPLICATION_LOGGERS = frozenset({"root", "__main__"})
+
+
 class Interesting(logging.Filter):
     """Keep the file readable: ours in full, LeRobot's at INFO, the rest at WARNING.
 
@@ -63,7 +75,7 @@ class Interesting(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if record.name.startswith("dk1lab"):
             return record.levelno >= self.level
-        if record.name.startswith("lerobot"):
+        if record.name.startswith("lerobot") or record.name in APPLICATION_LOGGERS:
             return record.levelno >= logging.INFO
         return record.levelno >= logging.WARNING
 
@@ -167,11 +179,55 @@ def start(
     return target
 
 
+def restore(handlers: list[logging.Handler], *, level: int = logging.DEBUG,
+            console_level: int = CONSOLE_LEVEL) -> None:
+    """Put our handlers back on the root logger after somebody cleared it.
+
+    ``lerobot.utils.utils.init_logging`` — which ``lerobot-train`` calls early —
+    does ``logging.getLogger().handlers.clear()`` and then attaches its own
+    console and file handlers. Anything we opened before it is simply gone,
+    silently: on 2026-08-28 that left a fine-tune's ``train.log`` holding exactly
+    one line, the one saying where the log was going, and ``dk1 policy curve``
+    had no held-out loss to read because the line LeRobot logged never reached
+    the file.
+
+    So this is not a logging nicety: it is what makes the checkpoint selection
+    work at all. Called *after* the clearing, not before it.
+
+    Handlers already back on root are left alone, so calling this twice does not
+    double every line. The handlers LeRobot has just attached get the same
+    taming :func:`start` gives them — see :func:`_tame`.
+
+    Args:
+        handlers: what was on root before, from :func:`handlers`.
+        level: what ``dk1lab`` logs at, as passed to :func:`start`.
+        console_level: the policy applied to handlers we did not attach.
+    """
+    root = logging.getLogger()
+    _tame(root, console_level)
+    for handler in handlers:
+        if handler not in root.handlers:
+            root.addHandler(handler)
+    # init_logging sets the root level to NOTSET, which passes everything to
+    # every handler; ours filter, and the two levels below are what decide.
+    root.setLevel(min(root.level or logging.WARNING, level))
+    logging.getLogger("dk1lab").setLevel(level)
+    logging.getLogger("lerobot").setLevel(logging.INFO)
+
+
+def handlers() -> list[logging.Handler]:
+    """The root logger's handlers right now, to hand back to :func:`restore`."""
+    return list(logging.getLogger().handlers)
+
+
 __all__ = [
+    "APPLICATION_LOGGERS",
     "CONSOLE_LEVEL",
     "DEFAULT_LOG_DIR",
     "Interesting",
     "SyncingFileHandler",
+    "handlers",
     "log_path",
+    "restore",
     "start",
 ]

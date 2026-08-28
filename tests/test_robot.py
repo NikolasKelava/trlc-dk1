@@ -297,3 +297,57 @@ def test_disconnect_forgets_the_cached_reading(robot, monkeypatch):
     robot.disconnect()
 
     assert robot._measured is None
+
+
+# --------------------------------------------------------------------------- #
+# The gripper command that was never executed
+# --------------------------------------------------------------------------- #
+
+
+def test_the_returned_gripper_is_the_one_the_robot_can_execute():
+    """`send_action` promises to return what was sent, and the gripper broke it.
+
+    `DK1Robot.command_gripper` clips to [0, 1] *inside* the robot and returns
+    nothing, so a leader trigger squeezed past the follower's closed stop was
+    recorded as a command of 1.03 that was executed as 1.0. Harmless on the arms;
+    fatal in a dataset, because MolmoAct2 passes the gripper channel through its
+    normaliser unnormalised and refuses anything outside [-1, 1].
+    """
+    from dk1lab.robot import _clamp_grippers
+
+    sent = _clamp_grippers(
+        {
+            "left_gripper.pos": 1.0344,
+            "right_gripper.pos": -0.02,
+            "left_joint_1.pos": 3.125,
+            "right_joint_6.pos": -1.577,
+        }
+    )
+    assert sent["left_gripper.pos"] == 1.0
+    assert sent["right_gripper.pos"] == 0.0
+    # Arm joints are radians and legitimately outside [0, 1]. Touching them would
+    # pin every arm to a wrist's worth of travel.
+    assert sent["left_joint_1.pos"] == 3.125
+    assert sent["right_joint_6.pos"] == -1.577
+
+
+def test_an_in_range_gripper_command_is_unchanged():
+    from dk1lab.robot import _clamp_grippers
+
+    action = {"left_gripper.pos": 0.5, "right_gripper.pos": 0.0}
+    assert _clamp_grippers(action) == action
+
+
+def test_clamping_does_not_mutate_the_callers_action():
+    """The teleoperation loop may still hold it, and it records what the leader asked."""
+    from dk1lab.robot import _clamp_grippers
+
+    action = {"left_gripper.pos": 1.03}
+    _clamp_grippers(action)
+    assert action["left_gripper.pos"] == 1.03
+
+
+def test_a_non_numeric_channel_is_passed_through():
+    from dk1lab.robot import _clamp_grippers
+
+    assert _clamp_grippers({"left_gripper.pos": None})["left_gripper.pos"] is None

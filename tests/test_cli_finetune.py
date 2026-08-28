@@ -397,3 +397,182 @@ def test_a_misspelled_adapt_is_refused_before_anything_is_written(
     )
     assert result.exit_code == 1
     assert not runs.exists()
+
+
+def test_the_clamp_repairs_a_dataset_recorded_before_the_follower_was_fixed(
+    runner, demos, tmp_path
+):
+    """The failure it prevents is a fine-tune that dies at its first evaluation:
+    MolmoAct2 passes the gripper channel through its normaliser unnormalised and
+    refuses anything outside [-1, 1]."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dk1lab.layout import GRIPPER_INDICES
+
+    row = [0.5] * 14
+    for index in GRIPPER_INDICES:
+        row[index] = 1.0344
+    (demos / "data" / "chunk-000").mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [0],
+                "action": pa.array([row], type=pa.list_(pa.float32(), 14)),
+            }
+        ),
+        demos / "data" / "chunk-000" / "file-000.parquet",
+    )
+
+    # It is a fault the check reports, not one a training run discovers.
+    assert "dk1 dataset clamp" in runner.invoke(app, ["dataset", "check", str(demos)]).output
+
+    dry = runner.invoke(app, ["dataset", "clamp", str(demos), "--dry-run"])
+    assert dry.exit_code == 0 and "nothing was written" in dry.output
+
+    result = runner.invoke(app, ["dataset", "clamp", str(demos)])
+    assert result.exit_code == 0, result.output
+    assert "clamped to [0, 1]" in result.output
+    assert not any("gripper" in p for p in
+                   __import__("dk1lab.dataset", fromlist=["x"]).summarise(demos).problems)
+
+
+def test_clamping_a_dataset_that_needs_nothing_says_so(runner, demos):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    (demos / "data" / "chunk-000").mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [0],
+                "action": pa.array([[0.5] * 14], type=pa.list_(pa.float32(), 14)),
+            }
+        ),
+        demos / "data" / "chunk-000" / "file-000.parquet",
+    )
+    result = runner.invoke(app, ["dataset", "clamp", str(demos)])
+    assert result.exit_code == 0
+    assert "nothing to repair" in result.output
+
+
+def test_the_eval_cap_reaches_the_command_line(
+    runner, demos, checkpoint_dir, config_file, tmp_path
+):
+    runs = tmp_path / "runs"
+    result = runner.invoke(
+        app,
+        base(demos, checkpoint_dir, config_file, runs, "A1") + ["--max-eval-samples", "800"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "--max_eval_samples=800" in (next(runs.iterdir()) / "command.txt").read_text()
+
+
+# --------------------------------------------------------------------------- #
+# Pausing and resuming, at the command line
+# --------------------------------------------------------------------------- #
+
+
+def saved(run_dir, *steps):
+    """A run directory shaped like one LeRobot has been writing into."""
+    root = run_dir / "train" / "checkpoints"
+    for step in steps:
+        directory = root / f"{step:06d}" / "pretrained_model"
+        directory.mkdir(parents=True)
+        (directory / "train_config.json").write_text("{}")
+    if steps:
+        (root / "last").symlink_to(f"{max(steps):06d}")
+    return run_dir
+
+
+def test_pause_writes_a_file_the_running_job_reads(runner, tmp_path):
+    result = runner.invoke(app, ["policy", "pause", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "STOP").exists()
+    assert "nothing is lost" in result.output
+
+
+def test_pause_can_be_withdrawn(runner, tmp_path):
+    runner.invoke(app, ["policy", "pause", str(tmp_path)])
+    result = runner.invoke(app, ["policy", "pause", str(tmp_path), "--cancel"])
+    assert result.exit_code == 0
+    assert not (tmp_path / "STOP").exists()
+
+
+def test_cancelling_a_pause_that_was_never_asked_for_says_so(runner, tmp_path):
+    result = runner.invoke(app, ["policy", "pause", str(tmp_path), "--cancel"])
+    assert result.exit_code == 1
+    assert "had no stop request" in result.output
+
+
+def test_pausing_a_directory_that_does_not_exist_is_refused(runner, tmp_path):
+    result = runner.invoke(app, ["policy", "pause", str(tmp_path / "nope")])
+    assert result.exit_code == 1
+
+
+def test_resume_names_the_last_checkpoint_and_the_recorded_budget(runner, run_dir):
+    saved(run_dir, 2000, 4000)
+    result = runner.invoke(app, ["policy", "resume", str(run_dir)], input="n\n")
+    assert "004000" in result.output
+    assert "checkpoints [2000, 4000]" in result.output
+    assert "--resume=true" in result.output
+
+
+def test_resume_can_be_pointed_at_an_earlier_checkpoint(runner, run_dir):
+    saved(run_dir, 2000, 4000)
+    result = runner.invoke(app, ["policy", "resume", str(run_dir), "--step", "2000"], input="n\n")
+    assert "002000/pretrained_model/train_config.json" in result.output
+
+
+def test_resume_clears_a_stale_stop_request(runner, run_dir):
+    """One left behind would stop the resumed run at its first checkpoint, which
+    looks exactly like it refusing to run."""
+    saved(run_dir, 2000)
+    (run_dir / "STOP").write_text("x")
+    result = runner.invoke(app, ["policy", "resume", str(run_dir)], input="n\n")
+    assert "cleared the pending stop request" in result.output
+    assert not (run_dir / "STOP").exists()
+
+
+def test_resume_warns_before_training_past_the_decay_horizon(runner, run_dir):
+    saved(run_dir, 2000)
+    result = runner.invoke(
+        app, ["policy", "resume", str(run_dir), "--steps", "99000"], input="n\n"
+    )
+    assert "decay horizon" in result.output
+
+
+def test_a_run_with_nothing_saved_cannot_be_resumed(runner, run_dir):
+    result = runner.invoke(app, ["policy", "resume", str(run_dir)])
+    assert result.exit_code == 1
+    assert "no checkpoints" in result.output
+
+
+def test_the_banner_says_how_to_pause_before_training_starts(
+    runner, demos, checkpoint_dir, config_file, tmp_path
+):
+    """Hours-long and unattended: the operator has to know the lever exists
+    before they need it, not after."""
+    runs = tmp_path / "runs"
+    result = runner.invoke(app, base(demos, checkpoint_dir, config_file, runs, "A1"))
+    assert result.exit_code == 0
+    assert "dk1 policy pause" in result.output
+
+
+def test_a_stop_landing_on_the_last_checkpoint_is_a_finished_run(run_dir):
+    """Telling the operator to resume a run with no steps left is how somebody
+    spends a morning waiting for a job that exits immediately."""
+    from dk1lab.cli import policy_cmds
+
+    saved(run_dir, 2000, 8000)
+    (run_dir / "STOP").write_text("x")
+    policy_cmds._echo_finetune_outcome("paused", run_dir, 8000)
+    assert not (run_dir / "STOP").exists()
+
+
+def test_a_stop_before_the_budget_still_reads_as_paused(run_dir, capsys):
+    from dk1lab.cli import policy_cmds
+
+    saved(run_dir, 2000)
+    policy_cmds._echo_finetune_outcome("paused", run_dir, 8000)
+    assert "dk1 policy resume" in capsys.readouterr().out

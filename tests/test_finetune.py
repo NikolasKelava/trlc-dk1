@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -388,7 +389,7 @@ def test_the_run_directory_carries_what_the_protocol_asks_for(tmp_path, checkpoi
     assert "checkpoint_sha256" in record
     assert record["recipe"]["r"] == 32
     assert record["split"]["holdout"] == list(split.holdout)
-    assert set(record["git"]) == {"sha", "branch", "clean"}
+    assert set(record["git"]) == {"sha", "branch", "clean", "untracked"}
     assert (directory / "dk1.toml").read_text() == config_file.read_text()
     assert (directory / "command.txt").read_text().startswith("lerobot-train --steps=10")
 
@@ -426,6 +427,17 @@ def test_the_run_directory_records_that_the_inversion_goes_off(
     record = json.loads((directory / "dk1_run.json").read_text())
     assert record["invert_gripper_at_rollout"] is False
     assert record["cropped_at_training_time"] is True
+
+
+def test_an_untracked_file_does_not_make_the_tree_dirty():
+    """`recordings/` is untracked by policy. A `clean` that is False on every run
+    forever is a field nobody reads — so it counts tracked changes, and says how
+    many untracked files there were alongside it."""
+    record = finetune.git_sha(".")
+    assert isinstance(record["untracked"], int)
+    assert record["clean"] == (not __import__("subprocess").run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True, text=True).stdout.strip())
 
 
 def test_a_missing_weights_file_hashes_to_nothing_rather_than_raising(tmp_path):
@@ -574,3 +586,268 @@ def test_what_is_adapted_is_described_in_plain_words():
     assert "action expert" in finetune.describe_adapt(
         "molmoact2", finetune.ADAPT_VLM_AND_EXPERT
     )
+
+
+# --------------------------------------------------------------------------- #
+# Surviving LeRobot's own logging setup
+# --------------------------------------------------------------------------- #
+
+
+def test_the_run_directory_log_survives_init_logging(tmp_path, checkpoint_dir, monkeypatch):
+    """`lerobot_train` calls `init_logging`, which clears every handler off the
+    root logger. Without the wrap, the run's own train.log holds one line and
+    `best_checkpoint` has nothing to read — the log IS the selection mechanism."""
+    import logging
+    import sys
+    import types
+
+    cleared: list[bool] = []
+
+    def init_logging(*args, **kwargs):
+        logging.getLogger().handlers.clear()
+        cleared.append(True)
+
+    module = types.SimpleNamespace(
+        make_pre_post_processors=lambda *a, **k: None,
+        init_logging=init_logging,
+        update_last_checkpoint=lambda *a, **k: None,
+    )
+    monkeypatch.setitem(sys.modules, "lerobot.scripts", types.SimpleNamespace(lerobot_train=module))
+
+    from dk1lab import logs
+
+    path = logs.start("probe", path=tmp_path / "train.log")
+    root = logging.getLogger()
+    try:
+        with finetune.patched(checkpoint_dir):
+            module.init_logging()
+            logging.getLogger().info("step 20: eval_loss=0.0685")
+        assert cleared
+        assert "eval_loss=0.0685" in path.read_text()
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+
+
+def test_the_patches_are_taken_off_again(tmp_path, checkpoint_dir, monkeypatch):
+    """A failed run must leave the module as it found it — this process may still
+    have a `dk1 policy check` to do."""
+    import sys
+    import types
+
+    original_processors = lambda *a, **k: None  # noqa: E731
+    original_logging = lambda *a, **k: None  # noqa: E731
+    original_update = lambda *a, **k: None  # noqa: E731
+    module = types.SimpleNamespace(
+        make_pre_post_processors=original_processors,
+        init_logging=original_logging,
+        update_last_checkpoint=original_update,
+    )
+    monkeypatch.setitem(sys.modules, "lerobot.scripts", types.SimpleNamespace(lerobot_train=module))
+
+    try:
+        with finetune.patched(checkpoint_dir):
+            raise RuntimeError("the run failed")
+    except RuntimeError:
+        pass
+    assert module.make_pre_post_processors is original_processors
+    assert module.init_logging is original_logging
+    assert module.update_last_checkpoint is original_update
+
+
+# --------------------------------------------------------------------------- #
+# The evaluation cap
+# --------------------------------------------------------------------------- #
+
+
+def test_the_whole_holdout_is_evaluated_by_default(argv):
+    """The hold-out is small and complete; capping it takes the FIRST N frames of
+    it, which is one episode's opening rather than a spread over three scenes."""
+    assert finetune.DEFAULT_BUDGET.max_eval_samples == 0
+    assert "--max_eval_samples=0" in argv
+
+
+def test_the_evaluation_can_be_capped(tmp_path):
+    """Because the whole hold-out is read at EVERY eval_steps — measured at 5 min
+    27 s for four episodes, which over twenty evaluations is nearly two hours."""
+    from dataclasses import replace as _replace
+
+    argv = finetune.train_argv(
+        dataset_root=tmp_path,
+        repo_id="dk1/demos",
+        checkpoint=tmp_path,
+        output_dir=tmp_path / "run",
+        job_name="dk1-r1",
+        split=finetune.split_episodes(scenes({1: 4}), holdout=1),
+        budget=_replace(finetune.DEFAULT_BUDGET, max_eval_samples=800),
+    )
+    assert "--max_eval_samples=800" in argv
+
+
+# --------------------------------------------------------------------------- #
+# Pausing and resuming
+# --------------------------------------------------------------------------- #
+
+
+def checkpoints(run_dir, *steps, width=6, config=True):
+    """A run directory shaped like one LeRobot has been writing into."""
+    root = finetune.train_dir(run_dir) / "checkpoints"
+    for step in steps:
+        directory = root / f"{step:0{width}d}" / finetune.PRETRAINED_MODEL_DIR
+        directory.mkdir(parents=True)
+        if config:
+            (directory / "train_config.json").write_text("{}")
+    if steps:
+        link = root / "last"
+        link.symlink_to(f"{max(steps):0{width}d}")
+    return run_dir
+
+
+def test_a_stop_request_is_a_file_the_running_job_can_see(tmp_path):
+    """Not a signal: the run is hours long and the person asking it to stop is
+    usually not at the terminal it is printing to."""
+    assert not finetune.stop_path(tmp_path).exists()
+    path = finetune.request_stop(tmp_path)
+    assert path.exists() and "resume" in path.read_text()
+    assert finetune.clear_stop(tmp_path) is True
+    assert finetune.clear_stop(tmp_path) is False
+
+
+def test_the_run_stops_after_the_checkpoint_is_written_not_before(tmp_path, checkpoint_dir, monkeypatch):
+    """`update_last_checkpoint` runs immediately after `save_checkpoint`, so by
+    then the checkpoint is complete AND `last` points at it. Stopping anywhere
+    earlier would leave a run whose newest checkpoint is half-written."""
+    import sys
+    import types
+
+    order: list[str] = []
+    module = types.SimpleNamespace(
+        make_pre_post_processors=lambda *a, **k: None,
+        init_logging=lambda *a, **k: None,
+        update_last_checkpoint=lambda directory: order.append(f"linked {directory.name}"),
+    )
+    monkeypatch.setitem(sys.modules, "lerobot.scripts", types.SimpleNamespace(lerobot_train=module))
+
+    finetune.request_stop(tmp_path)
+    with finetune.patched(checkpoint_dir, run_dir=tmp_path):
+        with pytest.raises(finetune.Paused) as excinfo:
+            module.update_last_checkpoint(Path("002000"))
+    assert order == ["linked 002000"]
+    assert excinfo.value.step == 2000
+
+
+def test_without_a_stop_request_the_run_carries_on(tmp_path, checkpoint_dir, monkeypatch):
+    import sys
+    import types
+
+    module = types.SimpleNamespace(
+        make_pre_post_processors=lambda *a, **k: None,
+        init_logging=lambda *a, **k: None,
+        update_last_checkpoint=lambda directory: "linked",
+    )
+    monkeypatch.setitem(sys.modules, "lerobot.scripts", types.SimpleNamespace(lerobot_train=module))
+    with finetune.patched(checkpoint_dir, run_dir=tmp_path):
+        assert module.update_last_checkpoint(Path("002000")) == "linked"
+
+
+def test_a_run_with_no_run_dir_cannot_be_paused(tmp_path, checkpoint_dir, monkeypatch):
+    """Right for a test, wrong for anything that takes hours — so it is explicit."""
+    import sys
+    import types
+
+    module = types.SimpleNamespace(
+        make_pre_post_processors=lambda *a, **k: None,
+        init_logging=lambda *a, **k: None,
+        update_last_checkpoint=lambda directory: "linked",
+    )
+    monkeypatch.setitem(sys.modules, "lerobot.scripts", types.SimpleNamespace(lerobot_train=module))
+    finetune.request_stop(tmp_path)
+    with finetune.patched(checkpoint_dir, run_dir=None):
+        assert module.update_last_checkpoint(Path("002000")) == "linked"
+
+
+def test_the_resume_point_is_the_last_complete_checkpoint(tmp_path):
+    """`last` is a symlink LeRobot updates after the write, so it is the newest
+    COMPLETE checkpoint — not always the highest-numbered directory on disk."""
+    checkpoints(tmp_path, 2000, 4000)
+    assert finetune.latest_checkpoint(tmp_path).name == "004000"
+
+
+def test_an_earlier_checkpoint_can_be_named(tmp_path):
+    checkpoints(tmp_path, 2000, 4000)
+    assert finetune.latest_checkpoint(tmp_path, 2000).name == "002000"
+
+
+def test_a_step_that_was_never_saved_says_which_ones_were(tmp_path):
+    """The usual cause is asking for a step the save_freq never landed on."""
+    checkpoints(tmp_path, 2000, 4000)
+    with pytest.raises(finetune.FinetuneError) as excinfo:
+        finetune.latest_checkpoint(tmp_path, 3000)
+    assert "[2000, 4000]" in str(excinfo.value)
+
+
+def test_a_run_with_nothing_saved_cannot_be_resumed(tmp_path):
+    with pytest.raises(finetune.FinetuneError) as excinfo:
+        finetune.latest_checkpoint(tmp_path)
+    assert "no checkpoints" in str(excinfo.value)
+
+
+def test_resuming_takes_everything_from_the_checkpoints_own_config(tmp_path):
+    """Which is what makes a resumed run the same experiment rather than a
+    similar one: the dataset, the split, the recipe, the budget and the LR
+    schedule all come back from train_config.json."""
+    checkpoints(tmp_path, 2000)
+    argv = finetune.resume_argv(tmp_path)
+    assert argv[0].endswith("/002000/pretrained_model/train_config.json")
+    assert "--resume=true" in argv
+    # Nothing else: a second --policy.path or --dataset.root here would be a
+    # second opinion about what this run is.
+    assert len(argv) == 2
+
+
+def test_the_budget_can_be_raised_on_a_resume(tmp_path):
+    checkpoints(tmp_path, 2000)
+    assert "--steps=16000" in finetune.resume_argv(tmp_path, steps=16000)
+
+
+def test_a_checkpoint_without_its_config_is_refused(tmp_path):
+    checkpoints(tmp_path, 2000, config=False)
+    with pytest.raises(finetune.FinetuneError) as excinfo:
+        finetune.resume_argv(tmp_path)
+    assert "nothing to resume from" in str(excinfo.value)
+
+
+def test_training_past_the_decay_horizon_is_called_out(tmp_path, checkpoint_dir, config_file):
+    """The LR reaches its floor at scheduler_decay_steps, which was set to the
+    original budget — so the extra steps barely move the adapter."""
+    finetune.write_run_dir(
+        tmp_path,
+        what=finetune.row("R1"),
+        argv=[],
+        checkpoint=checkpoint_dir,
+        config_path=config_file,
+        dataset_root=tmp_path,
+        split=finetune.split_episodes(scenes({1: 4}), holdout=1),
+        hash_weights=False,
+    )
+    assert finetune.decay_warning(tmp_path, 8000) is None
+    assert "decay horizon" in finetune.decay_warning(tmp_path, 16000)
+
+
+def test_every_resumed_session_is_recorded(tmp_path):
+    """`dk1_run.json` says how the run started and is not rewritten — a run
+    resumed four times still started once. This is the rest of the story."""
+    finetune.note_resume(tmp_path, argv=["--resume=true"], checkpoint=Path("ckpt"))
+    finetune.note_resume(tmp_path, argv=["--resume=true"], checkpoint=Path("ckpt"))
+    lines = (tmp_path / "dk1_resume.jsonl").read_text().strip().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["from"] == "ckpt"
+
+
+def test_the_default_budget_checkpoints_where_it_was_asked_to():
+    """8 000 steps with a checkpoint at 2 000 and 4 000 — Nikolas, 2026-08-28."""
+    budget = finetune.DEFAULT_BUDGET
+    assert budget.steps == 8_000
+    assert budget.save_freq == 2_000
+    saves = list(range(budget.save_freq, budget.steps + 1, budget.save_freq))
+    assert saves == [2000, 4000, 6000, 8000]

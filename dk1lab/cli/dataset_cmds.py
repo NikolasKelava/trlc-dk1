@@ -223,4 +223,51 @@ def crop(
     typer.echo(f"wrote {report.destination}\n")
 
 
-__all__ = ["app", "check", "crop"]
+HELP_CLAMP = """Clip a recorded dataset's gripper COMMANDS into the range the robot uses.
+
+`DK1Robot.command_gripper` clips its argument to [0, 1] inside the robot, so a
+leader trigger squeezed past the follower's closed stop was recorded as a command
+of 1.03 that the robot executed as 1.0. Harmless on the arms; fatal to a
+fine-tune, because MolmoAct2 passes the gripper channel through its normaliser
+unnormalised and refuses anything outside [-1, 1] — the run dies at its first
+evaluation.
+
+Rewrites only `data/` and the gripper entries of `meta/stats.json`, IN PLACE. The
+videos are untouched, `observation.state` is untouched — it is the measurement,
+and clipping a measurement would be inventing data — and what was recorded is
+written to dk1_clamp.json before anything changes.
+
+The follower has recorded the clipped value since 2026-08-28, so this is a repair
+for datasets made before that. Reads and writes files; touches nothing else."""
+
+
+@app.command("clamp", help=HELP_CLAMP)
+def clamp(
+    directory: Annotated[Path, typer.Argument(help="The dataset directory.")],
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Report what would change and write nothing.")
+    ] = False,
+) -> None:
+    from ..dataset import DatasetError, clamp_gripper
+
+    try:
+        report = clamp_gripper(directory, dry_run=dry_run)
+    except DatasetError as exc:
+        typer.secho(f"\n{exc}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"\n{report.describe()}")
+    if not report.needed:
+        typer.secho("nothing to repair.\n", fg=typer.colors.GREEN)
+        return
+    typer.echo(f"  episodes {list(report.episodes)}")
+    if dry_run:
+        typer.secho("\n--dry-run: nothing was written.\n", fg=typer.colors.YELLOW)
+        return
+    typer.secho(
+        f"\nclamped to [0, 1]; what was recorded is in {directory}/dk1_clamp.json\n",
+        fg=typer.colors.GREEN,
+    )
+
+
+__all__ = ["app", "check", "clamp", "crop"]

@@ -1539,3 +1539,101 @@ warning.
 What this does **not** measure: the crop against what the `optimized` *camera*
 delivers live, which is never encoded at all. The training frames are bounded by
 the recording's own NVENC pass, and that bound is the same one A1's frames carry.
+
+## The gripper command that was never executed
+
+2026-08-28. The first real fine-tune probe trained ten steps at 1.13 step/s and
+then died at its first evaluation:
+
+```
+ValueError: MolmoAct2 action gripper values are not under [-1, 1].
+Please set normalize_gripper=True.
+```
+
+**The mechanism, from the top.** MolmoAct2 does not normalise the gripper
+channel. `_add_gripper_masks_to_stats` builds a mask over the 14 channels —
+`"gripper" not in name.lower()` — and `_MolmoAct2MaskedNormalizationMixin`
+normalises the masked channels and **passes the gripper through untouched**,
+because the checkpoint expects it already in [-1, 1]. That is the same fact the
+gripper inversion rests on. `_validate_masked_passthrough_range` then **raises**
+on any passthrough value outside that range.
+
+**The data.** Of 18 484 recorded frames, 1 316 (7.1%) carry a gripper *command*
+above 1.0 — max 1.0230 left, 1.0344 right — across 16 of the 26 episodes. The
+measured `observation.state` never exceeds 0.9842. So the robot never went there.
+`DK1Robot.command_gripper` (upstream, `robot.py:138`) does
+`np.clip(normalized_pos, 0.0, 1.0)` **inside** the robot and returns nothing, so
+a leader trigger squeezed past the follower's closed stop was *executed* as 1.0
+and *recorded* as 1.03.
+
+`SafeBiDK1Follower.send_action` promised to "return the action that was actually
+sent, not the one requested — so a recorded dataset stores what the arms were
+told to do". For the gripper that was not true, and 7% of a dataset was enough
+to stop a training run dead.
+
+Two things were wrong with how it surfaced, and both are worth keeping in mind:
+
+* **it is not deterministic.** The first ten training steps drew batches with no
+  offending frame and passed. The hold-out (episodes 4, 11, 15, 25) contains
+  three of the sixteen, so the *evaluation* was certain to fail — which is why it
+  looked like an eval-specific fault and is not one;
+* **`normalize_gripper=True`, which the error suggests, is the wrong fix here.**
+  It normalises the gripper with the YAM quantile statistics, so the fine-tuned
+  checkpoint's gripper would mean something different from A0's and R0's. A1
+  against A0 is supposed to differ by the LoRA and nothing else.
+
+**The fix, in two halves.** `SafeBiDK1Follower.send_action` now clips the gripper
+channels of what it returns, so the recorded action is the executed one — the
+docstring's promise, made true. `dk1 dataset clamp` repairs a dataset recorded
+before that: it rewrites `data/` and the gripper entries of `meta/stats.json`
+in place, leaves the videos and `observation.state` alone — clipping a
+*measurement* would be inventing data — and writes what was recorded to
+`dk1_clamp.json` first. `dk1 dataset check` now reports the fault, so the next
+one is found in seconds rather than in a training run.
+
+### And the log that was not there
+
+Found in the same session, and worse in its way. `dk1 policy curve` reported
+*no held-out loss was logged* on a run whose console had plainly printed
+`step 20: eval_loss=0.0685`. The run's `train.log` held **one line**.
+
+Two independent causes, both silent:
+
+* `lerobot.utils.utils.init_logging` — `lerobot_train`'s third statement — does
+  `logging.getLogger().handlers.clear()`. Our fsynced file handler, attached
+  moments earlier, was simply gone. `finetune.patched` now wraps `init_logging`
+  and `dk1lab.logs.restore` puts the handlers back;
+* `lerobot_train` logs with bare `logging.info(...)`, and a bare call goes to the
+  **root** logger — so its records arrive named `root`, not
+  `lerobot.scripts.lerobot_train`. `dk1lab.logs.Interesting` held anything not
+  named `dk1lab*` or `lerobot*` to WARNING, so every one of those lines was
+  dropped from the file *and*, once the console handler was being tamed too,
+  from the screen. `APPLICATION_LOGGERS` now treats `root` and `__main__` as
+  application code at INFO. A library that spams uses
+  `logging.getLogger(__name__)` and is still held at WARNING.
+
+This is not a logging nicety. There is no early stop, so **the log is the
+checkpoint-selection mechanism**: a run whose log is empty cannot be selected
+from, and its GPU hours buy a directory of checkpoints nobody can rank.
+
+### What a step and an evaluation cost
+
+Measured on the arms' own machine, R1's configuration — MolmoAct2 5.44 B,
+`--adapt vlm+expert` (106 M trainable), batch 2, gradient checkpointing on,
+22 training episodes / 15 605 frames:
+
+| | |
+| --- | --- |
+| training | **1.13 step/s** steady (the first ~5 steps are slower: 5.1 s, then 2.6, then settling) |
+| one evaluation over the whole hold-out | **5 min 27 s** — 4 episodes, 2 879 frames, 1 440 forward passes at ~4.4 batch/s |
+| load, wrap and set up | ~75 s |
+| one checkpoint on disk | **1.2 GB** (adapter 406 MB + optimiser state 801 MB) |
+
+So the budget is `steps / 1.13` seconds of training plus `327 s x evaluations`.
+At 20 000 steps that is 4.9 h of training, and **evaluating every 1 000 steps
+adds 1.8 h of it** — over a quarter of the night spent measuring.
+
+`--max-eval-samples` caps it, but LeRobot takes the **first** N frames of the
+hold-out, which is one episode's opening rather than a spread across the three
+scenes. Halving the evaluation *count* is the better economy: it keeps the
+validation set complete.

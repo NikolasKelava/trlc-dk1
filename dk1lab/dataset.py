@@ -54,7 +54,7 @@ because a disk filled up is worse.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1159,4 +1159,270 @@ def _faults(summary: DatasetSummary, info: dict[str, Any]) -> list[str]:
 
     if (info.get("fps") or 0) <= 0:
         found.append("fps is missing or zero in meta/info.json")
+
+    found.extend(_gripper_faults(summary.root))
     return found
+
+
+def _gripper_faults(root: Path) -> list[str]:
+    """A recorded gripper command outside the range the robot executes.
+
+    Reported by `dk1 dataset check` rather than left to be discovered by a
+    training run, which is how it was discovered the first time: MolmoAct2 passes
+    the gripper channel through its normaliser unnormalised and **raises** on
+    anything outside [-1, 1], so 7% of frames three percent over the stop is not
+    a slightly wrong number — it is a fine-tune that dies at its first
+    evaluation. `dk1 dataset clamp` is the repair.
+    """
+    try:
+        report = clamp_gripper(root, dry_run=True)
+    except DatasetError:
+        return []
+    except Exception as exc:  # noqa: BLE001 - a check must not fail the check
+        logger.warning("could not read the gripper range: %s", exc)
+        return []
+    if not report.needed:
+        return []
+    ranges = ", ".join(
+        f"channel {index} reaches {high:+.4f}"
+        for index, (_low, high) in sorted(report.before.items())
+    )
+    return [
+        f"{report.changed} frame(s) in {len(report.episodes)} episode(s) carry a gripper "
+        f"COMMAND outside [0, 1] ({ranges}). The robot clips to [0, 1] internally, so those "
+        f"describe a motion that did not happen — and MolmoAct2 refuses them outright. "
+        f"Repair with `dk1 dataset clamp {report.root}`"
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Repairing one
+# --------------------------------------------------------------------------- #
+
+
+#: Written into a repaired dataset, so it can say what was done to it.
+CLAMP_FILE = "dk1_clamp.json"
+
+
+@dataclass(frozen=True)
+class ClampReport:
+    """What :func:`clamp_gripper` found, and what it changed."""
+
+    root: Path
+    frames: int = 0
+    changed: int = 0
+    #: ``{channel index: (min, max)}`` as recorded, before any clamping.
+    before: dict[int, tuple[float, float]] = field(default_factory=dict)
+    episodes: tuple[int, ...] = ()
+    written: bool = False
+
+    @property
+    def needed(self) -> bool:
+        return self.changed > 0
+
+    def describe(self) -> str:
+        if not self.needed:
+            return f"{self.root}: every gripper command is already within range"
+        ranges = ", ".join(
+            f"ch{index} [{low:+.4f}, {high:+.4f}]" for index, (low, high) in sorted(self.before.items())
+        )
+        return (
+            f"{self.root}: {self.changed} of {self.frames} frames "
+            f"({100 * self.changed / max(self.frames, 1):.1f}%) across "
+            f"{len(self.episodes)} episode(s) — recorded {ranges}"
+        )
+
+
+def clamp_gripper(root: Path | str, *, dry_run: bool = False) -> ClampReport:
+    """Clip a recorded dataset's gripper **commands** into the range the robot uses.
+
+    ``DK1Robot.command_gripper`` clips its argument to
+    ``[GRIPPER_MIN, GRIPPER_MAX]`` inside the robot, so a command of 1.03 was
+    executed as 1.0 and the recorded 1.03 describes a motion that did not happen.
+    Until 2026-08-28 the follower returned the *unclipped* value and the recorder
+    stored it, which is what this repairs.
+
+    It matters far out of proportion to its size. MolmoAct2 passes the gripper
+    channel through its normaliser **unnormalised** — the channel is masked out,
+    because the checkpoint expects it already in [-1, 1] — and
+    ``_validate_masked_passthrough_range`` **raises** on anything outside that.
+    So a handful of frames 3% over the stop is not a slightly wrong number; it is
+    a fine-tune that stops at its first evaluation. Found exactly that way.
+
+    In place, and deliberately: only ``data/`` changes, the videos are untouched,
+    and a copy would mean re-deriving every dataset downstream of this one. The
+    action's recorded range is written to :data:`CLAMP_FILE` before anything is
+    changed, so what was there is not lost.
+
+    ``observation.state`` is left alone. It is the *measurement*, it has never
+    been out of range on this cell, and clipping a measurement would be inventing
+    data rather than correcting a command.
+
+    Args:
+        root: the dataset directory.
+        dry_run: report what would change and write nothing.
+
+    Raises:
+        DatasetError: if the directory is not a LeRobot dataset.
+    """
+    import json
+
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from lerobot.utils.constants import ACTION
+
+    from .layout import GRIPPER_INDICES, GRIPPER_MAX, GRIPPER_MIN
+
+    root = Path(root)
+    if not (root / "meta" / "info.json").is_file():
+        raise DatasetError(f"{root} is not a LeRobot dataset — no meta/info.json")
+    files = sorted((root / "data").rglob("*.parquet"))
+    if not files:
+        raise DatasetError(f"{root} has no data/ parquet files")
+
+    before: dict[int, tuple[float, float]] = {}
+    episodes: set[int] = set()
+    frames = changed = 0
+    pending: list[tuple[Path, Any]] = []
+
+    for path in files:
+        table = pq.read_table(path)
+        if ACTION not in table.column_names:
+            continue
+        action = np.array(table.column(ACTION).to_pylist(), dtype=np.float64)
+        if action.ndim != 2:
+            continue
+        frames += action.shape[0]
+        index_column = (
+            np.array(table.column("episode_index").to_pylist())
+            if "episode_index" in table.column_names
+            else np.zeros(action.shape[0], dtype=int)
+        )
+
+        out_of_range = np.zeros(action.shape[0], dtype=bool)
+        for channel in GRIPPER_INDICES:
+            if channel >= action.shape[1]:
+                continue
+            column = action[:, channel]
+            low, high = before.get(channel, (float("inf"), float("-inf")))
+            before[channel] = (min(low, float(column.min())), max(high, float(column.max())))
+            out_of_range |= (column < GRIPPER_MIN) | (column > GRIPPER_MAX)
+            action[:, channel] = np.clip(column, GRIPPER_MIN, GRIPPER_MAX)
+
+        changed += int(out_of_range.sum())
+        episodes.update(int(value) for value in index_column[out_of_range])
+        if out_of_range.any():
+            pending.append(
+                (
+                    path,
+                    table.set_column(
+                        table.column_names.index(ACTION),
+                        ACTION,
+                        pa.array(action.tolist(), type=table.column(ACTION).type),
+                    ),
+                )
+            )
+
+    report = ClampReport(
+        root=root,
+        frames=frames,
+        changed=changed,
+        before=before,
+        episodes=tuple(sorted(episodes)),
+    )
+    if dry_run or not report.needed:
+        return report
+
+    # The record of what was there goes down BEFORE the data changes, so an
+    # interrupted repair still says what it was repairing.
+    (root / CLAMP_FILE).write_text(
+        json.dumps(
+            {
+                "clamped": datetime.now().isoformat(timespec="seconds"),
+                "range": [GRIPPER_MIN, GRIPPER_MAX],
+                "channels": list(GRIPPER_INDICES),
+                "frames": frames,
+                "changed": changed,
+                "episodes": list(report.episodes),
+                "recorded_range": {str(k): list(v) for k, v in sorted(before.items())},
+                "why": (
+                    "DK1Robot.command_gripper clips to this range inside the robot, so the "
+                    "recorded values above it describe a motion that did not happen. "
+                    "MolmoAct2 refuses them: the gripper channel is passed through its "
+                    "normaliser unnormalised and validated against [-1, 1]."
+                ),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    for path, table in pending:
+        temporary = path.with_suffix(".dk1clamp.parquet")
+        pq.write_table(table, temporary)
+        temporary.replace(path)
+
+    _restat_gripper(root)
+    return replace(report, written=True)
+
+
+def _restat_gripper(root: Path) -> None:
+    """Recompute ``meta/stats.json``'s action gripper channels from the clamped data.
+
+    Only those channels, and only from the action: everything else in the file is
+    still true, and rewriting statistics that did not change is how a repair turns
+    into a difference nobody can account for. It matters because the stats travel
+    into the training run — ``lerobot_train`` hands ``dataset.meta.stats`` to the
+    processors — so a ``max`` of 1.03 left behind would still describe a command
+    that no longer exists in the data.
+    """
+    import json
+
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    from lerobot.utils.constants import ACTION
+
+    from .layout import GRIPPER_INDICES
+
+    path = root / "meta" / "stats.json"
+    if not path.is_file():
+        return
+    stats = json.loads(path.read_text(encoding="utf-8"))
+    entry = stats.get(ACTION)
+    if not isinstance(entry, dict):
+        return
+
+    blocks = []
+    for file in sorted((root / "data").rglob("*.parquet")):
+        table = pq.read_table(file)
+        if ACTION not in table.column_names:
+            continue
+        block = np.array(table.column(ACTION).to_pylist(), dtype=np.float64)
+        if block.ndim == 2:
+            blocks.append(block)
+    if not blocks:
+        return
+    action = np.concatenate(blocks, axis=0)
+
+    percentiles = {"q01": 1, "q10": 10, "q50": 50, "q90": 90, "q99": 99}
+    for channel in GRIPPER_INDICES:
+        if channel >= action.shape[1]:
+            continue
+        column = action[:, channel]
+        fresh = {
+            "min": float(column.min()),
+            "max": float(column.max()),
+            "mean": float(column.mean()),
+            "std": float(column.std()),
+            **{name: float(np.percentile(column, q)) for name, q in percentiles.items()},
+        }
+        for name, value in fresh.items():
+            if isinstance(entry.get(name), list) and channel < len(entry[name]):
+                entry[name][channel] = value
+
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(stats) + "\n", encoding="utf-8")
+    temporary.replace(path)

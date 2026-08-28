@@ -417,8 +417,11 @@ it open, so a finger resting in a trigger gets pushed.
 | `dk1 policy home` | the home sweep alone, no model | both arms move |
 | `dk1 policy finetune` | the LoRA training run | GPU only, nothing connected |
 | `dk1 policy curve` | which checkpoint to deploy, off the log | none — two text files |
+| `dk1 policy pause` | ask a running fine-tune to stop at its next checkpoint | none — writes one file |
+| `dk1 policy resume` | continue a fine-tune from its last checkpoint | GPU only, nothing connected |
 | `dk1 dataset check` | is the recorded dataset what we meant? | none — metadata only |
 | `dk1 dataset crop` | the optimized crop, into a copy of a dataset | the video encoder, nothing else |
+| `dk1 dataset clamp` | repair a gripper command the robot never executed | none — parquet and JSON |
 | `dk1 study photo` | one still of a scene layout | a video device, nothing else |
 | `dk1 study scores` | reads a scored row's CSV back | none — a text file |
 | `dk1 doctor watch` | samples PSU, CPU and GPU once a second | none — sysfs and nvidia-smi |
@@ -738,6 +741,35 @@ Six things it must keep doing:
   are in DK1 convention, so the weights end up speaking DK1. `curve` prints the
   `dk1 policy session` line with `--no-invert-gripper` already in it.
 
+**Two faults found by the first probe, both of which stop the run silently.**
+`DIAGNOSTICS §` *The gripper command that was never executed*:
+
+- **A recorded gripper command outside [0, 1] kills the run at its first
+  evaluation.** MolmoAct2 passes the gripper channel through its normaliser
+  **unnormalised** and raises on anything outside [-1, 1]; upstream's
+  `command_gripper` clips to [0, 1] *inside* the robot, so a leader trigger
+  squeezed past the stop was executed as 1.0 and recorded as 1.03. 7% of
+  `study/demos` was. `SafeBiDK1Follower.send_action` now returns the clipped
+  value — which is what its docstring always claimed — `dk1 dataset clamp`
+  repairs a recording made before that, and `dk1 dataset check` reports it.
+  **Do not reach for `normalize_gripper=True`**, which the error message
+  suggests: it would normalise the gripper with the YAM statistics, so a
+  fine-tuned checkpoint's gripper would mean something different from A0's.
+- **The run's own `train.log` was empty, so `curve` had nothing to read.** Two
+  causes: `init_logging` clears every handler off the root logger (`patched`
+  now wraps it, `logs.restore` puts them back), and `lerobot_train` logs with
+  bare `logging.info(...)`, which arrives named **`root`** — held at WARNING by
+  `logs.Interesting` until `APPLICATION_LOGGERS` was added. There is no early
+  stop, so the log **is** the selection mechanism.
+
+**What it costs, measured** (R1's configuration, `--adapt vlm+expert`, 106 M
+trainable, batch 2, gradient checkpointing on): **1.13 step/s**, one evaluation
+over the whole 4-episode hold-out **5 min 27 s**, ~75 s to load, **1.2 GB** per
+checkpoint. So 20 000 steps is 4.9 h of training, and evaluating every 1 000
+steps adds 1.8 h on top. Halving the evaluation *count* is the better economy
+than `--max-eval-samples`, which takes the **first** N frames of the hold-out —
+one episode's opening rather than a spread over the three scenes.
+
 Two facts to carry with any number this produces:
 
 - **there is no early stop.** LeRobot 0.6.1 logs a held-out loss every
@@ -748,15 +780,31 @@ Two facts to carry with any number this produces:
   targets its action expert; **MolmoAct2's targets the VLM and leaves its 578 M
   action expert frozen**, because LeRobot's generic PEFT path freezes every base
   parameter first. `--adapt vlm+expert` extends MolmoAct2's *own* regex over the
-  action expert; the default is unchanged and the banner says which is in force.
-  `dk1lab.finetune.molmoact2_target_modules` is pinned against LeRobot's method
-  by a test, so it cannot drift.
+  action expert; the flag's default is unchanged, the banner says which is in
+  force, and **R1 and A1 are run with `--adapt vlm+expert`** (Nikolas, 2026-08-28
+  — `STUDY.md` amendment). `dk1lab.finetune.molmoact2_target_modules` is pinned
+  against LeRobot's method by a test, so it cannot drift.
 
-Defaults, all recorded and all movable by flag: **20 000 steps** (a budget, not
-epochs), batch 2, **lr 1e-4** — not the checkpoint's 1e-5, which is a full
+**It can be stopped and picked up again**, which is what makes the budget a
+decision rather than a commitment. `dk1 policy pause <run>` writes a `STOP` file;
+`patched` wraps `update_last_checkpoint`, which LeRobot calls immediately after
+`save_checkpoint`, so the run stops with a **complete** checkpoint and `last`
+pointing at it — nothing lost. Ctrl-C stops now and gives up at most `save_freq`
+steps; both are ordinary outcomes, neither exits non-zero, and both are resumable.
+`dk1 policy resume <run>` continues from `checkpoints/last`, and its command line
+is deliberately two arguments — `--config_path` and `--resume=true` — because
+everything about the run comes back from the checkpoint's own
+`train_config.json`. That is what keeps a resumed run the *same* experiment.
+`train.log` is appended, so `curve` sees the whole run however many sittings it
+took, and `dk1_resume.jsonl` records each one. A stop that lands on the last
+checkpoint reads as **completed**, not paused.
+
+Defaults, all recorded and all movable by flag: **8 000 steps** (a budget, not
+epochs — Nikolas, 2026-08-28, with a checkpoint at 2 000, 4 000, 6 000 and
+8 000), batch 2, **lr 1e-4** — not the checkpoint's 1e-5, which is a full
 fine-tune's rate and barely moves a rank-32 adapter at scale 0.5 — warmup 200,
 decay over the budget rather than the preset's 100 000, an evaluation **and** a
-checkpoint every 1 000 steps (equal on purpose: otherwise the best loss belongs to
+checkpoint every 2 000 steps (equal on purpose: otherwise the best loss belongs to
 a checkpoint nobody saved), **4 episodes held out** (`STUDY.md` amendment of
 2026-08-28: its 10 was set against 45 demonstrations and 26 were recorded, where
 it would hold out 38% of them), gradient checkpointing **on**.

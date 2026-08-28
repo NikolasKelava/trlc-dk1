@@ -2404,6 +2404,18 @@ def finetune(
         ),
     ] = None,
     num_workers: Annotated[int | None, typer.Option("--num-workers", help="Dataloader workers.")] = None,
+    max_eval_samples: Annotated[
+        int | None,
+        typer.Option(
+            "--max-eval-samples",
+            help=(
+                "Cap the frames one evaluation reads. 0 reads the whole hold-out, which "
+                "is ~1400 forward passes EVERY --eval-every steps. LeRobot takes the "
+                "first N frames of the hold-out, so a cap buys time with a smaller and "
+                "more front-loaded validation set."
+            ),
+        ),
+    ] = None,
     adapt: Annotated[
         str,
         typer.Option(
@@ -2479,6 +2491,7 @@ def finetune(
                 ("eval_steps", eval_every),
                 ("save_freq", eval_every),
                 ("num_workers", num_workers),
+                ("max_eval_samples", max_eval_samples),
             )
             if value is not None
         },
@@ -2523,9 +2536,16 @@ def finetune(
     typer.echo(f"  adapting    {describe_adapt(what.family, adapt)}")
     typer.echo(
         f"  budget      {budget.steps} steps, batch {budget.batch_size}, lr {budget.lr:g}, "
-        f"warmup {budget.warmup}, eval+checkpoint every {budget.eval_steps}"
+        f"warmup {budget.warmup}, eval+checkpoint every {budget.eval_steps}, "
+        f"eval reads {budget.max_eval_samples or 'the whole hold-out'}"
     )
     typer.echo(f"  run dir     {output}")
+    # Said here rather than only once training starts, so it is on screen before
+    # the operator walks away and in the --dry-run they read first.
+    typer.echo(
+        f"  stopping    dk1 policy pause {output} — stops at the next checkpoint, "
+        f"losing nothing; Ctrl-C stops now, losing at most {budget.save_freq} steps"
+    )
 
     if summary.problems:
         typer.secho(f"\n{len(summary.problems)} problem(s) with the dataset:", fg=typer.colors.RED)
@@ -2608,10 +2628,47 @@ def finetune(
         typer.echo(f"log -> {start_log('finetune', path=output / 'train.log')}")
 
     typer.secho(f"\ntraining {what.name} ...\n", fg=typer.colors.GREEN)
-    run_training(argv, checkpoint=spec, say=typer.echo)
+    outcome = run_training(argv, checkpoint=spec, say=typer.echo, run_dir=output)
+    _echo_finetune_outcome(outcome, output, budget.steps)
 
-    typer.secho(f"\n{what.name} trained. Read the curve back with:", fg=typer.colors.GREEN)
-    typer.echo(f"  dk1 policy curve {output}\n")
+
+def _echo_finetune_outcome(outcome: str, run_dir: Path, budget_steps: int | None = None) -> None:
+    """What happened, and the one command that follows from it.
+
+    A paused or interrupted run is an ordinary outcome with a checkpoint behind
+    it, not a failure — and the difference between the two is only how many steps
+    were lost, so both are reported the same way and neither exits non-zero.
+
+    A stop that lands on the **last** checkpoint is a finished run, not a paused
+    one: telling the operator to resume a run with no steps left is how somebody
+    spends a morning waiting for a training job that exits immediately.
+    """
+    from ..finetune import COMPLETED, PAUSED, checkpoint_steps, clear_stop
+
+    saved = checkpoint_steps(run_dir)
+    if outcome != COMPLETED and budget_steps and saved and max(saved) >= budget_steps:
+        clear_stop(run_dir)
+        outcome = COMPLETED
+
+    if outcome == COMPLETED:
+        typer.secho("\ntrained to the end of the budget.", fg=typer.colors.GREEN)
+    else:
+        if outcome == PAUSED:
+            clear_stop(run_dir)
+            typer.secho(
+                "\npaused at a checkpoint — nothing was lost, and the stop request "
+                "has been cleared.",
+                fg=typer.colors.YELLOW,
+            )
+        else:
+            typer.secho(
+                "\ninterrupted. The last checkpoint written is intact; the steps "
+                "since it are gone.",
+                fg=typer.colors.YELLOW,
+            )
+        typer.echo(f"  continue with:  dk1 policy resume {run_dir}")
+    typer.secho("\nread the curve back with:", bold=True)
+    typer.echo(f"  dk1 policy curve {run_dir}\n")
 
 
 HELP_CURVE = """Read a fine-tune's held-out loss back, and name the checkpoint to deploy.
@@ -2703,6 +2760,145 @@ def curve(
         "from the demonstrations, and inverting it flips every grasp. Confirm it on "
         "the FIRST episode before spending nine attempts.\n",
         fg=typer.colors.YELLOW,
+    )
+
+
+HELP_RESUME = """Continue a fine-tune from its last checkpoint. GPU only.
+
+A run that was paused (`dk1 policy pause`) or interrupted picks up where its
+last checkpoint left off — same dataset, same split, same recipe, same budget and
+the same learning-rate schedule, because all of it comes back from the
+checkpoint's own train_config.json rather than from what is typed here.
+
+    dk1 policy resume study/finetune/R1-<stamp>
+    dk1 policy resume study/finetune/R1-<stamp> --step 4000    # an earlier one
+
+Each session is appended to dk1_resume.jsonl, so a checkpoint can say it came
+from more than one sitting. The arms are not involved and nothing is energised."""
+
+
+@app.command("resume", help=HELP_RESUME)
+def resume(
+    run_dir: Annotated[Path, typer.Argument(help="A run directory from `dk1 policy finetune`.")],
+    step: Annotated[
+        int | None,
+        typer.Option("--step", help="Resume from this checkpoint instead of the last one."),
+    ] = None,
+    steps: Annotated[
+        int | None,
+        typer.Option(
+            "--steps",
+            help=(
+                "Raise the budget. Past the original, the learning rate is already at "
+                "its floor and the extra steps barely move the adapter."
+            ),
+        ),
+    ] = None,
+    log: Annotated[bool, typer.Option("--log/--no-log", help="Append to the run's train.log.")] = True,
+    assume_yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation.")] = False,
+) -> None:
+    from ..finetune import (
+        FinetuneError,
+        checkpoint_steps,
+        clear_stop,
+        decay_warning,
+        latest_checkpoint,
+        note_resume,
+        read_run,
+        resume_argv,
+    )
+    from ..finetune import run as run_training
+
+    try:
+        checkpoint = latest_checkpoint(run_dir, step)
+        argv = resume_argv(run_dir, step=step, steps=steps)
+    except FinetuneError as exc:
+        typer.secho(f"\n{exc}\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    record = read_run(run_dir)
+    budget = record.get("budget") or {}
+    saved = checkpoint_steps(run_dir)
+    at = int(checkpoint.name) if checkpoint.name.isdigit() else None
+
+    typer.secho(f"\nresuming {record.get('row') or run_dir.name}", bold=True)
+    typer.echo(f"  run dir     {run_dir}")
+    typer.echo(f"  from        {checkpoint}" + (f"  (step {at})" if at else ""))
+    typer.echo(f"  checkpoints {saved or 'none'}")
+    typer.echo(f"  budget      {steps or budget.get('steps') or '?'} steps "
+               f"(recorded {budget.get('steps') or '?'})")
+    typer.echo(f"  adapting    {record.get('adapting') or 'as recorded'}")
+    typer.echo("\nlerobot-train \\\n  " + " \\\n  ".join(argv))
+
+    # A stop request left behind would stop the resumed run at its first
+    # checkpoint, which looks exactly like it refusing to run.
+    if clear_stop(run_dir):
+        typer.secho("\ncleared the pending stop request.", fg=typer.colors.YELLOW)
+
+    if steps is not None and (warning := decay_warning(run_dir, steps)):
+        typer.secho(f"\n{warning}", fg=typer.colors.YELLOW)
+
+    if not assume_yes and not _confirm("continue this run?", default=True):
+        typer.secho("nothing was trained.", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+
+    if log:
+        from ..logs import start as start_log
+
+        typer.echo(f"log -> {start_log('finetune', path=Path(run_dir) / 'train.log')}")
+
+    note_resume(run_dir, argv=argv, checkpoint=checkpoint)
+    typer.secho(
+        f"\ncontinuing ...\n  pause it again with:  dk1 policy pause {run_dir}\n",
+        fg=typer.colors.GREEN,
+    )
+    outcome = run_training(
+        argv,
+        checkpoint=checkpoint / "pretrained_model",
+        say=typer.echo,
+        run_dir=run_dir,
+    )
+    _echo_finetune_outcome(outcome, Path(run_dir), steps or budget.get("steps"))
+
+
+HELP_PAUSE = """Ask a running fine-tune to stop at its next checkpoint.
+
+Writes a STOP file into the run directory. The training loop reads it right after
+each checkpoint is written, so it stops having lost nothing — unlike Ctrl-C, which
+stops now and gives up everything since the last save.
+
+    dk1 policy pause study/finetune/R1-<stamp>            ask it to stop
+    dk1 policy pause study/finetune/R1-<stamp> --cancel   change your mind
+
+Resume with `dk1 policy resume`. Writes one small file and nothing else."""
+
+
+@app.command("pause", help=HELP_PAUSE)
+def pause(
+    run_dir: Annotated[Path, typer.Argument(help="A run directory from `dk1 policy finetune`.")],
+    cancel: Annotated[
+        bool, typer.Option("--cancel", help="Withdraw a stop request instead of making one.")
+    ] = False,
+) -> None:
+    from ..finetune import clear_stop, request_stop
+
+    if not Path(run_dir).is_dir():
+        typer.secho(f"\n{run_dir} does not exist.\n", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    if cancel:
+        if clear_stop(run_dir):
+            typer.secho(f"\nstop request withdrawn; {run_dir} runs on.\n", fg=typer.colors.GREEN)
+            return
+        typer.secho(f"\n{run_dir} had no stop request.\n", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+
+    path = request_stop(run_dir)
+    typer.secho(f"\nwrote {path}", fg=typer.colors.GREEN)
+    typer.echo(
+        "  training stops after the next checkpoint is written — nothing is lost.\n"
+        f"  cancel with:  dk1 policy pause {run_dir} --cancel\n"
+        f"  continue with: dk1 policy resume {run_dir}\n"
     )
 
 

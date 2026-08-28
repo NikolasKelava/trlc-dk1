@@ -42,6 +42,14 @@ demonstrations are in DK1 convention and the YAM statistics are the units they
 get expressed in; the adapter learns the rest. That is a property to state, not
 one to fix — changing it would make A1 and A0 disagree about more than the LoRA.
 
+**LeRobot clears the root logger, and the run's own log has to survive it.**
+``lerobot_train`` calls ``init_logging``, which does
+``logging.getLogger().handlers.clear()``. Anything opened before it is gone
+without a word — which left a fine-tune's ``train.log`` holding one line and
+:func:`best_checkpoint` with nothing to read. :func:`patched` wraps
+``init_logging`` and :func:`dk1lab.logs.restore` puts the handlers back. It is
+not a logging nicety: the log **is** the selection mechanism.
+
 **The held-out episodes must not all be one scene.** LeRobot's ``eval_split``
 holds out *the last* ``ceil(n * split)`` episodes per task, and the
 demonstrations are recorded grouped by scene — 15 of scene 1, then 15 of scene 2,
@@ -78,6 +86,19 @@ from .layout import IMAGE_KEYS
 from .runprofile import COMMON, OPTIMIZED
 
 __all__ = [
+    "stop_path",
+    "resume_argv",
+    "request_stop",
+    "read_run",
+    "note_resume",
+    "latest_checkpoint",
+    "decay_warning",
+    "clear_stop",
+    "STOP_FILE",
+    "PAUSED",
+    "INTERRUPTED",
+    "COMPLETED",
+    "Paused",
     "DEFAULT_BUDGET",
     "DEFAULT_RUNS_DIR",
     "LoraRecipe",
@@ -297,7 +318,12 @@ class TrainingBudget:
     belongs to a checkpoint that was never written.
 
     Attributes:
-        steps: optimiser updates. Not epochs.
+        steps: optimiser updates. Not epochs. **8 000** (Nikolas, 2026-08-28),
+            which at the measured 1.13 step/s is about two hours plus four
+            evaluations — and with a checkpoint every 2 000 it can be stopped and
+            resumed at any of them. 8 000 x batch 2 is roughly one pass over the
+            15 605 training frames, which is thin; the curve is what says whether
+            it was enough, and :func:`resume_argv` is how it gets more.
         batch_size: frames per update. Small, because the model is 5.44 B
             parameters on a 32 GB card even with the base weights frozen.
         lr: peak learning rate. **1e-4, not the checkpoint's 1e-5.** The preset
@@ -309,18 +335,26 @@ class TrainingBudget:
             ten was set against 45 demonstrations and 26 were recorded, where it
             would hold out 38% of them. Four is 15%, and the same number has to
             be reused in Phase 7 for the two rows to be comparable.
+        max_eval_samples: cap on the frames one evaluation reads, ``0`` for all of
+            them. It matters more than it looks: the whole hold-out is read at
+            **every** ``eval_steps``, so four episodes of ~700 frames is ~1 400
+            forward passes twenty times over — hours of the budget spent
+            measuring rather than training. LeRobot takes the *first* N frames
+            of the hold-out, so a cap trades a smaller and more front-loaded
+            validation set for that time; measure both rates before choosing one.
         gradient_checkpointing: recompute activations instead of storing them.
             **On.** The alternative on this card is an out-of-memory error a few
             hundred steps in, which is the expensive way to find out.
     """
 
-    steps: int = 20_000
+    steps: int = 8_000
     batch_size: int = 2
     lr: float = 1e-4
     warmup: int = 200
-    eval_steps: int = 1_000
-    save_freq: int = 1_000
+    eval_steps: int = 2_000
+    save_freq: int = 2_000
     holdout: int = 4
+    max_eval_samples: int = 0
     num_workers: int = 4
     seed: int = 1000
     gradient_checkpointing: bool = True
@@ -620,6 +654,185 @@ def episode_scenes(
 
 
 # --------------------------------------------------------------------------- #
+# Pausing and resuming
+# --------------------------------------------------------------------------- #
+#
+# A training run is hours long and the machine it runs on is also the cell's
+# machine. Being able to stop it and pick it up again is what makes an 8 000-step
+# budget a decision rather than a commitment — and it is what turns "the curve was
+# still falling" from a wasted night into another two hours.
+#
+# There are two ways to stop, and they differ in what they cost:
+#
+#   Ctrl-C            stops now. Everything since the last checkpoint is lost,
+#                     which is at most `save_freq` steps.
+#   `dk1 policy pause`  writes a STOP file. Training continues to the **next**
+#                     checkpoint, writes it, updates `last`, and stops there —
+#                     so nothing is lost at all.
+#
+# Both leave the run resumable from `checkpoints/last`, because LeRobot's
+# checkpoint carries the optimiser state, the scheduler and the step count, and
+# `train_config.json` beside it carries the whole configuration. That last part
+# is what keeps a resumed run the same experiment: the budget, the LR schedule,
+# the split and the recipe come back from the checkpoint rather than from
+# whatever is typed the second time.
+
+
+#: Written into a run directory to ask a running fine-tune to stop cleanly.
+STOP_FILE = "STOP"
+
+
+class Paused(Exception):
+    """Raised inside the training loop when a stop was asked for. Not an error."""
+
+    def __init__(self, step: int) -> None:
+        super().__init__(f"paused after step {step}")
+        self.step = step
+
+
+def stop_path(run_dir: Path | str) -> Path:
+    """Where the stop request lives for one run."""
+    return Path(run_dir) / STOP_FILE
+
+
+def request_stop(run_dir: Path | str) -> Path:
+    """Ask the run in ``run_dir`` to stop at its next checkpoint."""
+    path = stop_path(run_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"requested {datetime.now().isoformat(timespec='seconds')}\n"
+        "Training stops after the next checkpoint is written. Remove this file to\n"
+        "cancel, or resume with `dk1 policy resume <run dir>`.\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def clear_stop(run_dir: Path | str) -> bool:
+    """Withdraw a stop request. Returns whether there was one."""
+    path = stop_path(run_dir)
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
+def latest_checkpoint(run_dir: Path | str, step: int | None = None) -> Path:
+    """The checkpoint to resume from: ``last``, or the one at ``step``.
+
+    ``last`` is a symlink LeRobot updates immediately after each checkpoint is
+    written, so it is the newest **complete** one — which is what a resume needs
+    and is not always the highest-numbered directory on disk if a write was
+    interrupted.
+
+    Raises:
+        FinetuneError: if there is nothing to resume from, or no checkpoint at
+            ``step``. Naming the steps that do exist, because the usual cause is
+            asking for one the ``save_freq`` never landed on.
+    """
+    root = train_dir(run_dir) / "checkpoints"
+    if step is not None:
+        steps = checkpoint_steps(run_dir)
+        if step not in steps:
+            raise FinetuneError(
+                f"{run_dir} has no checkpoint at step {step} — it has {steps or 'none'}"
+            )
+        width = max(6, len(str(max(steps))))
+        for candidate in root.iterdir():
+            if not candidate.is_symlink() and candidate.is_dir() and int(candidate.name) == step:
+                return candidate
+        return root / f"{step:0{width}d}"
+    last = root / "last"
+    if last.exists():
+        return last.resolve()
+    steps = checkpoint_steps(run_dir)
+    if not steps:
+        raise FinetuneError(
+            f"{run_dir} has no checkpoints to resume from. A run that was stopped "
+            f"before its first save_freq has nothing saved — start it again."
+        )
+    return latest_checkpoint(run_dir, steps[-1])
+
+
+def resume_argv(
+    run_dir: Path | str, *, step: int | None = None, steps: int | None = None
+) -> list[str]:
+    """The ``lerobot-train`` arguments that continue a run from its checkpoint.
+
+    Deliberately short. Everything about the run — the dataset, the split, the
+    recipe, the budget, the LR schedule — comes back from the checkpoint's own
+    ``train_config.json``, which is what makes a resumed run the same experiment
+    rather than a similar one. Only ``--steps`` may be raised, and doing so is a
+    decision worth understanding: see :func:`decay_warning`.
+
+    Raises:
+        FinetuneError: if the checkpoint has no ``train_config.json`` — a
+            directory that is not one of LeRobot's checkpoints, or one whose
+            write was interrupted.
+    """
+    checkpoint = latest_checkpoint(run_dir, step)
+    config = checkpoint / PRETRAINED_MODEL_DIR / "train_config.json"
+    if not config.is_file():
+        raise FinetuneError(
+            f"{config} does not exist, so there is nothing to resume from. "
+            f"A complete checkpoint carries its whole training configuration."
+        )
+    argv = [f"--config_path={config}", "--resume=true"]
+    if steps is not None:
+        argv.append(f"--steps={steps}")
+    return argv
+
+
+def decay_warning(run_dir: Path | str, steps: int) -> str | None:
+    """Why raising ``--steps`` past the recorded budget is not free.
+
+    The learning rate decays over ``scheduler_decay_steps``, which was set to the
+    original budget so the schedule fits it. Train past that horizon and every
+    extra step runs at ``scheduler_decay_lr`` — 1e-6, a hundredth of the peak —
+    so the adapter barely moves. Not wrong, and sometimes exactly what is wanted;
+    but it has to be a choice rather than a surprise.
+    """
+    record = read_run(run_dir)
+    budget = (record.get("budget") or {}).get("steps")
+    if not budget or steps <= int(budget):
+        return None
+    return (
+        f"{steps} steps is past this run's decay horizon of {budget}: the learning "
+        f"rate reaches its floor there, so the steps beyond it barely move the "
+        f"adapter. Start a fresh run with --steps {steps} for a schedule that fits."
+    )
+
+
+def read_run(run_dir: Path | str) -> dict[str, Any]:
+    """A run directory's ``dk1_run.json``, or ``{}`` if it has none."""
+    path = Path(run_dir) / "dk1_run.json"
+    if not path.is_file():
+        return {}
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def note_resume(run_dir: Path | str, *, argv: Sequence[str], checkpoint: Path) -> None:
+    """Append one line per resumed session to ``dk1_resume.jsonl``.
+
+    ``dk1_run.json`` describes how the run started, and is not rewritten — a run
+    that was resumed four times still started once. This is the rest of the
+    story, and it is what says the weights came from more than one sitting.
+    """
+    record = {
+        "resumed": datetime.now().isoformat(timespec="seconds"),
+        "from": str(checkpoint),
+        "argv": list(argv),
+        "git": git_sha(Path(run_dir).parent),
+    }
+    with (Path(run_dir) / "dk1_resume.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, default=str) + "\n")
+
+
+# --------------------------------------------------------------------------- #
 # The override repair
 # --------------------------------------------------------------------------- #
 
@@ -660,7 +873,9 @@ def pipeline_steps(path: Path | str, filename: str) -> list[str]:
 
 
 @contextmanager
-def patched(checkpoint: Path | str, *, say=None) -> Generator[None, None, None]:
+def patched(
+    checkpoint: Path | str, *, say=None, run_dir: Path | str | None = None
+) -> Generator[None, None, None]:
     """Install the override repair around a call to LeRobot's training entry point.
 
     Wraps ``lerobot.scripts.lerobot_train.make_pre_post_processors`` so that the
@@ -677,10 +892,18 @@ def patched(checkpoint: Path | str, *, say=None) -> Generator[None, None, None]:
         say: called with one line per dropped override, or ``None`` to stay
             quiet. What was dropped changes what the run normalises with, so
             somebody has to be told.
+        run_dir: the run directory to watch for a stop request. ``None`` means
+            the run cannot be paused — which is right for a test and wrong for
+            anything that takes hours.
     """
     from lerobot.scripts import lerobot_train
 
+    from . import logs
+
     original = lerobot_train.make_pre_post_processors
+    original_init_logging = lerobot_train.init_logging
+    original_update_last = lerobot_train.update_last_checkpoint
+    ours = logs.handlers()
     pre = pipeline_steps(checkpoint, "policy_preprocessor.json")
     post = pipeline_steps(checkpoint, "policy_postprocessor.json")
 
@@ -698,11 +921,38 @@ def patched(checkpoint: Path | str, *, say=None) -> Generator[None, None, None]:
                     )
         return original(*args, **kwargs)
 
+    def keep_our_log(*args: Any, **kwargs: Any):
+        # `init_logging` clears every handler off the root logger, ours included.
+        # Without this the run's own train.log holds one line and
+        # `dk1 policy curve` has no held-out loss to read.
+        result = original_init_logging(*args, **kwargs)
+        logs.restore(ours)
+        return result
+
+    def stop_after_checkpoint(checkpoint_dir, *args: Any, **kwargs: Any):
+        # Called immediately after `save_checkpoint`, so by the time this runs the
+        # checkpoint is complete — and after the original, so `last` points at it.
+        # That makes this the only place a run can be stopped losing nothing.
+        result = original_update_last(checkpoint_dir, *args, **kwargs)
+        if run_dir is not None and stop_path(run_dir).exists():
+            try:
+                step = int(Path(checkpoint_dir).name)
+            except ValueError:
+                step = 0
+            if say is not None:
+                say(f"  stop requested — finishing at step {step}")
+            raise Paused(step)
+        return result
+
     lerobot_train.make_pre_post_processors = repaired
+    lerobot_train.init_logging = keep_our_log
+    lerobot_train.update_last_checkpoint = stop_after_checkpoint
     try:
         yield
     finally:
         lerobot_train.make_pre_post_processors = original
+        lerobot_train.init_logging = original_init_logging
+        lerobot_train.update_last_checkpoint = original_update_last
 
 
 # --------------------------------------------------------------------------- #
@@ -760,6 +1010,7 @@ def train_argv(
         # Equal on purpose: every checkpoint gets a held-out loss beside it.
         f"--eval_steps={budget.eval_steps}",
         f"--save_freq={budget.save_freq}",
+        f"--max_eval_samples={budget.max_eval_samples}",
         # Nothing here has a simulator to evaluate in, and STUDY.md's evaluation
         # is nine attempts on the arms.
         "--env_eval_freq=0",
@@ -797,21 +1048,46 @@ def _bool(value: bool) -> str:
     return "true" if value else "false"
 
 
-def run(argv: Sequence[str], *, checkpoint: Path | str, say=None) -> None:
+#: How a training session ended. ``completed`` ran the budget out; the other two
+#: are resumable and are not failures.
+COMPLETED, PAUSED, INTERRUPTED = "completed", "paused", "interrupted"
+
+
+def run(
+    argv: Sequence[str],
+    *,
+    checkpoint: Path | str,
+    say=None,
+    run_dir: Path | str | None = None,
+) -> str:
     """Run LeRobot's training entry point with ``argv``, repairs installed.
 
     Goes through ``lerobot_train.train()`` rather than a config object because
     the entry point is ``@parser.wrap()``-ed and reads ``sys.argv`` — so passing
     the arguments this way is what makes the recorded command line and the
     executed one the same thing.
+
+    Returns :data:`COMPLETED`, :data:`PAUSED` or :data:`INTERRUPTED`. The last
+    two are ordinary outcomes with a checkpoint on disk behind them, not
+    failures, and the caller says how to pick the run up again. A real fault
+    still raises.
     """
     from lerobot.scripts import lerobot_train
 
     previous = sys.argv
     sys.argv = ["lerobot-train", *argv]
     try:
-        with patched(checkpoint, say=say):
+        with patched(checkpoint, say=say, run_dir=run_dir):
             lerobot_train.train()
+        return COMPLETED
+    except Paused:
+        return PAUSED
+    except KeyboardInterrupt:
+        # Everything since the last checkpoint is gone — at most `save_freq`
+        # steps — and the run is still resumable from it. A traceback here would
+        # read as a crash, which is the wrong thing to believe about a run whose
+        # weights are on disk.
+        return INTERRUPTED
     finally:
         sys.argv = previous
 
@@ -860,10 +1136,17 @@ def git_sha(repo: Path | str = ".") -> dict[str, Any]:
             return ""
 
     sha = ask("rev-parse", "HEAD")
+    # Tracked changes only. `recordings/` is untracked by policy and would make
+    # every run report a dirty tree, which is the fastest way to make a field
+    # nobody reads. What is untracked is counted separately rather than dropped:
+    # an untracked module is still code that ran.
+    modified = ask("status", "--porcelain", "--untracked-files=no")
+    untracked = ask("ls-files", "--others", "--exclude-standard")
     return {
         "sha": sha,
         "branch": ask("rev-parse", "--abbrev-ref", "HEAD"),
-        "clean": bool(sha) and not ask("status", "--porcelain"),
+        "clean": bool(sha) and not modified,
+        "untracked": len(untracked.splitlines()) if untracked else 0,
     }
 
 

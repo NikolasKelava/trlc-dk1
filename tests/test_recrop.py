@@ -427,3 +427,185 @@ def test_a_dataset_with_no_notes_cannot_be_stratified_and_says_so(dataset):
 def test_a_directory_that_is_not_a_dataset_raises(tmp_path):
     with pytest.raises(DatasetError):
         summarise(tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# The gripper command that was never executed
+# --------------------------------------------------------------------------- #
+
+
+def with_data(root, action, state=None):
+    """Give a dataset fixture a data/ table, so it can be clamped."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    action = np.asarray(action, dtype=np.float64)
+    state = np.asarray(state if state is not None else action, dtype=np.float64)
+    directory = root / "data" / "chunk-000"
+    directory.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": list(range(len(action))),
+                "action": pa.array(action.tolist(), type=pa.list_(pa.float32(), 14)),
+                "observation.state": pa.array(state.tolist(), type=pa.list_(pa.float32(), 14)),
+            }
+        ),
+        directory / "file-000.parquet",
+    )
+    return root
+
+
+def rows(*values):
+    """One 14-D row per value, with that value in both gripper channels."""
+    from dk1lab.layout import GRIPPER_INDICES
+
+    out = []
+    for value in values:
+        row = [0.5] * 14
+        for index in GRIPPER_INDICES:
+            row[index] = value
+        out.append(row)
+    return out
+
+
+def test_a_gripper_command_past_the_stop_is_clipped(dataset):
+    """The robot clips to [0, 1] internally, so 1.03 describes a motion that did
+    not happen — and MolmoAct2 refuses it, which is how it was found."""
+    import pyarrow.parquet as pq
+
+    from dk1lab.dataset import clamp_gripper
+    from dk1lab.layout import GRIPPER_INDICES
+
+    with_data(dataset, rows(0.06, 1.0234, 0.5, -0.01))
+    report = clamp_gripper(dataset)
+    assert report.written and report.changed == 2
+    low, high = report.before[GRIPPER_INDICES[0]]  # float32 on disk
+    assert (low, high) == (pytest.approx(-0.01, abs=1e-6), pytest.approx(1.0234, abs=1e-6))
+
+    action = np.array(
+        pq.read_table(dataset / "data" / "chunk-000" / "file-000.parquet")
+        .column("action")
+        .to_pylist(),
+        dtype=np.float64,
+    )
+    for index in GRIPPER_INDICES:
+        assert action[:, index].max() <= 1.0
+        assert action[:, index].min() >= 0.0
+
+
+def test_the_arm_joints_are_not_touched(dataset):
+    """They are radians and legitimately outside [0, 1]; clipping them would pin
+    every arm to a wrist's worth of travel."""
+    import pyarrow.parquet as pq
+
+    from dk1lab.dataset import clamp_gripper
+
+    table = [[3.125] * 14, [-1.577] * 14]
+    with_data(dataset, table)
+    clamp_gripper(dataset)
+    action = np.array(
+        pq.read_table(dataset / "data" / "chunk-000" / "file-000.parquet")
+        .column("action")
+        .to_pylist(),
+        dtype=np.float64,
+    )
+    arm = [i for i in range(14) if i not in __import__("dk1lab.layout", fromlist=["x"]).GRIPPER_INDICES]
+    assert action[:, arm].max() == pytest.approx(3.125, abs=1e-4)
+    assert action[:, arm].min() == pytest.approx(-1.577, abs=1e-4)
+
+
+def test_the_measured_state_is_left_alone(dataset):
+    """Clipping a measurement would be inventing data. It is also never needed:
+    the follower physically cannot pass its own stop."""
+    import pyarrow.parquet as pq
+
+    from dk1lab.dataset import clamp_gripper
+    from dk1lab.layout import GRIPPER_INDICES
+
+    with_data(dataset, rows(1.03), state=rows(1.03))
+    clamp_gripper(dataset)
+    state = np.array(
+        pq.read_table(dataset / "data" / "chunk-000" / "file-000.parquet")
+        .column("observation.state")
+        .to_pylist(),
+        dtype=np.float64,
+    )
+    assert state[0][GRIPPER_INDICES[0]] == pytest.approx(1.03, abs=1e-4)
+
+
+def test_a_dry_run_reports_and_writes_nothing(dataset):
+    from dk1lab.dataset import CLAMP_FILE, clamp_gripper
+
+    with_data(dataset, rows(1.03, 0.5))
+    report = clamp_gripper(dataset, dry_run=True)
+    assert report.needed and not report.written
+    assert not (dataset / CLAMP_FILE).exists()
+
+
+def test_a_dataset_already_in_range_is_not_rewritten(dataset):
+    from dk1lab.dataset import CLAMP_FILE, clamp_gripper
+
+    with_data(dataset, rows(0.0, 0.5, 1.0))
+    report = clamp_gripper(dataset)
+    assert not report.needed and not report.written
+    assert not (dataset / CLAMP_FILE).exists()
+
+
+def test_clamping_is_idempotent(dataset):
+    from dk1lab.dataset import clamp_gripper
+
+    with_data(dataset, rows(1.03, 0.5))
+    assert clamp_gripper(dataset).changed == 1
+    assert clamp_gripper(dataset).changed == 0
+
+
+def test_what_was_recorded_is_written_down_before_it_is_changed(dataset):
+    """A repair that leaves no trace of what it repaired is indistinguishable
+    from a recording that was always like that."""
+    from dk1lab.dataset import CLAMP_FILE, clamp_gripper
+
+    with_data(dataset, rows(1.03, 0.5))
+    clamp_gripper(dataset)
+    record = json.loads((dataset / CLAMP_FILE).read_text())
+    assert record["range"] == [0.0, 1.0]
+    assert record["changed"] == 1
+    assert record["recorded_range"]["6"][1] == pytest.approx(1.03, abs=1e-4)
+
+
+def test_the_stats_stop_describing_a_command_that_no_longer_exists(dataset):
+    """`lerobot_train` hands `dataset.meta.stats` to the processors, so a max of
+    1.03 left behind would still describe a frame that is not in the data."""
+    from dk1lab.dataset import clamp_gripper
+    from dk1lab.layout import GRIPPER_INDICES
+
+    (dataset / "meta" / "stats.json").write_text(
+        json.dumps(
+            {
+                "action": {
+                    name: [1.03 if i in GRIPPER_INDICES else 9.0 for i in range(14)]
+                    for name in ("min", "max", "mean", "std", "q01", "q10", "q50", "q90", "q99")
+                }
+            }
+        )
+    )
+    with_data(dataset, rows(1.03, 0.5))
+    clamp_gripper(dataset)
+    stats = json.loads((dataset / "meta" / "stats.json").read_text())["action"]
+    assert stats["max"][GRIPPER_INDICES[0]] == pytest.approx(1.0)
+    # Every other channel is untouched: rewriting statistics that did not change
+    # is how a repair turns into a difference nobody can account for.
+    assert stats["max"][0] == 9.0
+
+
+def test_the_check_reports_an_out_of_range_gripper(dataset):
+    """Reported by `dk1 dataset check` rather than discovered by a training run,
+    which is how it was discovered the first time."""
+    with_data(dataset, rows(1.03, 0.5))
+    problems = summarise(dataset).problems
+    assert any("gripper" in problem and "dk1 dataset clamp" in problem for problem in problems)
+
+
+def test_the_check_is_quiet_when_the_gripper_is_in_range(dataset):
+    with_data(dataset, rows(0.0, 0.5, 1.0))
+    assert not any("gripper" in problem for problem in summarise(dataset).problems)

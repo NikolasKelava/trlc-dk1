@@ -102,3 +102,69 @@ def test_starting_twice_does_not_stack_filters(root, tmp_path):
     logs.start("t2", directory=tmp_path)
 
     assert len(console.filters) == before
+
+
+# --------------------------------------------------------------------------- #
+# Surviving a library that clears the root logger
+# --------------------------------------------------------------------------- #
+
+
+def test_a_bare_logging_info_reaches_the_file():
+    """`lerobot/scripts/lerobot_train.py` logs with bare `logging.info(...)`.
+
+    A bare call goes to the ROOT logger, so its records arrive named `root` — not
+    `lerobot.scripts.lerobot_train`. Treating that as third-party noise cost the
+    whole of a fine-tune's log on 2026-08-28, including the
+    `step N: eval_loss=...` line that `dk1 policy curve` reads to pick a
+    checkpoint from. A run whose log is empty cannot be selected from.
+    """
+    keep = logs.Interesting(logging.DEBUG)
+    assert keep.filter(logging.LogRecord("root", logging.INFO, "f", 1, "step 20", (), None))
+    assert not keep.filter(logging.LogRecord("root", logging.DEBUG, "f", 1, "x", (), None))
+
+
+def test_a_chatty_library_is_still_held_at_warning():
+    """The reason the filter exists: PIL's DEBUG once buried an operator's screen.
+
+    A library that spams uses `logging.getLogger(__name__)`; `root` is where a
+    program talks about itself, which is the distinction this rests on.
+    """
+    keep = logs.Interesting(logging.DEBUG)
+    noisy = logging.LogRecord("PIL.PngImagePlugin", logging.INFO, "f", 1, "STREAM", (), None)
+    assert not keep.filter(noisy)
+
+
+def test_handlers_cleared_by_a_third_party_are_put_back(tmp_path):
+    """`lerobot.utils.utils.init_logging` does `root.handlers.clear()`.
+
+    Everything we opened before it is gone without a word — which is how a
+    fine-tune's train.log came to hold exactly one line.
+    """
+    path = logs.start("probe", path=tmp_path / "train.log")
+    ours = logs.handlers()
+    root = logging.getLogger()
+    try:
+        root.handlers.clear()
+        root.addHandler(logging.StreamHandler())  # what init_logging attaches
+        logs.restore(ours)
+        assert all(handler in root.handlers for handler in ours)
+
+        logging.getLogger().info("step 20: eval_loss=0.0685")
+        assert "eval_loss=0.0685" in path.read_text()
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+
+
+def test_restoring_twice_does_not_double_every_line(tmp_path):
+    path = logs.start("probe", path=tmp_path / "train.log")
+    ours = logs.handlers()
+    root = logging.getLogger()
+    try:
+        logs.restore(ours)
+        logs.restore(ours)
+        logging.getLogger("dk1lab.probe").info("once")
+        assert path.read_text().count("once") == 1
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)

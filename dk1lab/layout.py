@@ -107,6 +107,17 @@ def dict_from_vector(vector: Iterable[float], keys: Sequence[str] = ACTION_KEYS)
 # NOT YET VERIFIED ON HARDWARE. This is a well-supported inference, not an
 # observation; ``dk1 policy dryrun`` is what confirms it.
 
+#: The range a DK1 gripper command may take: 0 = open, 1 = closed.
+#:
+#: Not a convention this file invents — ``DK1Robot.command_gripper`` clips to
+#: exactly this before the value reaches the motor, so anything outside it is a
+#: command the robot did not execute. Named here because two other places need
+#: it: the follower, which must **return** what it really sent, and
+#: :func:`dk1lab.dataset.clamp_gripper`, which repairs a dataset recorded before
+#: it did.
+GRIPPER_MIN: float = 0.0
+GRIPPER_MAX: float = 1.0
+
 GRIPPER_INVERSION_SIGN: float = -1.0
 GRIPPER_INVERSION_OFFSET: float = 1.0
 

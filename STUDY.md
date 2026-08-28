@@ -360,6 +360,22 @@ training. `--steps`, `--batch-size`, `--lr`, `--eval-every` and `--holdout` move
 the budget; whatever they are set to is recorded, and the same numbers are reused
 in Phase 7.
 
+**A run can be stopped and picked up again**, which is what makes an 8 000-step
+budget a decision rather than a commitment:
+
+```
+dk1 policy pause  study/finetune/R1-<stamp>   # stops at the next checkpoint
+dk1 policy resume study/finetune/R1-<stamp>   # continues from checkpoints/last
+```
+
+`pause` writes a STOP file that the loop reads immediately after each checkpoint
+is written, so nothing is lost; Ctrl-C stops now and gives up at most `save_freq`
+steps. Either way the run is resumable, and a resumed run is the **same**
+experiment — the dataset, the split, the recipe, the budget and the schedule come
+back from the checkpoint's `train_config.json`, not from what is typed the second
+time. `--steps` on a resume raises the budget, and says so when that takes the run
+past the horizon its learning rate was scheduled to decay over.
+
 **The command refuses to start if the dataset's lens does not match the row's
 profile** — R1 on uncropped frames, or A1 on cropped ones. That is the invariant
 in *What gets recorded, and where* made mechanical: a checkpoint trained for a
@@ -654,3 +670,6 @@ A protocol that moves silently is not a protocol.
 | 2026-08-27 | **The LoRA target modules are NOT the same in shape for the two models**, and `--adapt` is the lever. The default stays each policy's own | *Fine-tuning* above says both defaults are "the action expert's q/v projections plus the state and action IO projections". That is exactly pi0.5's default and **not** MolmoAct2's, whose default targets the vision-language model's linear leaves; and LeRobot's generic PEFT path freezes every base parameter first, so under the defaults R1 and A1 would adapt MolmoAct2's VLM with its 578 M action expert frozen solid while B1 adapts pi0.5's action expert. `--adapt vlm+expert` extends MolmoAct2's **own** regex over its action expert. Which to use is a decision, not a bug fix, so the default is unchanged and the banner says out loud what is being adapted |
 | 2026-08-27 | **The hold-out is spread evenly across the three scene configurations**, not taken as the last ten episodes | LeRobot's `eval_split` holds out the last `ceil(n x split)` episodes per task, and the demonstrations are recorded grouped by scene — so the last ten of 45 are all scene 3. A validation set that is one layout measures one layout. Within a scene the picks are evenly spaced rather than the last few, because a session of teleoperation drifts and the steadiest demonstrations are at the end of each block. No patch was needed: the episode list is handed to LeRobot in an order whose tail is exactly the hold-out |
 | 2026-08-28 | **26 demonstrations, not 45, and the hold-out drops from 10 to 4** | What one session of hands produced on 2026-08-28: 26 episodes, 18 484 frames, 10.3 minutes, recorded 10:47–11:08 under `common`. Ten held out of 26 is 38% of the set and leaves 16 episodes to train a rank-32 adapter on; four is 15% and leaves 22. The number is now `dk1lab.finetune.DEFAULT_BUDGET.holdout` and **Phase 7 must reuse it** — the two fine-tunes are only comparable if their splits are the same shape. The count is reported with every result: this study says what 26 of our own demonstrations buy, not ~100 |
+| 2026-08-28 | **R1 and A1 run `--adapt vlm+expert`.** B1 keeps pi0.5's default, which already is its action expert | Nikolas's call, made against the amendment above. Under LeRobot's defaults MolmoAct2's adapter reaches its vision-language model and its 578 M action expert trains not at all, while pi0.5's reaches its action expert and nothing else — so the two rows would differ by which half of each model was adapted as well as by the model. `vlm+expert` extends MolmoAct2's **own** regex over its action expert, which is as close as the two get to one recipe. The choice is recorded per run in `dk1_run.json` (`adapt`, `adapting`) and printed in the banner, and Phase 7 must be read against it |
+| 2026-08-28 | **The step budget is 8 000, with a checkpoint and an evaluation every 2 000** — so 2 000, 4 000, 6 000 and 8 000 | Nikolas's call, against the measured cost: 1.13 step/s and 5 min 27 s per full evaluation make 8 000 steps about 2.4 hours rather than the 6.7 that 20 000 would have been. It is roughly one pass over the 15 605 training frames, which is thin — and that is what the stops are for. The curve says whether it was enough, and `dk1 policy resume --steps` buys more without starting again. **Phase 7 reuses this budget**, so if it is raised for R1 it is raised for B1 too |
+| 2026-08-28 | **A training run can be paused at a checkpoint and resumed.** `dk1 policy pause <run>` asks it to stop after the next checkpoint, losing nothing; `dk1 policy resume <run>` continues from `checkpoints/last` | A run is hours long on the machine that also drives the cell, and the alternative to a clean stop is Ctrl-C, which gives up everything since the last save. The resumed run is the *same* experiment and not a similar one: the dataset, the split, the recipe, the budget and the learning-rate schedule all come back from the checkpoint's own `train_config.json` rather than from what is typed the second time. Every resumed session is appended to `dk1_resume.jsonl`, so a checkpoint can say it came from more than one sitting |

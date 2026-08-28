@@ -32,6 +32,7 @@ from lerobot.robots import RobotConfig
 
 from lerobot_robot_trlc_dk1.bi_follower import BiDK1Follower, BiDK1FollowerConfig
 
+from .layout import GRIPPER_MAX, GRIPPER_MIN, is_gripper
 from .limiter import (
     DEFAULT_MAX_DT,
     DEFAULT_MAX_GRIPPER_RATE,
@@ -58,6 +59,23 @@ Connecting the DK1 follower is NOT passive:
   * every arm motor is energised and begins holding position
   * BOTH grippers self-zero by driving OPEN against their stop
 Clear the workspace and keep clear of the grippers."""
+
+
+def _clamp_grippers(action: dict[str, Any]) -> dict[str, Any]:
+    """``action`` with every gripper channel clipped the way the robot clips it.
+
+    A new dict: the caller's may be the one the teleoperator's own loop still
+    holds, and mutating it would change what the leader is understood to have
+    asked for. Non-gripper channels are copied through untouched.
+    """
+    return {
+        key: (
+            min(GRIPPER_MAX, max(GRIPPER_MIN, float(value)))
+            if is_gripper(key) and isinstance(value, (int, float))
+            else value
+        )
+        for key, value in action.items()
+    }
 
 
 @RobotConfig.register_subclass("bi_dk1_follower_safe")
@@ -164,11 +182,22 @@ class SafeBiDK1Follower(BiDK1Follower):
 
         Returns the action that was actually sent, not the one requested — so a
         recorded dataset stores what the arms were told to do.
+
+        **That promise was not true of the gripper until 2026-08-28.**
+        ``DK1Robot.command_gripper`` clips its argument to [0, 1] *inside* the
+        robot and returns nothing, so a leader trigger squeezed past the
+        follower's closed stop was recorded as a command of 1.03 that the robot
+        clipped to 1.0 and never executed. Harmless on the arms; not harmless in
+        a dataset, because MolmoAct2 passes the gripper channel through its
+        normaliser **unnormalised** and refuses anything outside [-1, 1] — so
+        those frames stopped a fine-tune dead. ``dk1lab.dataset.clamp_gripper``
+        repairs a recording made before this; this is what stops the next one
+        needing it. `DIAGNOSTICS §` *The gripper command that was never executed*.
         """
-        if not self.limiter.enabled:
-            return super().send_action(action)
-        limited = self.limiter.limit(action, self._fresh_measurement())
-        return super().send_action(limited)
+        limited = action if not self.limiter.enabled else self.limiter.limit(
+            action, self._fresh_measurement()
+        )
+        return _clamp_grippers(super().send_action(limited))
 
     def disconnect(self) -> None:
         """Disconnect. Does not move the arms."""
